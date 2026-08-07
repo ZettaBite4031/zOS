@@ -17,6 +17,8 @@ namespace {
 
 extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void KernelMain() noexcept {
     WriteDebug("[zOS/Kernel] Kernel entry reached\n");
+
+    __asm__ volatile("cli");
     for (;;) {
         __asm__ volatile("hlt");
     }

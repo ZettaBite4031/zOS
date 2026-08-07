@@ -41,6 +41,8 @@ TOOL_BIN_DIR="${TOOLCHAIN_DIR}/bin"
 ENVIRONMENT_FILE="${TOOLCHAIN_DIR}/Environment.sh"
 MANIFEST_FILE="${TOOLCHAIN_DIR}/Manifest.json"
 
+SYSTEM_PYTHON="/usr/bin/python3"
+
 FORCE_LLVM=0
 VERIFY_ONLY=0
 
@@ -164,6 +166,7 @@ verify_environment() {
     [[ -x "${LLVM_DIR}/bin/lld-link" ]] || fail "lld-link is missing."
     [[ -x "${PYTHON_DIR}/bin/scons" ]] || fail "Repository-local SCons is missing."
     [[ -r "${ENVIRONMENT_FILE}" ]] || fail "Environment file is missing: ${ENVIRONMENT_FILE}"
+    [[ -x "${SYSTEM_PYTHON}" ]] || fail "Ubuntu system Python is unavailable: ${SYSTEM_PYTHON}"
 
     require_command qemu-system-x86_64
     require_command qemu-img
@@ -310,6 +313,7 @@ log "Installing Ubuntu host prerequisites."
     python3 \
     python3-pip \
     python3-venv \
+    qemu-system-gui \
     qemu-system-x86 \
     qemu-utils \
     rsync \
@@ -393,7 +397,7 @@ install_llvm() {
 install_scons() {
     if [[ ! -x "${PYTHON_DIR}/bin/python" ]]; then
         log "Creating repository-local Python environment."
-        python3 -m venv "${PYTHON_DIR}"
+        "${SYSTEM_PYTHON}" -m venv "${PYTHON_DIR}"
     fi
 
     log "Installing SCons ${SCONS_VERSION} into the repository-local Python environment."

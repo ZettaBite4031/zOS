@@ -49,7 +49,7 @@ class Toolchain:
             Qemu=binary_directory / "qemu-system-x86_64",
             OvmfCode=Path(ovmf["code"]),
             OvmfVariablesTemplate=Path(ovmf["variablesTemplate"]),
-            QemuAccelerator=qemu.get("accelerator") or "tgc,thread=multi",
+            QemuAccelerator=qemu.get("accelerator") or "tcg,thread=multi",
         )
         toolchain.Validate()
         return toolchain

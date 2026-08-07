@@ -316,8 +316,8 @@ Avoid building from `/mnt/c/...` unless necessary.
 The setup script installs the required Ubuntu host utilities and prepares the repository-local LLVM and SCons environment.
 
 ```bash
-chmod +x Tools/SetupDevelopmentEnvironment.sh
-./Tools/SetupDevelopmentEnvironment.sh
+chmod +x Tools/SetupDevEnv.sh
+./Tools/SetupDevEnv.sh
 ```
 
 To activate the environment manually:
@@ -329,13 +329,13 @@ source .zos/Toolchain/Environment.sh
 To verify the existing installation:
 
 ```bash
-./Tools/SetupDevelopmentEnvironment.sh --verify-only
+./Tools/SetupDevEnv.sh --verify-only
 ```
 
 Or:
 
 ```bash
-./Tools/VerifyDevelopmentEnvironment.py
+./Tools/VerifyDevEnv.py
 ```
 
 Generated toolchain files are stored under:
