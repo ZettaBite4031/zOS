@@ -1,5 +1,13 @@
+#include <Boot/Protocol.hpp>
+
 #include <Boot/UEFI/UEFI.hpp>
 #include <Boot/UEFI/ELF.hpp>
+
+extern "C" [[noreturn]] void TransferControl(
+    Zos::Boot::UEFI::PhysicalAddress entryPoint,
+    Zos::Boot::UEFI::PhysicalAddress stackTop,
+    const Zos::Boot::BootEnvironment_V1* environment
+) noexcept;
 
 namespace {
     using namespace Zos::Boot;
@@ -35,6 +43,10 @@ namespace {
                 WriteChar(buffer[position]);
                 ++position;
             }
+        }
+
+        void DisableConsole() noexcept {
+            m_ConsoleOutput = nullptr;
         }
 
         void WriteHex(UEFI::Uint64 value) noexcept {
@@ -92,10 +104,16 @@ namespace {
             if (m_BootServices == nullptr) 
                 return ReportFailure("locate UEFI boot services", UEFI::InvalidParameter);
             
-            if (m_BootServices->OpenProtocol == nullptr
-            || m_BootServices->CloseProtocol == nullptr
-            || m_BootServices->AllocatePool == nullptr
-            || m_BootServices->FreePool == nullptr) 
+            if (m_BootServices->AllocatePages == nullptr ||
+                m_BootServices->FreePages == nullptr ||
+                m_BootServices->GetMemoryMap == nullptr ||
+                m_BootServices->AllocatePool == nullptr ||
+                m_BootServices->FreePool == nullptr ||
+                m_BootServices->ExitBootServices == nullptr ||
+                m_BootServices->OpenProtocol == nullptr ||
+                m_BootServices->CloseProtocol == nullptr ||
+                m_BootServices->CopyMem == nullptr ||
+                m_BootServices->SetMem == nullptr)
                 return ReportFailure("validate required boot services", UEFI::Unsupported);
 
             UEFI::Status status = OpenBootVolume();
@@ -128,12 +146,10 @@ namespace {
             status = LoadKernelSegments();
             if (UEFI::IsError(status)) return status;
 
-            status = ReleaseKernelPages();
+            status = PrepareHandoff();
             if (UEFI::IsError(status)) return status;
-
-            m_Output.WriteLine("[zOS/Boot] Test kernel allocation released.");
-
-            return UEFI::Success;
+            
+            CompleteHandoff();
         }
 
     private:
@@ -142,6 +158,9 @@ namespace {
         }
 
         static constexpr UEFI::Uint64 PageSize{ 4096 };
+        static constexpr UEFI::UintN KernelStackPageCount{ 16 };
+        static constexpr UEFI::UintN MemoryMapSlackDescriptorCount{ 64 };
+        static constexpr UEFI::UintN ExitBootServicesAttemptCount{ 4 };
         static constexpr UEFI::Uint64 MaximumAddress{ ~UEFI::Uint64{ 0 } };
 
         static bool IsPowerOfTwo(UEFI::Uint64 value) noexcept {
@@ -554,6 +573,310 @@ namespace {
             return UEFI::Success;
         }
 
+        UEFI::Status CloseBootInputResources() noexcept {
+            if (m_KernelFile != nullptr) {
+                if (m_KernelFile->Close == nullptr)
+                    return ReportFailure("validate kernel file close operation", UEFI::Unsupported);
+                
+                const UEFI::Status status = m_KernelFile->Close(m_KernelFile);
+                if (UEFI::IsError(status))
+                    return ReportFailure("close the kernel file", status);
+
+                m_KernelFile = nullptr;
+            }
+
+            if (m_RootDirectory != nullptr) {
+                if (m_RootDirectory->Close == nullptr)
+                    return ReportFailure("validate root directory close operation", UEFI::Unsupported);
+
+                const UEFI::Status status = m_RootDirectory->Close(m_RootDirectory);
+                if (UEFI::IsError(status))
+                    return ReportFailure("close the boot volume", status);
+
+                m_RootDirectory = nullptr;
+            }
+
+            if (m_KernelImage != nullptr) {
+                const UEFI::Status status = m_BootServices->FreePool(m_KernelImage);
+                if (UEFI::IsError(status))
+                    return ReportFailure("release the temporary kernel file buffer", status);
+
+                m_KernelImage = nullptr;
+                m_KernelImageSize = 0;
+            }
+
+            if (m_FileInformationBuffer != nullptr) {
+                const UEFI::Status status = m_BootServices->FreePool(m_FileInformationBuffer);
+                if (UEFI::IsError(status))
+                    return ReportFailure("release kernel file information", status);
+
+                m_FileInformationBuffer = nullptr;
+            }
+
+            if (m_FileSystemProtocolOpen) {
+                const UEFI::Status status = m_BootServices->CloseProtocol(
+                    m_BootDeviceHandle,
+                    &UEFI::SimpleFileSystemProtocolGuid,
+                    m_ImageHandle,
+                    nullptr
+                );
+
+                if (UEFI::IsError(status))
+                    return ReportFailure("close Simple File System Protocol", status);
+
+                m_FileSystemProtocolOpen = false;
+                m_FileSystem = nullptr;
+            }
+
+            if (m_LoadedImageProtocolOpen) {
+                const UEFI::Status status = m_BootServices->CloseProtocol(
+                    m_ImageHandle,
+                    &UEFI::LoadedImageProtocolGuid,
+                    m_ImageHandle,
+                    nullptr
+                );
+
+                if (UEFI::IsError(status))
+                    return ReportFailure("close Loaded Image Protocol", status);
+
+                m_LoadedImageProtocolOpen = false;
+                m_LoadedImage = nullptr;
+            }
+
+            return UEFI::Success;
+        }
+
+        UEFI::Status AllocateKernelStack() noexcept {
+            UEFI::PhysicalAddress stack_base = 0;
+            const UEFI::Status status = m_BootServices->AllocatePages(UEFI::AllocateType::AnyPages, UEFI::MemoryType::LoaderData, KernelStackPageCount, &stack_base);
+            if (UEFI::IsError(status))
+                return ReportFailure("allocate the kernel stack", status);
+
+            m_KernelStackBase = stack_base;
+            m_KernelStackPageCount = KernelStackPageCount;
+            m_KernelStackAllocated = true;
+
+            const UEFI::Uint64 stack_size = KernelStackPageCount * PageSize;
+            if (stack_base > MaximumAddress - stack_size)
+                return ReportValidationFailure("kernel stack range overflows");
+
+            m_KernelStackSize = stack_size;
+            m_KernelStackTop = stack_base + stack_size;
+            
+            m_BootServices->SetMem(reinterpret_cast<void*>(static_cast<UEFI::UintN>(stack_base)), stack_size, 0);
+
+            return UEFI::Success;
+        }
+
+        UEFI::Status AllocateBootEnvironment() noexcept {
+            UEFI::PhysicalAddress environment_base = 0;
+            const UEFI::Status status = m_BootServices->AllocatePages(UEFI::AllocateType::AnyPages, UEFI::MemoryType::LoaderData, 1, &environment_base);
+            if (UEFI::IsError(status))
+                return ReportFailure("allocate the boot environment", status);
+
+            m_BootEnvironmentBase = environment_base;
+            m_BootEnvironmentPageCount = 1;
+            m_BootEnvironmentAllocated = true;
+            m_BootEnvironment = reinterpret_cast<BootEnvironment_V1*>(static_cast<UEFI::UintN>(environment_base));
+
+            m_BootServices->SetMem(m_BootEnvironment, PageSize, 0);
+            return UEFI::Success;
+        }
+
+        UEFI::Status ResizeMemoryMapStorage(UEFI::UintN required_size, UEFI::UintN descriptor_size) noexcept {
+            if (descriptor_size == 0) 
+                descriptor_size = sizeof(UEFI::MemoryDescriptor);
+            
+            if (descriptor_size > MaximumAddress / MemoryMapSlackDescriptorCount)
+                return ReportFailure("calculate memory map slack", UEFI::OutOfResources);
+
+            const UEFI::Uint64 slack = static_cast<UEFI::Uint64>(descriptor_size) * MemoryMapSlackDescriptorCount;
+            if (required_size > MaximumAddress - slack)
+                return ReportFailure("calculate memory map storage size", UEFI::OutOfResources);
+
+            UEFI::Uint64 requested_size = required_size + slack;
+            UEFI::Uint64 aligned_size = 0;
+            if (!TryAlignUpToPage(requested_size, aligned_size))
+                return ReportFailure("page-align memory map storage", UEFI::OutOfResources);
+
+            const UEFI::UintN page_count = aligned_size / PageSize;
+            if (page_count == 0) 
+                return ReportFailure("calculate memory map page count", UEFI::OutOfResources);
+
+            if (m_MemoryMapAllocated) {
+                const UEFI::Status release_status = m_BootServices->FreePages(m_MemoryMapBase, m_MemoryMapPageCount);
+                if (UEFI::IsError(release_status))
+                    return ReportFailure("resize the UEFI memory map storage", release_status);
+                
+                m_MemoryMapAllocated = false;
+                m_MemoryMapBase = 0;
+                m_MemoryMapPageCount = 0;
+                m_MemoryMapCapacity = 0;
+            }
+
+            UEFI::PhysicalAddress map_base = 0;
+            const UEFI::Status allocate_status = m_BootServices->AllocatePages(UEFI::AllocateType::AnyPages, UEFI::MemoryType::LoaderData, page_count, &map_base);
+            if (UEFI::IsError(allocate_status))
+                return ReportFailure("allocate UEFI memory map storage", allocate_status);
+
+            m_MemoryMapBase = map_base;
+            m_MemoryMapPageCount = page_count;
+            m_MemoryMapCapacity = page_count * PageSize;
+            m_MemoryMapAllocated = true;
+
+            if (m_BootEnvironment != nullptr) {
+                m_BootEnvironment->MemoryMapStorage.Base = m_MemoryMapBase;
+                m_BootEnvironment->MemoryMapStorage.Size = m_MemoryMapCapacity;
+            }
+
+            return UEFI::Success;
+        }
+
+        UEFI::Status PrepareMemoryMapStorage() noexcept {
+            UEFI::UintN required_size = 0;
+            UEFI::UintN map_key = 0;
+            UEFI::UintN descriptor_size = 0;
+            UEFI::Uint32 descriptor_version = 0;
+
+            const UEFI::Status status = m_BootServices->GetMemoryMap(&required_size, nullptr, &map_key, &descriptor_size, &descriptor_version);
+            if (status != UEFI::BufferTooSmall) {
+                const UEFI::Status failure_status = UEFI::IsError(status) ? status : UEFI::LoadError;
+                return ReportFailure("query the UEFI memory map size", failure_status);
+            }
+
+            if (descriptor_size < sizeof(UEFI::MemoryDescriptor))
+                return ReportFailure("validate the UEFI memory descriptor size", UEFI::Unsupported);
+
+            return ResizeMemoryMapStorage(required_size, descriptor_size);
+        }
+
+        void PopulateBootEnvironment() noexcept {
+            m_BootEnvironment->Signature = EnvironmentSignature;
+            m_BootEnvironment->Version = ProtocolVersion;
+            m_BootEnvironment->Size = sizeof(BootEnvironment_V1);
+            m_BootEnvironment->KernelEntryPoint = m_EntryPoint;
+            m_BootEnvironment->KernelImage.Base = m_LoadedKernelBase;
+            m_BootEnvironment->KernelImage.Size = m_LoadedKernelSize;
+            m_BootEnvironment->KernelStack.Base = m_KernelStackBase;
+            m_BootEnvironment->KernelStack.Size = m_KernelStackSize;
+            m_BootEnvironment->EnvironmentStorage.Base = m_BootEnvironmentBase;
+            m_BootEnvironment->EnvironmentStorage.Size = PageSize;
+            m_BootEnvironment->MemoryMapStorage.Base = m_MemoryMapBase;
+            m_BootEnvironment->MemoryMapStorage.Size = m_MemoryMapCapacity;
+            m_BootEnvironment->FirmwareSystemTable = reinterpret_cast<UEFI::UintN>(m_SystemTable);
+        }
+
+        UEFI::Status PrepareHandoff() noexcept {
+            UEFI::Status status = CloseBootInputResources();
+            if (UEFI::IsError(status)) return status;
+
+            status = AllocateKernelStack();
+            if (UEFI::IsError(status)) return status;
+
+            status = AllocateBootEnvironment();
+            if (UEFI::IsError(status)) return status;
+
+            status = PrepareMemoryMapStorage();
+            if (UEFI::IsError(status)) return status;
+
+            PopulateBootEnvironment();
+
+            m_Output.Write("[zOS/Boot] Kernel stack: ");
+            m_Output.WriteHex(m_KernelStackBase);
+            m_Output.Write(" - ");
+            m_Output.WriteHex(m_KernelStackTop);
+            m_Output.WriteLine("");
+
+            m_Output.Write("[zOS/Boot] Boot environment: ");
+            m_Output.WriteHex(m_BootEnvironmentBase);
+            m_Output.WriteLine("");
+
+            m_Output.Write("[zOS/Boot] Memory map capacity: ");
+            m_Output.WriteDecimal(m_MemoryMapCapacity);
+            m_Output.WriteLine(" bytes");
+
+            return UEFI::Success;
+        }
+
+        UEFI::Status AcquireFinalMemoryMap(bool allow_resize) noexcept {
+            for (;;) {
+                UEFI::UintN memory_map_size = m_MemoryMapCapacity;
+                UEFI::UintN map_key = 0;
+                UEFI::UintN descriptor_size = 0;
+                UEFI::Uint32 descriptor_version = 0;
+
+                const UEFI::Status status = m_BootServices->GetMemoryMap(&memory_map_size, reinterpret_cast<UEFI::MemoryDescriptor*>(static_cast<UEFI::UintN>(m_MemoryMapBase)), &map_key, &descriptor_size, &descriptor_version);
+                if (status == UEFI::BufferTooSmall && allow_resize) {
+                    const UEFI::Status resize_status = ResizeMemoryMapStorage(memory_map_size, descriptor_size);
+                    if (UEFI::IsError(resize_status)) return resize_status;
+                    continue;
+                }
+
+                if (UEFI::IsError(status)) return status;
+
+                if (descriptor_size < sizeof(UEFI::MemoryDescriptor) ||
+                    descriptor_size == 0 ||
+                    (memory_map_size % descriptor_size) != 0) {
+                    return UEFI::LoadError;
+                }
+
+                m_MemoryMapSize = memory_map_size;
+                m_MemoryMapKey = map_key;
+                m_MemoryDescriptorSize = descriptor_size;
+                m_MemoryDescriptorVersion = descriptor_version;
+
+                m_BootEnvironment->MemoryMapStorage.Base = m_MemoryMapBase;
+                m_BootEnvironment->MemoryMapStorage.Size = m_MemoryMapCapacity;
+                m_BootEnvironment->MemoryMapSize = memory_map_size;
+                m_BootEnvironment->MemoryMapDescriptorSize = descriptor_size;
+                m_BootEnvironment->MemoryDescriptorVersion = descriptor_version;
+                return UEFI::Success;
+            }
+        }
+
+        [[noreturn]] void FatalHandoffFailure(const char* operation, UEFI::Status status) noexcept {
+            m_Output.Write("[zOS/Boot] FATAL: Failed to ");
+            m_Output.Write(operation);
+            m_Output.Write(" (status ");
+            m_Output.WriteHex(status);
+            m_Output.WriteLine(").");
+
+            for (;;) {
+                __asm__ volatile("cli; hlt");
+            }
+        }
+
+        [[noreturn]] void CompleteHandoff() noexcept {
+            m_Output.WriteLine("[zOS/Boot] Acquiring final UEFI memory map.");
+            m_Output.WriteLine("[zOS/Boot] Firmware console disabled for final handoff.");
+            m_Output.DisableConsole();
+
+            bool exit_attempted = false;
+
+            for (UEFI::UintN attempt = 0; attempt < ExitBootServicesAttemptCount; attempt++) {
+                const UEFI::Status map_status = AcquireFinalMemoryMap(!exit_attempted);
+                if (UEFI::IsError(map_status))
+                    FatalHandoffFailure("acquire the final UEFI mempry map", map_status);
+
+                const UEFI::Status exit_status = m_BootServices->ExitBootServices(m_ImageHandle, m_MemoryMapKey);
+                exit_attempted = true;
+                if (exit_status == UEFI::Success) {
+                    m_BootServicesExited = true;
+                    m_Output.WriteLine("[zOS/Boot] UEFI boot services exited.");
+                    m_Output.WriteLine("[zOS/Boot] Entering kernel.");
+
+                    TransferControl(m_EntryPoint, m_KernelStackTop, m_BootEnvironment);
+                }
+
+                if (exit_status != UEFI::InvalidParameter)
+                    FatalHandoffFailure("exit UEFI boot services", exit_status);
+
+                m_Output.WriteLine("[zOS/Boot] Memory map changed; retrying ExitBootServices.");
+            }
+
+            FatalHandoffFailure("exit UEFI boot services after retries", UEFI::InvalidParameter);
+        }
+
         UEFI::Status ReportLoadFailure(const char* reason) noexcept {
             m_Output.Write("[zOS/Boot] ERROR: Loaded kernel verification failed: ");
             m_Output.Write(reason);
@@ -632,6 +955,7 @@ namespace {
 
 
         UEFI::Handle m_ImageHandle;
+        UEFI::SystemTable* m_SystemTable;
         UEFI::BootServices* m_BootServices;
         TextWriter m_Output;
 
@@ -651,6 +975,27 @@ namespace {
         UEFI::Uint64 m_LoadedKernelSize{};
         UEFI::UintN m_LoadedKernelPageCount{};
 
+        UEFI::PhysicalAddress m_KernelStackBase{};
+        UEFI::PhysicalAddress m_KernelStackTop{};
+        UEFI::Uint64 m_KernelStackSize{};
+        UEFI::UintN m_KernelStackPageCount{};
+
+        UEFI::PhysicalAddress m_BootEnvironmentBase{};
+        UEFI::UintN m_BootEnvironmentPageCount{};
+        BootEnvironment_V1* m_BootEnvironment{};
+
+        UEFI::PhysicalAddress m_MemoryMapBase{};
+        UEFI::UintN m_MemoryMapPageCount{};
+        UEFI::UintN m_MemoryMapCapacity{};
+        UEFI::UintN m_MemoryMapSize{};
+        UEFI::UintN m_MemoryMapKey{};
+        UEFI::UintN m_MemoryDescriptorSize{};
+        UEFI::Uint32 m_MemoryDescriptorVersion{};
+
+        bool m_BootServicesExited{};
+        bool m_MemoryMapAllocated{};
+        bool m_BootEnvironmentAllocated{};
+        bool m_KernelStackAllocated{};
         bool m_KernelPagesAllocated{};
         bool m_LoadedImageProtocolOpen{};
         bool m_FileSystemProtocolOpen{};

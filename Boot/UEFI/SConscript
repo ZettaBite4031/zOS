@@ -2,14 +2,20 @@ Import("uefi_environment", "output_root")
 
 component_output = f"{output_root}/Boot/UEFI"
 
-loader_object = uefi_environment.Object(
-    target=f"{component_output}/Loader.obj",
-    source="Loader.cpp",
-)
+loader_objects = [
+    uefi_environment.Object(
+        target=f"{component_output}/Loader.obj",
+        source="Loader.cpp",
+    ),
+    uefi_environment.Object(
+        target=f"{component_output}/Handoff.obj",
+        source="Handoff.cpp",
+    ),
+]
 
 loader = uefi_environment.Command(
     target=f"{component_output}/BOOTX64.EFI",
-    source=loader_object,
+    source=loader_objects,
     action=(
         "$LINK $UEFI_LINKFLAGS "
         "/out:$TARGET "

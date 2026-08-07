@@ -10,14 +10,16 @@ namespace Zos::Boot::UEFI {
     using Uint16 = unsigned short;
     using Uint32 = unsigned int;
     using Uint64 = unsigned long long;
-    using PhysicalAddress = Uint64;
     using UintN = unsigned long long;
+    using PhysicalAddress = Uint64;
+    using VirtualAddress = Uint64;
 
 
     static_assert(sizeof(Boolean) == 1);
     static_assert(sizeof(Char16) == 2);
     static_assert(sizeof(Int16) == 2);
     static_assert(sizeof(PhysicalAddress) == 8);
+    static_assert(sizeof(VirtualAddress) == 8);
     static_assert(sizeof(Uint16) == 2);
     static_assert(sizeof(Uint32) == 4);
     static_assert(sizeof(Uint64) == 8);
@@ -93,6 +95,15 @@ namespace Zos::Boot::UEFI {
       PersistentMemory,
       UnacceptedMemory,
       MaximumMemoryType,  
+    };
+
+    struct MemoryDescriptor {
+        MemoryType Type;
+        Uint32 _pad1;
+        PhysicalAddress PhysStart;
+        VirtualAddress VirtStart;
+        Uint64 NumberOfPages;
+        Uint64 Attribute;
     };
 
     struct TableHeader {
@@ -185,6 +196,8 @@ namespace Zos::Boot::UEFI {
 
     using fpAllocatePages = Status(*)(AllocateType type, MemoryType memory_type, UintN pages, PhysicalAddress* memory);
     using fpFreePages = Status(*)(PhysicalAddress memory, UintN pages);
+    using fpGetMemoryMap = Status(*)(UintN* memory_map_size, MemoryDescriptor* memory_map, UintN* map_key, UintN* descriptor_size, Uint32* descriptor_version);
+    using fpExitBootServices = Status(*)(Handle image_handle, UintN map_key);
     using fpCopyMem = void(*)(void* destination, const void* source, UintN length);
     using fpSetMem = void(*)(void* buffer, UintN size, Uint8 value);
     using fpAllocatePool = Status(*)(MemoryType pool_type, UintN size, void** buffer);
@@ -198,7 +211,7 @@ namespace Zos::Boot::UEFI {
         void* RestoreTpl;
         fpAllocatePages AllocatePages;
         fpFreePages FreePages;
-        void* GetMemoryMap;
+        fpGetMemoryMap GetMemoryMap;
         fpAllocatePool AllocatePool;
         fpFreePool FreePool;
         void* CreateEvent;
@@ -220,7 +233,7 @@ namespace Zos::Boot::UEFI {
         void* StartImage;
         void* Exit;
         void* UnloadImage;
-        void* ExitBootServices;
+        fpExitBootServices ExitBootServices;
         void* GetNextMonotonicCount;
         void* Stall;
         void* SetWatchdogTimer;
@@ -279,6 +292,9 @@ namespace Zos::Boot::UEFI {
 
     static_assert(sizeof(Guid) == 16);
     static_assert(sizeof(Time) == 16);
+    static_assert(sizeof(MemoryDescriptor) == 40);
+    static_assert(__builtin_offsetof(MemoryDescriptor, PhysStart) == 8);
+    static_assert(__builtin_offsetof(MemoryDescriptor, Attribute) == 32);
     static_assert(sizeof(TableHeader) == 24);
     static_assert(sizeof(SimpleTextOutputProtocol) == 80);
     static_assert(sizeof(LoadedImageProtocol) == 96);
@@ -288,7 +304,9 @@ namespace Zos::Boot::UEFI {
     static_assert(sizeof(BootServices) == 376);
     static_assert(__builtin_offsetof(BootServices, AllocatePages) == 40);
     static_assert(__builtin_offsetof(BootServices, FreePages) == 48);
+    static_assert(__builtin_offsetof(BootServices, GetMemoryMap) == 56);
     static_assert(__builtin_offsetof(BootServices, AllocatePool) == 64);
+    static_assert(__builtin_offsetof(BootServices, ExitBootServices) == 232);
     static_assert(__builtin_offsetof(BootServices, OpenProtocol) == 280);
     static_assert(__builtin_offsetof(BootServices, CopyMem) == 352);
     static_assert(__builtin_offsetof(BootServices, SetMem) == 360);
