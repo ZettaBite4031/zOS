@@ -1,25 +1,32 @@
+from pathlib import Path
+
 Import("kernel_environment", "output_root")
 
 component_output = f"{output_root}/Kernel"
+component_directory = Path(Dir(".").srcnode().abspath)
 linker_script = File("Linker.ld")
 
-kernel_object = kernel_environment.Object(
-    target=f"{component_output}/Kernel.o",
-    source="Kernel.cpp",
-)
+source_exts = [ ".c", ".cc", ".cpp", ".cxx" ]
 
-kernel = kernel_environment.Command(
-    target=f"{component_output}/Kernel.elf",
-    source=kernel_object,
-    action=(
-        "$LINK $KERNEL_LINKFLAGS "
-        "--script=$KERNEL_LINKER_SCRIPT "
-        "--entry=KernelMain "
-        "-o $TARGET "
-        "$SOURCES"
-    ),
-    KERNEL_LINKER_SCRIPT=linker_script.abspath,
-)
+source_files = sorted(path for path in component_directory.rglob("*") if path.is_file() and path.suffix.lower() in source_exts)
+
+if not source_files:
+    raise RuntimeError("Kernel contains no translation units.")
+
+kernel_objects = []
+
+for source_path in source_files:
+    relative_path = source_path.relative_to(component_directory)
+    object_path = relative_path.with_suffix(kernel_environment["OBJSUFFIX"])
+
+    kernel_objects.append(kernel_environment.Object(target=f"{component_output}/{object_path.as_posix()}", source=File(str(source_path))))
+
+kernel = kernel_environment.Command(target=f"{component_output}/Kernel.elf", source=kernel_objects, action=(
+    "$LINK $KERNEL_LINKFLAGS "
+    "--script=$KERNEL_LINKER_SCRIPT "
+    "--entry=KernelMain "
+    "-o $TARGET "
+    "$SOURCES"), KERNEL_LINKER_SCRIPT=linker_script.abspath)
 
 kernel_environment.Depends(kernel, linker_script)
 
