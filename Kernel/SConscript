@@ -1,0 +1,26 @@
+Import("kernel_environment", "output_root")
+
+component_output = f"{output_root}/Kernel"
+linker_script = File("Linker.ld")
+
+kernel_object = kernel_environment.Object(
+    target=f"{component_output}/Kernel.o",
+    source="Kernel.cpp",
+)
+
+kernel = kernel_environment.Command(
+    target=f"{component_output}/Kernel.elf",
+    source=kernel_object,
+    action=(
+        "$LINK $KERNEL_LINKFLAGS "
+        "--script=$KERNEL_LINKER_SCRIPT "
+        "--entry=KernelMain "
+        "-o $TARGET "
+        "$SOURCES"
+    ),
+    KERNEL_LINKER_SCRIPT=linker_script.abspath,
+)
+
+kernel_environment.Depends(kernel, linker_script)
+
+Return("kernel")
