@@ -10,11 +10,14 @@ namespace Zos::Boot::UEFI {
     using Uint16 = unsigned short;
     using Uint32 = unsigned int;
     using Uint64 = unsigned long long;
+    using PhysicalAddress = Uint64;
     using UintN = unsigned long long;
+
 
     static_assert(sizeof(Boolean) == 1);
     static_assert(sizeof(Char16) == 2);
     static_assert(sizeof(Int16) == 2);
+    static_assert(sizeof(PhysicalAddress) == 8);
     static_assert(sizeof(Uint16) == 2);
     static_assert(sizeof(Uint32) == 4);
     static_assert(sizeof(Uint64) == 8);
@@ -63,6 +66,13 @@ namespace Zos::Boot::UEFI {
         Int16 Timezone;
         Uint8 Daylight;
         Uint8 _pad2;
+    };
+
+    enum class AllocateType : Uint32 {
+        AnyPages,
+        MaximumAddress,
+        Address,
+        Maximum,
     };
 
     enum class MemoryType : Uint32 {
@@ -173,6 +183,10 @@ namespace Zos::Boot::UEFI {
         Char16 FileName[1];
     };
 
+    using fpAllocatePages = Status(*)(AllocateType type, MemoryType memory_type, UintN pages, PhysicalAddress* memory);
+    using fpFreePages = Status(*)(PhysicalAddress memory, UintN pages);
+    using fpCopyMem = void(*)(void* destination, const void* source, UintN length);
+    using fpSetMem = void(*)(void* buffer, UintN size, Uint8 value);
     using fpAllocatePool = Status(*)(MemoryType pool_type, UintN size, void** buffer);
     using fpFreePool = Status(*)(void* buffer);
     using fpOpenProtocol = Status(*)(Handle handle, const Guid* protocol, void** interface, Handle agent_handle, Handle controller_handle, Uint32 attributes);
@@ -182,8 +196,8 @@ namespace Zos::Boot::UEFI {
         TableHeader Header;
         void* RaiseTpl;
         void* RestoreTpl;
-        void* AllocatePages;
-        void* FreePages;
+        fpAllocatePages AllocatePages;
+        fpFreePages FreePages;
         void* GetMemoryMap;
         fpAllocatePool AllocatePool;
         fpFreePool FreePool;
@@ -221,8 +235,8 @@ namespace Zos::Boot::UEFI {
         void* InstallMultipleProtocolInterfaces;
         void* UninstallMultipleProtocolInterfaces;
         void* CalculateCrc32;
-        void* CopyMem;
-        void* SetMem;
+        fpCopyMem CopyMem;
+        fpSetMem SetMem;
         void* CreateEventEx;
     };
 
@@ -272,8 +286,12 @@ namespace Zos::Boot::UEFI {
     static_assert(sizeof(SimpleFileSystemProtocol) == 16);
     static_assert(__builtin_offsetof(FileInfo, FileName) == 80);
     static_assert(sizeof(BootServices) == 376);
+    static_assert(__builtin_offsetof(BootServices, AllocatePages) == 40);
+    static_assert(__builtin_offsetof(BootServices, FreePages) == 48);
     static_assert(__builtin_offsetof(BootServices, AllocatePool) == 64);
     static_assert(__builtin_offsetof(BootServices, OpenProtocol) == 280);
+    static_assert(__builtin_offsetof(BootServices, CopyMem) == 352);
+    static_assert(__builtin_offsetof(BootServices, SetMem) == 360);
     static_assert(sizeof(SystemTable) == 120);
     static_assert(__builtin_offsetof(SystemTable, ConsoleOutput) == 64);
     static_assert(__builtin_offsetof(SystemTable, pBootServices) == 96);

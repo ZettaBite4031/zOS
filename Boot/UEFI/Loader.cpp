@@ -125,6 +125,14 @@ namespace {
             m_Output.WriteLine("[zOS/Boot] ELF64 AMD64 executable verified");
             m_Output.WriteLine("[zOS/Boot] Kernel image validation complete");
 
+            status = LoadKernelSegments();
+            if (UEFI::IsError(status)) return status;
+
+            status = ReleaseKernelPages();
+            if (UEFI::IsError(status)) return status;
+
+            m_Output.WriteLine("[zOS/Boot] Test kernel allocation released.");
+
             return UEFI::Success;
         }
 
@@ -133,8 +141,30 @@ namespace {
             return offset <= total && length <= total - offset;
         }
 
+        static constexpr UEFI::Uint64 PageSize{ 4096 };
+        static constexpr UEFI::Uint64 MaximumAddress{ ~UEFI::Uint64{ 0 } };
+
         static bool IsPowerOfTwo(UEFI::Uint64 value) noexcept {
             return value != 0 && (value & (value - 1)) == 0;
+        }
+
+        static UEFI::Uint64 AlignDownToPage(UEFI::Uint64 value) noexcept {
+            return value & ~(PageSize - 1);
+        }
+
+        static bool TryAlignUpToPage(UEFI::Uint64 value, UEFI::Uint64& aligned) noexcept {
+            if (value > MaximumAddress - (PageSize - 1)) return false;
+            aligned = (value + PageSize - 1) & ~(PageSize - 1);
+            return true;
+        }
+
+        static bool RangesOverlap(UEFI::Uint64 first_base, UEFI::Uint64 first_size, UEFI::Uint64 second_base, UEFI::Uint64 second_size) noexcept {
+            if (first_size == 0 || second_size == 0) return false;
+
+
+            const UEFI::Uint64 first_end = first_base + first_size;
+            const UEFI::Uint64 second_end = second_base + second_size;
+            return first_base < second_end && second_base < first_end;
         }
 
         UEFI::Status OpenBootVolume() noexcept {
@@ -359,6 +389,179 @@ namespace {
             return UEFI::Success;
         }
 
+        UEFI::Status LoadKernelSegments() noexcept {
+            using namespace ELF;
+
+            const auto* header = static_cast<const Header*>(m_KernelImage);
+            const auto* image_bytes = static_cast<const UEFI::Uint8*>(m_KernelImage);
+            const auto* program_headers = reinterpret_cast<const ProgramHeader*>(image_bytes + header->ProgramHeaderOffset);
+
+            UEFI::Uint64 minimum_address = MaximumAddress;
+            UEFI::Uint64 maximum_address = 0;
+            bool found_nonempty_segment = false;
+
+            for (UEFI::UintN i = 0; i < header->ProgramHeaderCount; i++) {
+                const ProgramHeader& segment = program_headers[i];
+
+                if (segment.TypeValue != ProgramType::Load || segment.MemorySize == 0) continue;
+                if (segment.PhysAddress != segment.VirtAddress)
+                    return ReportValidationFailure("the current kernel must use identifical physical and virtual load addresses");
+
+                for (UEFI::UintN prev_i = 0; prev_i < i; prev_i++) {
+                    const ProgramHeader& prev = program_headers[prev_i];
+                    if (prev.TypeValue != ProgramType::Load || prev.MemorySize == 0) continue;
+                    if (RangesOverlap(prev.PhysAddress, prev.MemorySize, segment.PhysAddress, segment.MemorySize))
+                        return ReportValidationFailure("kernel load segments overlap in physical memory");
+                }
+
+                const UEFI::Uint64 segment_start = AlignDownToPage(segment.PhysAddress);
+                const UEFI::Uint64 segment_end = segment.PhysAddress + segment.MemorySize;
+                UEFI::Uint64 aligned_segment_end = 0;
+
+                if (!TryAlignUpToPage(segment_end, aligned_segment_end))
+                    return ReportValidationFailure("a kernel load segment cannot be page-aligned safely!");
+                
+                if (segment_start < minimum_address)
+                    minimum_address = segment_start;
+
+                if (aligned_segment_end > maximum_address)
+                    maximum_address = aligned_segment_end;
+
+                found_nonempty_segment = true;
+            }
+
+            if (!found_nonempty_segment || maximum_address <= minimum_address) 
+                return ReportValidationFailure("kernel has no nonempty loadable memory range");
+
+            const UEFI::Uint64 allocation_size = maximum_address - minimum_address;
+            if ((allocation_size % PageSize) != 0) 
+                return ReportValidationFailure("kernel allocation span is not page-aligned");
+            
+            const UEFI::Uint64 page_count = allocation_size / PageSize;
+            if (page_count == 0) 
+                return ReportValidationFailure("kernel allocation requires zero pages");
+
+            UEFI::PhysicalAddress allocation_address = minimum_address;
+            UEFI::Status status = m_BootServices->AllocatePages(UEFI::AllocateType::Address, UEFI::MemoryType::LoaderData, page_count, &allocation_address);
+            if (UEFI::IsError(status))
+                return ReportFailure("allocate the kernel's physical memory span", status);
+            
+            m_LoadedKernelBase = allocation_address;
+            m_LoadedKernelSize = allocation_size;
+            m_LoadedKernelPageCount = page_count;
+            m_KernelPagesAllocated = true;
+
+            if (allocation_address != minimum_address)
+                return ReportValidationFailure("Firmware returned an unexpected address for an exact kernel allocation");
+
+            auto* allocation = reinterpret_cast<void*>(static_cast<UEFI::UintN>(m_LoadedKernelBase));
+            m_BootServices->SetMem(allocation, m_LoadedKernelSize, 0);
+        
+            UEFI::UintN loaded_segment_index = 0;
+            for (UEFI::UintN i = 0; i < header->ProgramHeaderCount; i++) {
+                const ProgramHeader& segment = program_headers[i];
+                if (segment.TypeValue != ProgramType::Load) continue;
+                if (segment.FileSize != 0) {
+                    auto* destination = reinterpret_cast<void*>(static_cast<UEFI::UintN>(segment.PhysAddress));
+                    const void* source = image_bytes + segment.Offset;
+                    m_BootServices->CopyMem(destination, source, segment.FileSize);
+                }
+
+                m_Output.Write("[zOS/Boot] Loaded segment ");
+                m_Output.WriteDecimal(loaded_segment_index);
+                m_Output.Write(" at ");
+                m_Output.WriteHex(segment.PhysAddress);
+                m_Output.WriteLine("");
+                loaded_segment_index++;
+            }
+
+            status = VerifyLoadedKernel();
+            if (UEFI::IsError(status)) return status;
+
+            m_Output.Write("[zOS/Boot] Kernel allocation base: ");
+            m_Output.WriteHex(m_LoadedKernelBase);
+            m_Output.WriteLine("");
+
+            m_Output.Write("[zOS/Boot] Kernel allocation size: ");
+            m_Output.WriteDecimal(m_LoadedKernelSize);
+            m_Output.WriteLine(" bytes");
+
+            m_Output.WriteLine("[zOS/Boot] Kernel segments loaded and verified.");
+
+            return UEFI::Success;
+        }
+
+        UEFI::Status VerifyLoadedKernel() noexcept {
+            using namespace ELF;
+
+            const auto* header = static_cast<const Header*>(m_KernelImage);
+            const auto* imageBytes = static_cast<const UEFI::Uint8*>(m_KernelImage);
+            const auto* programHeaders = reinterpret_cast<const ProgramHeader*>(
+                imageBytes + header->ProgramHeaderOffset
+            );
+
+            const UEFI::Uint64 allocationEnd = m_LoadedKernelBase + m_LoadedKernelSize;
+            if (allocationEnd < m_LoadedKernelBase)
+                return ReportLoadFailure("loaded kernel allocation range overflows");
+
+            if (m_EntryPoint < m_LoadedKernelBase || m_EntryPoint >= allocationEnd)
+                return ReportLoadFailure("kernel entry point lies outside the loaded allocation");
+
+            for (UEFI::UintN index = 0; index < header->ProgramHeaderCount; ++index) {
+                const ProgramHeader& segment = programHeaders[index];
+
+                if (segment.TypeValue != ProgramType::Load)
+                    continue;
+
+                if (segment.PhysAddress < m_LoadedKernelBase ||
+                    !RangeIsInside(
+                        segment.PhysAddress - m_LoadedKernelBase,
+                        segment.MemorySize,
+                        m_LoadedKernelSize)) {
+                    return ReportLoadFailure("a loaded segment lies outside the kernel allocation");
+                }
+
+                const auto* source = imageBytes + segment.Offset;
+                const auto* destination = reinterpret_cast<const UEFI::Uint8*>(
+                    static_cast<UEFI::UintN>(segment.PhysAddress)
+                );
+
+                for (UEFI::Uint64 byte = 0; byte < segment.FileSize; ++byte) {
+                    if (destination[byte] != source[byte])
+                        return ReportLoadFailure("a loaded segment differs from its ELF file data");
+                }
+
+                for (UEFI::Uint64 byte = segment.FileSize; byte < segment.MemorySize; ++byte) {
+                    if (destination[byte] != 0)
+                        return ReportLoadFailure("a loaded segment's zero-fill region is not zero");
+                }
+            }
+
+            return UEFI::Success;
+        }
+
+        UEFI::Status ReleaseKernelPages() noexcept {
+            if (!m_KernelPagesAllocated) return UEFI::Success;
+
+            const UEFI::Status status = m_BootServices->FreePages(m_LoadedKernelBase, m_LoadedKernelPageCount);
+            if (UEFI::IsError(status))
+                return ReportFailure("releasde the test kernel allocation", status);
+
+            m_LoadedKernelBase = 0;
+            m_LoadedKernelSize = 0;
+            m_LoadedKernelPageCount = 0;
+            m_KernelPagesAllocated = false;
+            return UEFI::Success;
+        }
+
+        UEFI::Status ReportLoadFailure(const char* reason) noexcept {
+            m_Output.Write("[zOS/Boot] ERROR: Loaded kernel verification failed: ");
+            m_Output.Write(reason);
+            m_Output.WriteLine(".");
+            return UEFI::LoadError;
+        }
+
+
         UEFI::Status ReportFailure(const char* operation, UEFI::Status status) noexcept {
             m_Output.Write("[zOS/Boot] ERROR: Failed to ");
             m_Output.Write(operation);
@@ -376,6 +579,12 @@ namespace {
         }
 
         void ReleaseResources() noexcept {
+            if (m_KernelPagesAllocated &&
+                m_BootServices != nullptr &&
+                m_BootServices->FreePages != nullptr) {
+                ReleaseKernelPages();
+            }
+
             if (m_KernelFile != nullptr && m_KernelFile->Close != nullptr) {
                 m_KernelFile->Close(m_KernelFile);
                 m_KernelFile = nullptr;
@@ -438,6 +647,11 @@ namespace {
         UEFI::Uint64 m_EntryPoint{};
         UEFI::UintN m_LoadSegmentCount{};
 
+        UEFI::PhysicalAddress m_LoadedKernelBase{};
+        UEFI::Uint64 m_LoadedKernelSize{};
+        UEFI::UintN m_LoadedKernelPageCount{};
+
+        bool m_KernelPagesAllocated{};
         bool m_LoadedImageProtocolOpen{};
         bool m_FileSystemProtocolOpen{};
     };
