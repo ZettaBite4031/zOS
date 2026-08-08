@@ -2,6 +2,7 @@
 
 namespace Zos::Boot {
     using Uint8 = unsigned char;
+    using Uint16 = unsigned short;
     using Uint32 = unsigned int;
     using Uint64 = unsigned long long;
 
@@ -25,6 +26,37 @@ namespace Zos::Boot {
         Uint64 Size;
     };
 
+    // These values deliberately mirror EFI_MEMORY_TYPE. Keeping the firmware
+    // memory-map ABI in the boot protocol prevents the kernel from depending on
+    // the UEFI loader's implementation headers
+    enum class FirmwareMemoryType : Uint32 {
+        Reserved = 0,
+        LoaderCode = 1,
+        LoaderData = 2,
+        BootServicesCode = 3,
+        BootServicesData = 4,
+        RuntimeServicesCode = 5,
+        RuntimeServicesData = 6,
+        ConventionalMemory = 7,
+        UnusableMemory = 8,
+        AcpiReclaimMemory = 9,
+        AcpiMemoryNvs = 10,
+        MemoryMappedIo = 11,
+        MemoryMappedIoPortSpace = 12,
+        PalCode = 13,
+        PersistentMemory = 14,
+        UnacceptedMemory = 15,
+    };
+
+    struct FirmwareMemoryDescriptor {
+        FirmwareMemoryType Type;
+        Uint32 Reserved;
+        Uint64 PhysStart;
+        Uint64 VirtStart;
+        Uint64 NumPages;
+        Uint64 Attribute;
+    };
+
     struct BootEnvironment_V1 {
         Uint64 Signature;
         Uint32 Version;
@@ -45,6 +77,10 @@ namespace Zos::Boot {
     };
 
     static_assert(sizeof(PhysicalRange) == 16);
+    static_assert(sizeof(FirmwareMemoryDescriptor) == 40);
+    static_assert(__builtin_offsetof(FirmwareMemoryDescriptor, PhysStart) == 8);
+    static_assert(__builtin_offsetof(FirmwareMemoryDescriptor, NumPages) == 24);
+
     static_assert(sizeof(BootEnvironment_V1) == 120);
     static_assert(__builtin_offsetof(BootEnvironment_V1, KernelEntryPoint) == 16);
     static_assert(__builtin_offsetof(BootEnvironment_V1, KernelImage) == 24);

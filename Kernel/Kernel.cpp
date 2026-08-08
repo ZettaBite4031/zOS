@@ -1,5 +1,7 @@
 #include <Boot/Protocol.hpp>
 
+#include <Kernel/Memory/PhysicalMemory.hpp>
+
 namespace {
     using namespace Zos;
 
@@ -50,11 +52,18 @@ namespace {
         for (;;) __asm__ volatile("hlt");
     }
 
-    [[noreturn]] void RejectBootEnvironment(const char* reason) noexcept {
-        WriteDebug("[zOS/Kernel] FATAL: Invalid boot environment: ");
+    [[noreturn]] void Fatal(const char* subsystem, const char* reason) noexcept {
+        WriteDebug("[zSO/");
+        WriteDebug(subsystem);
+        WriteDebug("] FATAL: ");
         WriteDebug(reason);
         WriteDebug(".\n");
         Halt();
+    }
+
+
+    [[noreturn]] void RejectBootEnvironment(const char* reason) noexcept {
+        Fatal("Kernel", reason);
     }
 
     void PrintSignature(Boot::Uint64 signature) {
@@ -63,7 +72,112 @@ namespace {
             if (byte == '\0') break;
             WriteDebugChar(static_cast<char>(byte));
         }
+    }
 
+    void ValidateBootEnvironment(const Boot::BootEnvironment_V1& environment) noexcept {
+        if (environment.Signature != Boot::EnvironmentSignature) 
+            RejectBootEnvironment("signature mismatch");
+
+        if (environment.Version != Boot::ProtocolVersion)
+            RejectBootEnvironment("unsupported protocol version");
+
+        if (environment.Size < sizeof(Boot::BootEnvironment_V1))
+            RejectBootEnvironment("structure is too small");
+
+        if (environment.KernelImage.Size == 0) 
+            RejectBootEnvironment("kernel image range is empty");
+
+        if (environment.KernelStack.Size == 0) 
+            RejectBootEnvironment("kernel stack range is empty");
+
+        if (environment.MemoryMapSize == 0 ||
+            environment.MemoryMapDescriptorSize == 0 ||
+            environment.MemoryMapSize > environment.MemoryMapStorage.Size ||
+            (environment.MemoryMapSize % environment.MemoryMapDescriptorSize) != 0) 
+            RejectBootEnvironment("memory map metadata is inconsistent");
+    }
+
+    void PrintBootEnvironment(const Boot::BootEnvironment_V1& environment) noexcept {
+        WriteDebug("[zOS/Kernel] Boot protocol signature: ");
+        PrintSignature(environment.Signature);
+        WriteDebug("\n");
+
+        WriteDebug("[zOS/Kernel] Boot protocol version: ");
+        WriteDecimal(environment.Version);
+        WriteDebug("\n");
+
+        WriteDebug("[zOS/Kernel] Kernel image: ");
+        WriteHex(environment.KernelImage.Base);
+        WriteDebug(" + ");
+        WriteDecimal(environment.KernelImage.Size);
+        WriteDebug(" bytes\n");
+
+        WriteDebug("[zOS/Kernel] Kernel stack: ");
+        WriteHex(environment.KernelStack.Base);
+        WriteDebug(" + ");
+        WriteDecimal(environment.KernelStack.Size);
+        WriteDebug(" bytes\n");
+
+        WriteDebug("[zOS/Kernel] UEFI memory map: ");
+        WriteDecimal(environment.MemoryMapSize);
+        WriteDebug(" bytes, descriptor size ");
+        WriteDecimal(environment.MemoryMapDescriptorSize);
+        WriteDebug("\n");
+    }
+
+    void RunPhysicalMemorySelfTest(Kernel::Memory::PhysicalMemoryManager& manager) noexcept {
+        using namespace Kernel::Memory;
+
+        const Uint64 free_pages_before = manager.Statistics().FreePages;
+        const Uint64 allocated_pages_before = manager.Statistics().AllocatedPages;
+
+        PhysicalAllocation first{};
+        PhysicalAllocation second{};
+        PhysicalAllocation contiguous{};
+
+        PhysicalAllocationError error = manager.AllocatePage(first);
+        if (error != PhysicalAllocationError::Success)
+            Fatal("Memory", PhysicalMemoryManager::Describe(error));
+
+        error = manager.AllocatePage(second);
+        if (error != PhysicalAllocationError::Success)
+            Fatal("Memory", PhysicalMemoryManager::Describe(error));
+
+        if (first.Base() == second.Base() 
+         || !first.Base().IsPageAligned()
+         || !second.Base().IsPageAligned())
+         Fatal("Memory", "single-page allocation invariant failed");
+
+        PhysicalAllocationConstraints dma32 = PhysicalAllocationConstraints::Dma32();
+        dma32.Alignment = 64 * 1024;
+        error = manager.AllocateContiguous(4, contiguous, dma32);
+        if (error != PhysicalAllocationError::Success) 
+            Fatal("Memory", PhysicalMemoryManager::Describe(error));
+        
+        const Uint64 contiguous_end = contiguous.Base().Value() + contiguous.SizeBytes() - 1;
+        if (contiguous.Base().Value() > Dma32AddressLimit
+         || contiguous_end > Dma32AddressLimit
+         || (contiguous.Base().Value() & ((64 * 1024) - 1)) != 0) {
+            WriteHex(contiguous.Base().Value());
+            Fatal("Memory", "DMA32 allocation constraints were violated");
+        }
+        
+
+        if (manager.Release(second) != PhysicalAllocationError::Success)
+            Fatal("Memory", "single-page release validation failed");
+
+        if (manager.Release(second) != PhysicalAllocationError::CorruptAllocation)
+            Fatal("Memory", "double-free protection failed");
+
+        if (manager.Release(first) != PhysicalAllocationError::Success ||
+            manager.Release(contiguous) != PhysicalAllocationError::Success) 
+            Fatal("Memory", "allocation release validation failed");
+        
+        if (manager.Statistics().FreePages != free_pages_before ||
+            manager.Statistics().AllocatedPages != allocated_pages_before) 
+            Fatal("Memory", "allocation accounting did not return to baseline");
+        
+        WriteDebug("[zOS/Memory] Allocation, DMA32, and double-free self-test passed.\n");
     }
 }
 
@@ -75,56 +189,48 @@ extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void Kernel
     WriteDebug("[zOS/Kernel]=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n");
 
     if (environment == nullptr)
-        RejectBootEnvironment("pointer is null");
+        RejectBootEnvironment("boot environment pointer is null");
 
-    if (environment->Signature != EnvironmentSignature) 
-        RejectBootEnvironment("signature mismatch");
-
-    if (environment->Version != ProtocolVersion)
-        RejectBootEnvironment("unsupported protocol version");
-
-    if (environment->Size < sizeof(BootEnvironment_V1))
-        RejectBootEnvironment("structure is too small");
-
-    if (environment->KernelImage.Size == 0) 
-        RejectBootEnvironment("kernel image range is empty");
-
-    if (environment->KernelStack.Size == 0) 
-        RejectBootEnvironment("kernel stack range is empty");
-
-    if (environment->MemoryMapSize == 0 ||
-        environment->MemoryMapDescriptorSize == 0 ||
-        environment->MemoryMapSize > environment->MemoryMapStorage.Size ||
-        (environment->MemoryMapSize % environment->MemoryMapDescriptorSize) != 0) 
-        RejectBootEnvironment("memory map metadata is inconsistent");
-    
-    WriteDebug("[zOS/Kernel] Boot protocol signature: ");
-    PrintSignature(environment->Signature);
-    WriteDebug("\n");
-
-    WriteDebug("[zOS/Kernel] Boot protocol version: ");
-    WriteDecimal(environment->Version);
-    WriteDebug("\n");
-
-    WriteDebug("[zOS/Kernel] Kernel image: ");
-    WriteHex(environment->KernelImage.Base);
-    WriteDebug(" + ");
-    WriteDecimal(environment->KernelImage.Size);
-    WriteDebug(" bytes\n");
-
-    WriteDebug("[zOS/Kernel] Kernel stack: ");
-    WriteHex(environment->KernelStack.Base);
-    WriteDebug(" + ");
-    WriteDecimal(environment->KernelStack.Size);
-    WriteDebug(" bytes\n");
-
-    WriteDebug("[zOS/Kernel] UEFI memory map: ");
-    WriteDecimal(environment->MemoryMapSize);
-    WriteDebug(" bytes, descriptor size ");
-    WriteDecimal(environment->MemoryMapDescriptorSize);
-    WriteDebug("\n");
+    ValidateBootEnvironment(*environment);
+    PrintBootEnvironment(*environment);
 
     WriteDebug("[zOS/Kernel] Firmware handoff validated.\n");
+
+    Kernel::Memory::PhysicalMemoryManager physical_memory{};
+    const Kernel::Memory::PhysicalMemoryInitializationError initialization = physical_memory.Initialize(*environment);
+    if (initialization != Kernel::Memory::PhysicalMemoryInitializationError::Success) 
+        Fatal("Memory", Kernel::Memory::PhysicalMemoryManager::Describe(initialization));
+
+    const Kernel::Memory::PhysicalMemoryStatistics& statistics = physical_memory.Statistics();
+    const Kernel::Memory::PhysicalSpan metadata = physical_memory.MetadataSpan();
+
+    WriteDebug("[zOS/Memory] Physical allocator initialized.\n");
+    WriteDebug("[zOS/Memory] Conventional memory: ");
+    WriteDecimal(statistics.ConventionalBytes());
+    WriteDebug(" bytes\n");
+    WriteDebug("[zOS/Memory] Free memory: ");
+    WriteDecimal(statistics.FreeBytes());
+    WriteDebug(" bytes\n");
+    WriteDebug("[zOS/Memory] Reserved conventional pages: ");
+    WriteDecimal(statistics.ReservedConventionalPages());
+    WriteDebug("\n");
+    WriteDebug("[zOS/Memory] Deferred boot-service memory: ");
+    WriteDecimal(statistics.DeferredBootBytes());
+    WriteDebug(" bytes\n");
+    WriteDebug("[zOS/Memory] Deferred ACPI reclaim memory: ");
+    WriteDecimal(statistics.DeferredAcpiBytes());
+    WriteDebug(" bytes\n");
+    WriteDebug("[zOS/Memory] Page-state metadata: ");
+    WriteHex(metadata.Base.Value());
+    WriteDebug(" + ");
+    WriteDecimal(metadata.SizeBytes());
+    WriteDebug(" bytes (");
+    WriteDecimal(statistics.MetadataBytes);
+    WriteDebug(" used)\n");
+
+    RunPhysicalMemorySelfTest(physical_memory);
+
+    WriteDebug("[zOS/Kernel] Physical memory ownership established");
 
     __asm__ volatile("cli");
     for (;;) {
