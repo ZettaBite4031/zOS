@@ -13,6 +13,7 @@ repo_root = Path(Dir("#").abspath)
 sys.path.insert(0, str(repo_root / "BuildSystem"))
 
 from Environments import CreateKernelEnvironment, CreateUefiEnvironment
+from Execution import CreateQemuCommand
 from Toolchain import Toolchain
 
 configuration = ARGUMENTS.get("Configuration", "Debug")
@@ -26,8 +27,8 @@ toolchain = Toolchain.Load(repo_root)
 uefi_environment = CreateUefiEnvironment(repo_root, toolchain, configuration)
 kernel_environment = CreateKernelEnvironment(repo_root, toolchain, configuration)
 
-loader = SConscript("Boot/UEFI/SConscript", exports={"uefi_environment": uefi_environment, "output_root": output_root})
-kernel = SConscript("Kernel/SConscript", exports={"kernel_environment": kernel_environment, "output_root": output_root})
+loader = SConscript("Boot/UEFI/SConscript", exports={ "uefi_environment": uefi_environment, "output_root": output_root })
+kernel = SConscript("Kernel/SConscript", exports={ "kernel_environment": kernel_environment, "output_root": output_root })
 
 host_execution_environment = os.environ.copy()
 host_execution_environment["PATH"] = f"{toolchain.Bin}{os.pathsep}{host_execution_environment.get('PATH', '')}"
@@ -35,10 +36,7 @@ host_execution_environment["PATH"] = f"{toolchain.Bin}{os.pathsep}{host_executio
 host_environment = Environment(tools=[], ENV=host_execution_environment)
 host_environment["LLVM_NM"] = str(toolchain.LlvmNm)
 host_environment["LLVM_READOBJ"] = str(toolchain.LlvmReadObj)
-host_environment["QEMU"] = str(toolchain.Qemu)
-host_environment["OVMF_CODE"] = str(toolchain.OvmfCode)
-host_environment["OVMF_VARIABLES_TEMPLATE"] = str(toolchain.OvmfVariablesTemplate)
-host_environment["QEMU_ACCELERATOR"] = toolchain.QemuAccelerator
+
 
 def CopyFile(target, source, env):
     destination = Path(str(target[0]))
@@ -47,13 +45,10 @@ def CopyFile(target, source, env):
     shutil.copy2(origin, destination)
     return 0
 
+
 def VerifyUefi(target, source, env):
     image = Path(str(source[0]))
-    output = subprocess.check_output(
-        [env["LLVM_READOBJ"], "--file-headers", str(image)],
-        text=True,
-        stderr=subprocess.STDOUT,
-    )
+    output = subprocess.check_output([env["LLVM_READOBJ"], "--file-headers", str(image)], text=True, stderr=subprocess.STDOUT)
 
     required = ("Format: COFF-x86-64", "IMAGE_SUBSYSTEM_EFI_APPLICATION")
     missing = [value for value in required if value not in output]
@@ -66,21 +61,15 @@ def VerifyUefi(target, source, env):
     stamp.write_text("UEFI image verified.\n", encoding="utf-8")
     return 0
 
+
 def VerifyKernel(target, source, env):
     image = Path(str(source[0]))
-    headers = subprocess.check_output(
-        [env["LLVM_READOBJ"], "--file-headers", str(image)],
-        text=True,
-        stderr=subprocess.STDOUT,
-    )
-    symbols = subprocess.check_output(
-        [env["LLVM_NM"], "--defined-only", str(image)],
-        text=True,
-        stderr=subprocess.STDOUT,
-    )
+    headers = subprocess.check_output([env["LLVM_READOBJ"], "--file-headers", str(image)], text=True, stderr=subprocess.STDOUT)
+    symbols = subprocess.check_output([env["LLVM_NM"], "--defined-only", str(image)], text=True, stderr=subprocess.STDOUT)
 
     required_headers = ("Format: elf64-x86-64", "Arch: x86_64")
-    missing = [value for value in required_headers if value not in headers]
+    missing = [ value for value in required_headers if value not in headers ]
+
     if missing or "KernelMain" not in symbols:
         print(headers)
         print(symbols)
@@ -91,69 +80,14 @@ def VerifyKernel(target, source, env):
     stamp.write_text("Kernel ELF image verified.\n", encoding="utf-8")
     return 0
 
+
 def RunQemu(target, source, env):
-    accelerator = env["QEMU_ACCELERATOR"]
-
-    output_directory = (
-        repo_root 
-        / "Output"
-        / configuration
-        / architecture
-    )
-
-    esp_directory = output_directory / "ESP"
-    variables_path = (
-        output_directory
-        / "Firmware"
-        / "OVMF_VARS.fd"
-    )
-
-    processor = "host" if accelerator == "kvm" else "max"
-
-    command = [
-        str(env["QEMU"]),
-        "-machine",
-        "q35",
-        "-accel",
-        accelerator,
-        "-cpu",
-        processor,
-        "-m",
-        "512M",
-        "-drive",
-        (
-            "if=pflash,"
-            "format=raw,"
-            "readonly=on,"
-            f"file={env['OVMF_CODE']}"
-        ),
-        "-drive",
-        (
-            "if=pflash,"
-            "format=raw,"
-            f"file={variables_path}"
-        ),
-        "-drive",
-        f"format=raw,file=fat:rw:{esp_directory}",
-        "-display",
-        "gtk",
-        "-debugcon",
-        "stdio",
-        "-global",
-        "isa-debugcon.iobase=0xe9",
-        "-nic",
-        "none",
-        "-no-reboot",
-        "-no-shutdown",
-    ]
+    command = CreateQemuCommand(repo_root, toolchain, configuration, architecture)
 
     print("Starting QEMU.")
     print("Press Ctrl+C once to stop the emulator.")
 
-    process = subprocess.Popen(
-        command,
-        start_new_session=True,
-    )
+    process = subprocess.Popen(command, start_new_session=True)
 
     try:
         return_code = process.wait()
@@ -195,7 +129,7 @@ def RunQemu(target, source, env):
         return 0
 
     return return_code
-    return subprocess.run(command, check=False).returncode
+
 
 loader_verification = host_environment.Command(
     target=f"{output_root}/Verification/UEFI.stamp",
@@ -224,21 +158,16 @@ ovmf_variables = host_environment.Command(
     action=Action(CopyFile, "Preparing OVMF variable store $TARGET"),
 )
 
-build_products = [
-    loader_verification,
-    kernel_verification,
-    staged_loader,
-    staged_kernel,
-]
+build_products = [ loader_verification, kernel_verification, staged_loader, staged_kernel ]
 
 Default(build_products)
 Alias("build", build_products)
 Alias("verify", [loader_verification, kernel_verification])
 
-run = host_environment.Alias(
-    "run",
-    [*build_products, ovmf_variables],
-    Action(RunQemu, "Running zOS under QEMU"),
-)
-AlwaysBuild(run)
+# Build.py uses this non-interactive alias before starting a debug session.
+# Keeping preparation inside SCons preserves the same dependency graph used by
+# normal runs without placing an interactive GDB process inside an SCons action.
+Alias("debug-build", [*build_products, ovmf_variables])
 
+run = host_environment.Alias("run", [*build_products, ovmf_variables], Action( RunQemu, "Running zOS under QEMU"))
+AlwaysBuild(run)
