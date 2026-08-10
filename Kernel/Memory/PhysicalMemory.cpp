@@ -116,6 +116,9 @@ namespace Zos::Kernel::Memory {
                 Uint64 other_end = 0;
                 if (!TryDescriptorEnd(other, other_end)) 
                     return PhysicalMemoryInitializationError::DescriptorRangeOverflow;
+
+                if (Overlaps(descriptor.PhysStart, descriptor_end, other.PhysStart, other_end))
+                    return PhysicalMemoryInitializationError::DescriptorRangesOverlap;
             }
 
             if (!IsManagedType(descriptor.Type)) continue;
@@ -217,8 +220,10 @@ namespace Zos::Kernel::Memory {
         for (Uint64 i = 0; i < m_MetadataSpan.SizeBytes(); i++) 
             storage[i] = 0;
 
+        const Uint64 region_metadata_bytes = managed_region_capacity * sizeof(ManagedRegion);
+
         m_Regions = reinterpret_cast<ManagedRegion*>(storage);
-        m_PageStates = storage + (managed_region_capacity * sizeof(ManagedRegion));
+        m_PageStates = storage + region_metadata_bytes;
         m_Statistics.ManagedPages = managed_pages;
     }
 
@@ -433,7 +438,12 @@ namespace Zos::Kernel::Memory {
         if (managed_region_capacity > MaximumValue / sizeof(ManagedRegion)) 
             return PhysicalMemoryInitializationError::MetadataSizeOverflow;
 
-        const Uint64 metadata_bytes = managed_region_capacity * sizeof(ManagedRegion);
+        const Uint64 region_metadata_bytes = managed_region_capacity * sizeof(ManagedRegion);
+        if (managed_pages > MaximumValue - region_metadata_bytes) 
+            return PhysicalMemoryInitializationError::MetadataSizeOverflow;
+
+        const Uint64 page_state_bytes = managed_pages * sizeof(Uint8);
+        const Uint64 metadata_bytes = region_metadata_bytes + page_state_bytes;
         Uint64 metadata_allocation_bytes = 0;
         if (!TryAlignUp(metadata_bytes, PageSize, metadata_allocation_bytes))
             return PhysicalMemoryInitializationError::MetadataSizeOverflow;

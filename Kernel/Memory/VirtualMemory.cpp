@@ -90,10 +90,11 @@ namespace Zos::Kernel::Memory {
 
         InitializePage(new_page);
 
+        const PhysicalAddress new_page_address = page.Base();
         auto* ownership = reinterpret_cast<PhysicalAllocation*>(reinterpret_cast<Uint8*>(m_CurrentPage) + ReservedOwnershipOffset());
 
         new (ownership) PhysicalAllocation(static_cast<PhysicalAllocation&&>(page));
-        m_CurrentPage->Next = new_page;
+        m_CurrentPage->Next = new_page_address;
         m_CurrentPage = new_page;
         m_Statistics.PageCount++;
         return true;
@@ -134,6 +135,18 @@ namespace Zos::Kernel::Memory {
         if (storage == nullptr) return nullptr;
 
         return new (storage) PhysicalAllocation(static_cast<PhysicalAllocation&&>(allocation));
+    }
+
+    PhysicalAddress BootstrapMetadataArena::BackingPage(Uint64 index) const noexcept {
+        if (!IsInitialized() || index >= m_Statistics.PageCount) return {};
+
+        PhysicalAddress address = m_FirstPageAllocation.Base();
+        for (Uint64 current = 0; current < index; current ++) {
+            const auto* header = static_cast<const PageHeader*>(BootstrapPointer(address));
+            if (header == nullptr || header->Next.IsNull()) return {};
+            address = header->Next;
+        }
+        return address;
     }
 
     const char* BootstrapMetadataArena::Describe(MetadataArenaInitializationError error) noexcept {

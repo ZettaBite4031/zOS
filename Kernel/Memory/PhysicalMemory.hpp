@@ -67,7 +67,7 @@ namespace Zos::Kernel::Memory {
     class PhysicalMemoryManager;
 
     // An ownership token, not merely an address. It cannot be copied or forged
-    // outside the PPM. Release() consumes it, preventing normal double/partial
+    // outside the PMM. Release() consumes it, preventing normal double/partial
     // frees and accidental cross-manager releases.
     class PhysicalAllocation final {
     public:

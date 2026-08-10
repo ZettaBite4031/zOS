@@ -44,7 +44,7 @@ def CreateUefiEnvironment(repo_root: Path, toolchain: Toolchain, config: str):
     )
 
     if config == "Debug":
-        environment.Append(CXXFLAGS=["-O0", "-g"])
+        environment.Append(CXXFLAGS=["-O0", "-g", "-fno-omit-frame-pointer"])
     else:
         environment.Append(CXXFLAGS=["-O2", "-g"])
 
@@ -94,7 +94,7 @@ def CreateKernelEnvironment(repo_root: Path, toolchain: Toolchain, config: str):
     )
 
     if config == "Debug":
-        environment.Append(CXXFLAGS=["-O0", "-g"])
+        environment.Append(CXXFLAGS=["-O0", "-g", "-fno-omit-frame-pointer"])
     else:
         environment.Append(CXXFLAGS=["-O2", "-g"])
 

@@ -196,7 +196,7 @@ def main() -> int:
 
     arguments = sys.argv[1:] or ["build"]
 
-    targets = [ argument for argument in arguments if "=" not in argument ]
+    targets = [ argument for argument in arguments if "=" not in argument and not argument.startswith("-") ]
 
     if "debug" not in targets:
         return _run_scons(repository_root, scons_path, arguments)
@@ -217,7 +217,7 @@ def main() -> int:
         print("GdbPort must be an integer.", file=sys.stderr)
         return 1
 
-    scons_arguments = [ "debug-build", *[ argument for argument in arguments if "=" in argument and not argument.startswith("GdbPort=") ] ]
+    scons_arguments = [ "debug-build", *[ argument for argument in arguments if ( argument.startswith("-") or "=" in argument ) and not argument.startswith("GdbPort=") ] ]
 
     build_result = _run_scons(repository_root, scons_path, scons_arguments)
     if build_result != 0:

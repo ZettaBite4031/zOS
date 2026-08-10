@@ -24,10 +24,14 @@ namespace Zos::Kernel::Memory {
         friend constexpr bool operator<=(PhysicalAddress left, PhysicalAddress right) noexcept { return left.m_Value <= right.m_Value; }
         friend constexpr bool operator>(PhysicalAddress left, PhysicalAddress right) noexcept { return right < left; }
         friend constexpr bool operator>=(PhysicalAddress left, PhysicalAddress right) noexcept { return right <= left; }
+
         
     private:
         Uint64 m_Value{};
     };
+
+    [[nodiscard]] inline constexpr PhysicalAddress operator+(PhysicalAddress address, Uint64 offset) noexcept { return PhysicalAddress(address.Value() + offset); }
+    [[nodiscard]] inline constexpr PhysicalAddress operator-(PhysicalAddress address, Uint64 offset) noexcept { return PhysicalAddress(address.Value() - offset); }
 
     class VirtualAddress final {
         public:
@@ -48,6 +52,9 @@ namespace Zos::Kernel::Memory {
     private:
         Uint64 m_Value{};
     };
+
+    [[nodiscard]] inline constexpr VirtualAddress operator+(VirtualAddress address, Uint64 offset) noexcept { return VirtualAddress(address.Value() + offset); }
+    [[nodiscard]] inline constexpr VirtualAddress operator-(VirtualAddress address, Uint64 offset) noexcept { return VirtualAddress(address.Value() - offset); }
 
     struct PhysicalSpan final {
         PhysicalAddress Base{};

@@ -183,49 +183,59 @@ namespace {
         WriteDebug("[zOS/Memory] Allocation, DMA32, and double-free self-test passed.\n");
     }
 
+    void InitializeVirtualMemoryInfrastructure(Kernel::Memory::PhysicalMemoryManager& physical_memory, Kernel::Memory::BootstrapMetadataArena& metadata, Kernel::Memory::VirtualAddressAllocator& kernel_addresses, Kernel::Architecture::AMD64::PageMap& page_map) noexcept {
+        using namespace Kernel::Memory;
+        using namespace Kernel::Architecture::AMD64;
+
+        const MetadataArenaInitializationError metadata_error = metadata.Initialize(physical_memory);
+        if (metadata_error != MetadataArenaInitializationError::Success) 
+            Fatal("VMM", BootstrapMetadataArena::Describe(metadata_error));
+
+        const VirtualAllocationError virtual_error = kernel_addresses.Initialize(Layout::KernelDynamicSpan(), metadata);
+        if (virtual_error != VirtualAllocationError::Success) 
+            Fatal("VMM", VirtualAddressAllocator::Describe(virtual_error));
+        
+
+        const PageMapInitializationError page_map_error = page_map.Initialize(physical_memory, metadata);
+        if (page_map_error != PageMapInitializationError::Success) 
+            Fatal("VMM", PageMap::Describe(page_map_error));
+        
+    }
+
     void RunVirtualMemoryInfrastructureSelfTest(Kernel::Memory::PhysicalMemoryManager& physical_memory, Kernel::Memory::BootstrapMetadataArena& metadata, Kernel::Memory::VirtualAddressAllocator& kernel_addresses, Kernel::Architecture::AMD64::PageMap& page_map) noexcept {
         using namespace Kernel::Memory;
         using Kernel::Architecture::AMD64::MappingError;
         using Kernel::Architecture::AMD64::PageMap;
         using Kernel::Architecture::AMD64::PageMapInitializationError;
 
-        const MetadataArenaInitializationError metadata_error = metadata.Initialize(physical_memory);
-        if (metadata_error != MetadataArenaInitializationError::Success) 
-            Fatal("VMM194", BootstrapMetadataArena::Describe(metadata_error));
-
-        VirtualAllocationError virtual_error = kernel_addresses.Initialize(Layout::KernelDynamicSpan(), metadata);
-        if (virtual_error != VirtualAllocationError::Success) 
-            Fatal("VMM198", VirtualAddressAllocator::Describe(virtual_error));
+        if (!metadata.IsInitialized() || !kernel_addresses.IsInitialized() || !physical_memory.IsInitialized())
+            Fatal("VMM", "self-test dependencies are not initialized");
 
         const Uint64 free_virtual_pages_before = kernel_addresses.Statistics().FreePages;
 
         VirtualReservation lead_reservation{};
-        virtual_error = kernel_addresses.Reserve(1, lead_reservation);
+        VirtualAllocationError virtual_error = kernel_addresses.Reserve(1, lead_reservation);
         if (virtual_error != VirtualAllocationError::Success) 
-            Fatal("VMM205", VirtualAddressAllocator::Describe(virtual_error));
+            Fatal("VMM", VirtualAddressAllocator::Describe(virtual_error));
 
          VirtualReservation reservation{};
         VirtualAllocationConstraints virtual_constraints{};
         virtual_constraints.Alignment = 64 * 1024;
         virtual_error = kernel_addresses.Reserve(4, reservation, virtual_constraints);
         if (virtual_error != VirtualAllocationError::Success)
-            Fatal("VMM212", VirtualAddressAllocator::Describe(virtual_error));
+            Fatal("VMM", VirtualAddressAllocator::Describe(virtual_error));
 
         if (!reservation.Base().IsPageAligned() ||
             (reservation.Base().Value() & ((64 * 1024) - 1)) != 0 ||
             reservation.PageCount() != 4 ||
             reservation.Base() == lead_reservation.Base()) {
-            Fatal("VMM218", "virtual reservation alignment invariant failed");
+            Fatal("VMM", "virtual reservation alignment invariant failed");
         }
 
         PhysicalAllocation backing{};
         PhysicalAllocationError physical_error = physical_memory.AllocateContiguous(4, backing);
         if (physical_error != PhysicalAllocationError::Success) 
-            Fatal("VMM224", PhysicalMemoryManager::Describe(physical_error));
-
-        const PageMapInitializationError page_map_error = page_map.Initialize(physical_memory, metadata);
-        if (page_map_error != PageMapInitializationError::Success) 
-            Fatal("VMM228", PageMap::Describe(page_map_error));
+            Fatal("VMM", PhysicalMemoryManager::Describe(physical_error));
 
         const MappingOptions options{
             .Access = PageAccess::Read | PageAccess::Write | PageAccess::Global,
@@ -237,11 +247,12 @@ namespace {
             const PhysicalAddress physical_address{ backing.Base().Value() + page * PageSize };
             const MappingError mapping_error = page_map.MapPage(virtual_address, physical_address, options);
             if (mapping_error != MappingError::Success) 
-                Fatal("VMM240", PageMap::Describe(mapping_error));
+                Fatal("VMM", PageMap::Describe(mapping_error));
         }
 
-        const VirtualAddress probe_virtual(reservation.Base().Value() + PageSize + 0x2A5);
-        const PhysicalAddress expected_physical(backing.Base().Value() + PageSize + 0x2A5);
+        const Uint64 probe_offset = PageSize + 0x2A5;
+        const VirtualAddress probe_virtual = reservation.Base() + probe_offset;
+        const PhysicalAddress expected_physical = backing.Base() + probe_offset;
         const auto translation = page_map.Translate(probe_virtual);
         if (!translation.Mapped ||
             translation.Physical != expected_physical ||
@@ -362,9 +373,10 @@ extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void Kernel
 
     Kernel::Memory::BootstrapMetadataArena virtual_metadata{};
     Kernel::Memory::VirtualAddressAllocator kernel_addresses{};
-    Kernel::Architecture::AMD64::PageMap test_page_map{};
+    Kernel::Architecture::AMD64::PageMap kernel_page_map{};
 
-    RunVirtualMemoryInfrastructureSelfTest(physical_memory, virtual_metadata, kernel_addresses, test_page_map);
+    InitializeVirtualMemoryInfrastructure(physical_memory, virtual_metadata, kernel_addresses, kernel_page_map);
+    RunVirtualMemoryInfrastructureSelfTest(physical_memory, virtual_metadata, kernel_addresses, kernel_page_map);
     WriteDebug("[zOS/Kernel] Virtual-Memory infrastructure established.\n");
 
     __asm__ volatile("cli");

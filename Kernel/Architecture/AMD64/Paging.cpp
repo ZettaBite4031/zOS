@@ -25,6 +25,15 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return address.Value() & (PageSize - 1);
     }
 
+    PhysicalAddress PageMap::TablePage(Uint64 index) const noexcept {
+        const TableRecord* record = m_TableRecords;
+
+        for (Uint64 current = 0; record != nullptr && current < index; current++) 
+            record = record->Next;
+
+        return record != nullptr ? record->Address : PhysicalAddress{};
+    }
+
     bool PageMap::IsCanonical(VirtualAddress address) noexcept {
         const Uint64 value = address.Value();
         const Uint64 upper = value >> 48;
@@ -117,13 +126,11 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return PageMapInitializationError::MetadataAllocationFailed;
         }
 
-        void* record_storage = m_Metadata->Allocate(sizeof(TableRecord), alignof(TableRecord));
-        if (record_storage == nullptr) {
+        TableRecord* record = AcquireTableRecord();
+        if (record == nullptr) {
             (void)m_PhysicalMemory->Release(*ownership);
             return PageMapInitializationError::MetadataAllocationFailed;
         }
-
-        auto* record = static_cast<TableRecord*>(record_storage);
         record->Address = address;
         record->Ownership = ownership;
         record->Previous = nullptr;
@@ -146,6 +153,22 @@ namespace Zos::Kernel::Architecture::AMD64 {
         }
     }
 
+    PageMap::TableRecord* PageMap::AcquireTableRecord() noexcept {
+        if (m_RecycledTableRecords != nullptr) {
+            TableRecord* record = m_RecycledTableRecords;
+            m_RecycledTableRecords = record->NextFree;
+            *record = {};
+            return record;
+        }
+
+        void* storage = m_Metadata->Allocate(sizeof(TableRecord), alignof(TableRecord));
+        if (storage == nullptr) return nullptr;
+
+        auto* record = static_cast<TableRecord*>(storage);
+        *record = {};
+        return record;
+    }
+
     bool PageMap::ReleaseTable(PhysicalAddress address) noexcept {
         if (address == m_RootTable) return false;
 
@@ -158,10 +181,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         if (record->Next != nullptr) record->Next->Previous = record->Previous;
 
-        record->Address = {};
-        record->Ownership = nullptr;
-        record->Previous = nullptr;
-        record->Next = nullptr;
+        RecycleTableRecord(*record);
 
         if (m_Statistics.TablePages != 0) m_Statistics.TablePages--;
 
@@ -259,6 +279,35 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return next;
     }
 
+    PageMap::Entry* PageMap::ResolveExistingNextTable(Entry* table, Uint64 index, MappingError& error) noexcept {
+        const Entry entry = table[index];
+
+        if ((entry & Present) == 0) {
+            error = MappingError::NotMapped;
+            return nullptr;
+        }
+
+        if ((entry & LargePage) != 0) {
+            error = MappingError::UnsupportedLargePage;
+            return nullptr;
+        }
+
+        const PhysicalAddress address = EntryAddress(entry);
+        if (address.IsNull() || !address.IsPageAligned() || FindTableRecord(address) == nullptr) {
+            error = MappingError::CorruptPageTable;
+            return nullptr;
+        }
+
+        Entry* next = BootstrapTablePointer(address);
+        if (next == nullptr) {
+            error = MappingError::CorruptPageTable;
+            return nullptr;
+        }
+
+        error = MappingError::Success;
+        return next;
+    }
+
     bool PageMap::RollbackResolution(TableResolution& resolution) noexcept {
         if (!resolution.Created && !resolution.Modified) return true;
         if (resolution.ParentEntry == nullptr) return false;
@@ -272,6 +321,17 @@ namespace Zos::Kernel::Architecture::AMD64 {
         *resolution.ParentEntry = resolution.OriginalEntry;
         resolution = {};
         return true;
+    }
+
+    void PageMap::RecycleTableRecord(TableRecord& record) noexcept {
+        record.Address = {};
+        record.Ownership = nullptr;
+        record.Previous = nullptr;
+        record.Next = nullptr;
+
+        record.NextFree = m_RecycledTableRecords;
+
+        m_RecycledTableRecords = &record;
     }
 
     MappingError PageMap::MapPage(VirtualAddress virt_addr, PhysicalAddress phys_addr, MappingOptions options) noexcept {
@@ -329,24 +389,33 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if (!IsCanonical(virt_addr) || !virt_addr.IsPageAligned()) return MappingError::InvalidVirtualAddress; 
 
         Entry* pml4 = BootstrapTablePointer(m_RootTable);
+        if (pml4 == nullptr) return MappingError::CorruptPageTable;
+        
         Entry& pml4_entry = pml4[Pml4Index(virt_addr)];
         if ((pml4_entry & Present) == 0) return MappingError::NotMapped;
         if ((pml4_entry & LargePage) != 0) return MappingError::UnsupportedLargePage;
-
+        
         const PhysicalAddress pdpt_address = EntryAddress(pml4_entry);
-        Entry* pdpt = BootstrapTablePointer(pdpt_address);
+        MappingError error = MappingError::Success;
+        Entry* pdpt = ResolveExistingNextTable(pml4, Pml4Index(virt_addr), error);
+        if (pdpt == nullptr) return error;
+
         Entry& pdpt_entry = pdpt[PdptIndex(virt_addr)];
         if ((pdpt_entry & Present) == 0) return MappingError::NotMapped;
         if ((pdpt_entry & LargePage) != 0) return MappingError::UnsupportedLargePage;
 
         const PhysicalAddress pd_address = EntryAddress(pdpt_entry);
-        Entry* pd = BootstrapTablePointer(pd_address);
+        Entry* pd = ResolveExistingNextTable(pdpt, PdptIndex(virt_addr), error);
+        if (pd == nullptr) return error;
+
         Entry& pd_entry = pd[PdIndex(virt_addr)];
         if ((pd_entry & Present) == 0) return MappingError::NotMapped;
         if ((pd_entry & LargePage) != 0) return MappingError::UnsupportedLargePage;
-
+        
         const PhysicalAddress pt_address = EntryAddress(pd_entry);
-        Entry* pt = BootstrapTablePointer(pt_address);
+        Entry* pt = ResolveExistingNextTable(pd, PdIndex(virt_addr), error);
+        if (pt == nullptr) return error;
+
         Entry& leaf = pt[PtIndex(virt_addr)];
         if ((leaf & Present) == 0) return MappingError::NotMapped;
 

@@ -57,6 +57,9 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] bool IsInitialized() const noexcept { return !m_RootTable.IsNull(); }
         [[nodiscard]] Memory::PhysicalAddress RootTable() const noexcept { return m_RootTable; }
         [[nodiscard]] const PageMapStatistics& Statistics() const noexcept { return m_Statistics; }
+        [[nodiscard]] Memory::Uint64 TablePageCount() const noexcept { return m_Statistics.TablePages; }
+
+        [[nodiscard]] Memory::PhysicalAddress TablePage(Memory::Uint64 index) const noexcept;
 
         [[nodiscard]] static bool IsCanonical(Memory::VirtualAddress address) noexcept;
         [[nodiscard]] static const char* Describe(PageMapInitializationError error) noexcept;
@@ -89,6 +92,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             Memory::PhysicalAllocation* Ownership{};
             TableRecord* Previous{};
             TableRecord* Next{};
+            TableRecord* NextFree{};
         };
 
         struct TableResolution final {
@@ -113,17 +117,21 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] Entry* BootstrapTablePointer(Memory::PhysicalAddress address) const noexcept;
         [[nodiscard]] PageMapInitializationError AllocateTable(Memory::PhysicalAddress& output) noexcept;
         [[nodiscard]] MappingError AllocateTableForMapping(Memory::PhysicalAddress& output) noexcept;
+        [[nodiscard]] TableRecord* AcquireTableRecord() noexcept;
         [[nodiscard]] TableRecord* FindTableRecord(Memory::PhysicalAddress address) noexcept;
         [[nodiscard]] const TableRecord* FindTableRecord(Memory::PhysicalAddress address) const noexcept;
         [[nodiscard]] bool ReleaseTable(Memory::PhysicalAddress address) noexcept;
         [[nodiscard]] MappingError ResolveNextTable(Entry* table, Memory::Uint64 index, bool userMapping, TableResolution& output) noexcept;
         [[nodiscard]] const Entry* ResolveExistingNextTable(const Entry* table, Memory::Uint64 index, MappingError& error) const noexcept;
+        [[nodiscard]] Entry* ResolveExistingNextTable(Entry* table, Memory::Uint64 index, MappingError& error) noexcept;
         [[nodiscard]] bool RollbackResolution(TableResolution& resolution) noexcept;
+        void RecycleTableRecord(TableRecord& record) noexcept;
 
         Memory::PhysicalMemoryManager* m_PhysicalMemory{};
         Memory::BootstrapMetadataArena* m_Metadata{};
         Memory::PhysicalAddress m_RootTable{};
         TableRecord* m_TableRecords{};
+        TableRecord* m_RecycledTableRecords{};
         PageMapStatistics m_Statistics{};
     };
 }

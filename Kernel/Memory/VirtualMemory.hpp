@@ -63,12 +63,15 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] bool IsInitialized() const noexcept { return m_PhysicalMemory != nullptr; }
         [[nodiscard]] const MetadataArenaStatistics& Statistics() const noexcept { return m_Statistics; }
         [[nodiscard]] PhysicalAddress FirstPage() const noexcept { return m_FirstPageAllocation.Base(); }
+        [[nodiscard]] Uint64 BackingPageCount() const noexcept { return m_Statistics.PageCount; }
+
+        [[nodiscard]] PhysicalAddress BackingPage(Uint64 index) const noexcept;
 
         [[nodiscard]] static const char* Describe(MetadataArenaInitializationError error) noexcept;
 
     private:
         struct PageHeader final {
-            PageHeader* Next{};
+            PhysicalAddress Next{};
             Uint64 Offset{};
         };
 
