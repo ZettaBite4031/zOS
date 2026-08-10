@@ -1,6 +1,9 @@
 #include <Boot/Protocol.hpp>
 
+#include <Kernel/Architecture/AMD64/Paging.hpp>
+
 #include <Kernel/Memory/PhysicalMemory.hpp>
+#include <Kernel/Memory/VirtualMemory.hpp>
 
 namespace {
     using namespace Zos;
@@ -179,6 +182,132 @@ namespace {
         
         WriteDebug("[zOS/Memory] Allocation, DMA32, and double-free self-test passed.\n");
     }
+
+    void RunVirtualMemoryInfrastructureSelfTest(Kernel::Memory::PhysicalMemoryManager& physical_memory, Kernel::Memory::BootstrapMetadataArena& metadata, Kernel::Memory::VirtualAddressAllocator& kernel_addresses, Kernel::Architecture::AMD64::PageMap& page_map) noexcept {
+        using namespace Kernel::Memory;
+        using Kernel::Architecture::AMD64::MappingError;
+        using Kernel::Architecture::AMD64::PageMap;
+        using Kernel::Architecture::AMD64::PageMapInitializationError;
+
+        const MetadataArenaInitializationError metadata_error = metadata.Initialize(physical_memory);
+        if (metadata_error != MetadataArenaInitializationError::Success) 
+            Fatal("VMM194", BootstrapMetadataArena::Describe(metadata_error));
+
+        VirtualAllocationError virtual_error = kernel_addresses.Initialize(Layout::KernelDynamicSpan(), metadata);
+        if (virtual_error != VirtualAllocationError::Success) 
+            Fatal("VMM198", VirtualAddressAllocator::Describe(virtual_error));
+
+        const Uint64 free_virtual_pages_before = kernel_addresses.Statistics().FreePages;
+
+        VirtualReservation lead_reservation{};
+        virtual_error = kernel_addresses.Reserve(1, lead_reservation);
+        if (virtual_error != VirtualAllocationError::Success) 
+            Fatal("VMM205", VirtualAddressAllocator::Describe(virtual_error));
+
+         VirtualReservation reservation{};
+        VirtualAllocationConstraints virtual_constraints{};
+        virtual_constraints.Alignment = 64 * 1024;
+        virtual_error = kernel_addresses.Reserve(4, reservation, virtual_constraints);
+        if (virtual_error != VirtualAllocationError::Success)
+            Fatal("VMM212", VirtualAddressAllocator::Describe(virtual_error));
+
+        if (!reservation.Base().IsPageAligned() ||
+            (reservation.Base().Value() & ((64 * 1024) - 1)) != 0 ||
+            reservation.PageCount() != 4 ||
+            reservation.Base() == lead_reservation.Base()) {
+            Fatal("VMM218", "virtual reservation alignment invariant failed");
+        }
+
+        PhysicalAllocation backing{};
+        PhysicalAllocationError physical_error = physical_memory.AllocateContiguous(4, backing);
+        if (physical_error != PhysicalAllocationError::Success) 
+            Fatal("VMM224", PhysicalMemoryManager::Describe(physical_error));
+
+        const PageMapInitializationError page_map_error = page_map.Initialize(physical_memory, metadata);
+        if (page_map_error != PageMapInitializationError::Success) 
+            Fatal("VMM228", PageMap::Describe(page_map_error));
+
+        const MappingOptions options{
+            .Access = PageAccess::Read | PageAccess::Write | PageAccess::Global,
+            .Cache = CachePolicy::WriteBack,
+        };
+
+        for (Uint64 page = 0; page < reservation.PageCount(); page++) {
+            const VirtualAddress virtual_address{ reservation.Base().Value() + page * PageSize };
+            const PhysicalAddress physical_address{ backing.Base().Value() + page * PageSize };
+            const MappingError mapping_error = page_map.MapPage(virtual_address, physical_address, options);
+            if (mapping_error != MappingError::Success) 
+                Fatal("VMM240", PageMap::Describe(mapping_error));
+        }
+
+        const VirtualAddress probe_virtual(reservation.Base().Value() + PageSize + 0x2A5);
+        const PhysicalAddress expected_physical(backing.Base().Value() + PageSize + 0x2A5);
+        const auto translation = page_map.Translate(probe_virtual);
+        if (!translation.Mapped ||
+            translation.Physical != expected_physical ||
+            !HasAccess(translation.Options.Access, PageAccess::Read) ||
+            !HasAccess(translation.Options.Access, PageAccess::Write) ||
+            !HasAccess(translation.Options.Access, PageAccess::Global) ||
+            HasAccess(translation.Options.Access, PageAccess::Execute) ||
+            translation.Options.Cache != CachePolicy::WriteBack) {
+            Fatal("VMM", "page-table translation or permission decoding failed");
+        }
+
+        if (page_map.MapPage(reservation.Base(), backing.Base(), options) != MappingError::AlreadyMapped)
+            Fatal("VMM", "duplicate mapping protection failed");
+
+        const MappingOptions invalid_options{
+            .Access = PageAccess::Read | PageAccess::Write | PageAccess::Execute,
+            .Cache = CachePolicy::WriteBack,
+        };
+        if (page_map.MapPage(VirtualAddress(reservation.Base().Value() + reservation.SizeBytes()), backing.Base(), invalid_options) != MappingError::InvalidPermissions)
+            Fatal("VMM", "W^X mapping policy failed");
+        
+        if (page_map.MapPage(VirtualAddress(0), backing.Base(), options) != MappingError::InvalidVirtualAddress)
+            Fatal("VMM", "null-region mapping protection failed");
+
+        for (Uint64 page = 0; page < reservation.PageCount(); page++) {
+            const VirtualAddress virtual_address(reservation.Base().Value() + page * PageSize);
+            if (page_map.UnmapPage(virtual_address) != MappingError::Success) 
+                Fatal("VMM", "page-table unmap failed");
+            if (page_map.IsMapped(virtual_address))
+                Fatal("VMM", "unmapped virtual page still translates");
+        }
+
+        if (page_map.UnmapPage(reservation.Base()) != MappingError::NotMapped)
+            Fatal("VMM", "duplicate unmap protection failed");
+
+        if (physical_memory.Release(backing) != PhysicalAllocationError::Success) 
+            Fatal("VMM", "physical backing release failed");
+
+        if (kernel_addresses.Release(reservation) != VirtualAllocationError::Success)
+            Fatal("VMM", "aligned virtual reservation release failed");
+
+        if (kernel_addresses.Release(lead_reservation) != VirtualAllocationError::Success)
+            Fatal("VMM", "lead virtual reservation release failed");
+
+        if (kernel_addresses.Statistics().FreePages != free_virtual_pages_before ||
+            kernel_addresses.Statistics().ReservedPages != 0 ||
+            kernel_addresses.Statistics().FreeExtentCount != 1) {
+            Fatal("VMM", "virtual address accounting did not return to baseline");
+        }
+
+        if (page_map.Statistics().MappedPages != 0 || page_map.Statistics().TablePages != 1)
+            Fatal("VMM", "page-table cleanup did not return to root-only state");
+
+        WriteDebug("[zOS/VMM] Virtual range allocator initialized.\n");
+        WriteDebug("[zOS/VMM] Test page-map root: ");
+        WriteHex(page_map.RootTable().Value());
+        WriteDebug("\n");
+        WriteDebug("[zOS/VMM] Page-table pages retained: ");
+        WriteDecimal(page_map.Statistics().TablePages);
+        WriteDebug("\n");
+        WriteDebug("[zOS/VMM] Bootstrap metadata pages: ");
+        WriteDecimal(metadata.Statistics().PageCount);
+        WriteDebug("\n");
+        WriteDebug("[zOS/VMM] Mapping, translation, W^X, null-guard, and release self-test passed.\n");
+        WriteDebug("[zOS/VMM] Test page map remains inactive; CR3 is unchanged.\n");
+    }
 }
 
 extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void KernelMain(const Zos::Boot::BootEnvironment_V1* environment) noexcept {
@@ -229,8 +358,14 @@ extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void Kernel
     WriteDebug(" used)\n");
 
     RunPhysicalMemorySelfTest(physical_memory);
+    WriteDebug("[zOS/Kernel] Physical memory ownership established.\n");
 
-    WriteDebug("[zOS/Kernel] Physical memory ownership established");
+    Kernel::Memory::BootstrapMetadataArena virtual_metadata{};
+    Kernel::Memory::VirtualAddressAllocator kernel_addresses{};
+    Kernel::Architecture::AMD64::PageMap test_page_map{};
+
+    RunVirtualMemoryInfrastructureSelfTest(physical_memory, virtual_metadata, kernel_addresses, test_page_map);
+    WriteDebug("[zOS/Kernel] Virtual-Memory infrastructure established.\n");
 
     __asm__ volatile("cli");
     for (;;) {

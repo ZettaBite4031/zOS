@@ -2,6 +2,7 @@
 
 namespace Zos::Kernel::Memory {
     using Uint8 = unsigned char;
+    using Uint16 = unsigned short;
     using Uint32 = unsigned int;
     using Uint64 = unsigned long long;
 
@@ -62,6 +63,42 @@ namespace Zos::Kernel::Memory {
 
         [[nodiscard]] constexpr bool IsEmpty() const noexcept { return PageCount == 0; }
         [[nodiscard]] constexpr Uint64 SizeBytes() const noexcept { return PageCount * PageSize; };
+    };
+
+    enum class PageAccess : Uint32 {
+        None = 0,
+        Read = 1u << 0,
+        Write = 1u << 1,
+        Execute = 1u << 2,
+        User = 1u << 3,
+        Global = 1u << 4,
+    };
+
+    [[nodiscard]] constexpr PageAccess operator|(PageAccess left, PageAccess right) noexcept {
+        return static_cast<PageAccess>(static_cast<Uint32>(left) | static_cast<Uint32>(right));
+    }
+
+    [[nodiscard]] constexpr PageAccess operator&(PageAccess left, PageAccess right) noexcept {
+        return static_cast<PageAccess>(static_cast<Uint32>(left) & static_cast<Uint32>(right));
+    }
+
+    constexpr PageAccess& operator|=(PageAccess& left, PageAccess right) noexcept {
+        left = left | right;
+        return left;
+    }
+
+    [[nodiscard]] constexpr bool HasAccess(PageAccess value, PageAccess required) noexcept {
+        return (static_cast<Uint32>(value) & static_cast<Uint32>(required)) == static_cast<Uint32>(required);
+    }
+
+    enum class CachePolicy : Uint32 {
+        WriteBack,
+        Uncached,
+    };
+
+    struct MappingOptions final {
+        PageAccess Access{ PageAccess::Read };
+        CachePolicy Cache{ CachePolicy::WriteBack };
     };
 
     static_assert(sizeof(PhysicalAddress) == sizeof(Uint64));
