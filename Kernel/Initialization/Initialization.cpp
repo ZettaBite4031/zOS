@@ -312,6 +312,110 @@ namespace Zos::Kernel::Initialization {
             
             Diagnostics::Write("[zOS/Interrupt] INT32 dispatch and IRETQ self-test passed.\n");
         }
+
+        void RelcaimBootMemory(KernelRuntime& runtime) noexcept {
+            PhysicalMemoryManager& physical_memory = runtime.PhysicalMemory;
+            if (!physical_memory.IsInitialized())
+                Diagnostics::Fatal("Memory", "cannot reclaim boot memory before PMM intialization");
+            if (!runtime.KernelPageMap.IsActive())
+                Diagnostics::Fatal("Memory", "cannot reclaim boot memory before kernel address-space activation");
+            if (!runtime.Interrupts.IsInitialized())
+                Diagnostics::Fatal("Memory", "cannot reclaim boot memory before interrupt infrastructure initialization");
+            
+            /*
+             * Snapshot statistics by value. The reference returned by
+             * Statistics() changes as reclamation proceeds.
+             */
+            const PhysicalMemoryStatistics before = physical_memory.Statistics();
+            PhysicalMemoryReclamationResult result{};
+            const PhysicalMemoryReclamationError error = physical_memory.ReclaimBootMemory(result);
+            if (error != PhysicalMemoryReclamationError::Success)
+                Diagnostics::Fatal("Memory", PhysicalMemoryManager::Describe(error));
+
+            const PhysicalMemoryStatistics after = physical_memory.Statistics();
+            
+            /*
+             * Every page previously marked DeferredBoot must have become
+             * Free, and no other accounting category may change.
+             */
+            if (result.ReclaimedPages != before.DeferredBootPages ||
+                after.DeferredBootPages != 0 || after.ManagedPages != before.ManagedPages || 
+                after.ConventionalPages != before.ConventionalPages ||
+                after.AllocatedPages != before.AllocatedPages ||
+                after.DeferredAcpiPages != before.DeferredAcpiPages ||
+                after.ReservedPages() != before.ReservedPages()) 
+                Diagnostics::Fatal("Memory", "boot-memory reclamation accounting invariant failed");
+
+            if (before.FreePages > ~Uint64{ 0 } - result.ReclaimedPages) 
+                Diagnostics::Fatal("Memory", "boot-memory reclamation free-page accounting overflowed");
+
+            if (after.FreePages != before.FreePages + result.ReclaimedPages) 
+                Diagnostics::Fatal("Memory", "reclaimed boot pages were not added to free memory");
+
+            if (!physical_memory.IsBootMemoryReclaimed())
+                Diagnostics::Fatal("Memory", "boot-memory reclamation did not enter the completed state");
+
+            Diagnostics::Write("[zOS/Memory] Reclaimed boot/loader memory: ");
+            Diagnostics::WriteDecimal(result.ReclaimedPages);
+            Diagnostics::Write(" pages (");
+            Diagnostics::WriteDecimal(result.ReclaimedBytes());
+            Diagnostics::Write(" bytes).\n");
+
+            Diagnostics::Write("[zOS/Memory] Free memory after reclamation: ");
+            Diagnostics::WriteDecimal(after.FreeBytes());
+            Diagnostics::Write(" bytes.\n");
+        }
+
+        void RunBootMemoryReclamationSelfTest(KernelRuntime& runtime) noexcept {
+            PhysicalMemoryManager& manager = runtime.PhysicalMemory;
+
+            if (!manager.IsBootMemoryReclaimed()) 
+                Diagnostics::Fatal("Memory", "boot-memory reclamation self-test ran before reclamation");
+
+            const PhysicalMemoryStatistics baseline = manager.Statistics();
+
+            /*
+            * Reclamation is a one-time state transition. A second request
+            * must be explicitly rejected rather than silently doing
+            * nothing.
+            */
+            PhysicalMemoryReclamationResult duplicate_result{};
+
+            const auto duplicate_error = manager.ReclaimBootMemory(duplicate_result);
+            if (duplicate_error != PhysicalMemoryReclamationError::AlreadyReclaimed || duplicate_result.ReclaimedPages != 0) 
+                Diagnostics::Fatal("Memory", "duplicate boot-memory reclamation protection failed");
+            
+            const PhysicalMemoryStatistics after_duplicate = manager.Statistics();
+            if (after_duplicate.FreePages != baseline.FreePages ||
+                after_duplicate.AllocatedPages != baseline.AllocatedPages ||
+                after_duplicate.DeferredBootPages != baseline.DeferredBootPages ||
+                after_duplicate.DeferredAcpiPages != baseline.DeferredAcpiPages ||
+                after_duplicate.ReservedPages() != baseline.ReservedPages()) 
+                Diagnostics::Fatal("Memory", "duplicate reclamation modified PMM state");
+
+            /*
+            * Prove that ordinary allocation/release remains consistent
+            * after the state transition.
+            */
+            PhysicalAllocation probe{};
+            const auto allocation_error = manager.AllocatePage(probe);
+            if (allocation_error != PhysicalAllocationError::Success) 
+                Diagnostics::Fatal("Memory", "post-reclamation allocation failed");
+            
+            if (manager.Release(probe) != PhysicalAllocationError::Success)
+                Diagnostics::Fatal("Memory", "post-reclamation allocation release failed");
+
+            const PhysicalMemoryStatistics final = manager.Statistics();
+
+            if (final.FreePages != baseline.FreePages ||
+                final.AllocatedPages != baseline.AllocatedPages ||
+                final.DeferredBootPages != 0 ||
+                final.DeferredAcpiPages != baseline.DeferredAcpiPages ||
+                final.ReservedPages() != baseline.ReservedPages()) 
+                Diagnostics::Fatal("Memory", "post-reclamation PMM accounting did not return to baseline");
+
+            Diagnostics::Write("[zOS/Memory] Boot-memory reclamation self-test passed.\n");
+        }
     }
 
     void Bootstrap(const Boot::BootEnvironment_V1& environment, KernelRuntime& runtime) noexcept {
@@ -339,16 +443,23 @@ namespace Zos::Kernel::Initialization {
         AdvancePhase(runtime, KernelPhase::AddressSpaceActive, KernelPhase::InterruptsReady);
 
         /*
-         * This is the explicit architectural boundary.
+         * ExitBootServices has already occurred in the loader and zOS now
+         * owns its page tabels and exception infrastructure.
          * 
-         * Everything that needs permanent ownership now belongs
-         * to KernelRuntime rather than KernelMain's stack frame.
-         * 
-         * The next roadmap milestone will insert firmware-memory
-         * reclamation and boot-context internalizationbefore this
-         * becomes Runtime.
+         * Pages still classified DeferredBoot are no longer required by
+         * any current bootstrap dependency. Explicitly reserved handoff
+         * ranges remain Reserved and are therefore unaffected.
          */
-        AdvancePhase(runtime, KernelPhase::InterruptsReady, KernelPhase::BootstrapComplete);
+        RelcaimBootMemory(runtime);
+        RunBootMemoryReclamationSelfTest(runtime);
+        AdvancePhase(runtime, KernelPhase::InterruptsReady, KernelPhase::BootMemoryReclaimed);
+
+        /*
+         * The next roadmap phase will internalize the remaining boot
+         * context and eventually release the specifically reserved
+         * bootstrap stack/environment/memory-map allocations.
+         */
+        AdvancePhase(runtime, KernelPhase::BootMemoryReclaimed, KernelPhase::BootstrapComplete);
 
         Diagnostics::Write("[zOS/Startup] Boostrap infrastructure complete.\n");
     }

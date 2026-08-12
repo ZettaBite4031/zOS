@@ -14,6 +14,7 @@ namespace Zos::Kernel {
         VirtualMemoryReady,
         AddressSpaceActive,
         InterruptsReady,
+        BootMemoryReclaimed,
         BootstrapComplete,
         Runtime,
     };

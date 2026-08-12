@@ -466,6 +466,94 @@ namespace Zos::Kernel::Memory {
         return PhysicalMemoryInitializationError::Success;
     }
 
+    PhysicalMemoryReclamationError PhysicalMemoryManager::ReclaimBootMemory(PhysicalMemoryReclamationResult& result) noexcept {
+        result = {};
+
+        if (!m_Initialized) return PhysicalMemoryReclamationError::NotInitialized;
+        if (m_BootMemoryReclaimed) return PhysicalMemoryReclamationError::AlreadyReclaimed;
+        if (m_Regions == nullptr || m_PageStates == nullptr || m_RegionCount == 0) return PhysicalMemoryReclamationError::CorruptState;
+
+        /*
+         * Preflight the complete PMM state before modifying anything.
+         *
+         * This verifies both the encoded page states and the statistics
+         * maintained by the allocator.
+         */
+        Uint64 observed_pages =0;
+
+        Uint64 free_pages = 0;
+        Uint64 allocated_pages = 0;
+        Uint64 reserved_pages = 0;
+        Uint64 deferred_boot_pages = 0;
+        Uint64 deferred_acpi_pages = 0;
+        for (Uint64 i = 0; i < m_RegionCount; i++) {
+            const ManagedRegion& region = m_Regions[i];
+            if (region.PageCount > m_Statistics.ManagedPages - observed_pages)
+                return PhysicalMemoryReclamationError::CorruptState;
+            
+            observed_pages += region.PageCount;
+            for (Uint64 page = 0; page < region.PageCount; page++) {
+                const PageState state = GetState(region, page);
+                switch (state) {
+                case PageState::Reserved: ++reserved_pages; break;
+                case PageState::Free: ++free_pages; break;
+                case PageState::Allocated: ++allocated_pages; break;
+                case PageState::DeferredBoot: ++deferred_boot_pages; break;
+                case PageState::DeferredAcpi: ++deferred_acpi_pages; break;
+                case PageState::Corrupt:
+                default:
+                    return PhysicalMemoryReclamationError::CorruptState;
+                }
+            }
+        }
+
+        /*
+         * Region coverage must exactly describe every page represented
+         * by the PMM metadata
+         */
+        if (observed_pages != m_Statistics.ManagedPages) 
+            return PhysicalMemoryReclamationError::CorruptState;
+
+        /*
+         * The observed classifications must account for every managed
+         * page exactly once
+         */
+        if (reserved_pages > observed_pages || free_pages > observed_pages - reserved_pages)
+            return PhysicalMemoryReclamationError::CorruptState;
+
+        Uint64 classified_pages = reserved_pages + free_pages;
+        if (allocated_pages > observed_pages - classified_pages) 
+            return PhysicalMemoryReclamationError::CorruptState;
+
+        classified_pages += allocated_pages;
+        if (deferred_boot_pages > observed_pages - classified_pages) 
+            return PhysicalMemoryReclamationError::CorruptState;
+
+        classified_pages += deferred_boot_pages;
+        if (deferred_acpi_pages != observed_pages - classified_pages) 
+            return PhysicalMemoryReclamationError::CorruptState;
+
+        /*
+         * We have now completed every operation that can fail.
+         *
+         * From this point onward the transition is deterministic:
+         *  - DeferredBoot -> Free
+         */
+        for (Uint64 i = 0; i < m_RegionCount; i++) {
+            const ManagedRegion& region = m_Regions[i];
+            for (Uint64 page = 0; page < region.PageCount; page++) {
+                if (GetState(region, page) != PageState::DeferredBoot) continue;
+                SetState(region, page, PageState::Free);
+            }
+        }
+
+        m_Statistics.FreePages += deferred_boot_pages;
+        m_Statistics.DeferredBootPages = 0;
+        m_BootMemoryReclaimed = true;
+        result.ReclaimedPages = deferred_boot_pages;
+        return PhysicalMemoryReclamationError::Success;
+    }
+
     bool PhysicalMemoryManager::RangeIsFree(const ManagedRegion& region, Uint64 first_page_offset, Uint64 page_count) const noexcept {
         if (page_count == 0 || first_page_offset >= region.PageCount || page_count > region.PageCount - first_page_offset) return false;
 
@@ -714,5 +802,15 @@ namespace Zos::Kernel::Memory {
             case PhysicalAllocationError::CorruptAllocation: return "physical allocation token or page state is invalid";
         }
         return "unknown physical allocation error";
+    }
+
+    const char* PhysicalMemoryManager::Describe(PhysicalMemoryReclamationError error) noexcept {
+        switch (error) {
+        case PhysicalMemoryReclamationError::Success: return "success";
+        case PhysicalMemoryReclamationError::NotInitialized: return "physical memory manager is not initialized";
+        case PhysicalMemoryReclamationError::AlreadyReclaimed: return "boot memory has already been reclaimed";
+        case PhysicalMemoryReclamationError::CorruptState: return "physical memory state is inconsistent";
+        }
+        return "unknown physical memory reclamation error";
     }
 }   

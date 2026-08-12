@@ -26,9 +26,21 @@ namespace Zos::Kernel::Memory {
         CorruptAllocation,
     };
 
+    enum class PhysicalMemoryReclamationError : Uint32 {
+        Success,
+        NotInitialized,
+        AlreadyReclaimed,
+        CorruptState,
+    };
+
     enum class PhysicalAllocationPreference : Uint32 {
         HighAddresses,
         LowAddresses,
+    };
+
+    struct PhysicalMemoryReclamationResult final {
+        Uint64 ReclaimedPages{};
+        [[nodiscard]] Uint64 ReclaimedBytes() const noexcept { return ReclaimedPages * PageSize; }
     };
 
     struct PhysicalAllocationConstraints final {
@@ -55,7 +67,11 @@ namespace Zos::Kernel::Memory {
         Uint64 MetadataBytes{};
         Uint64 ManagedRegionCount{};
 
-        [[nodiscard]] constexpr Uint64 ReservedConventionalPages() const noexcept { return ConventionalPages - FreePages - AllocatedPages; }
+        [[nodiscard]] constexpr Uint64 ReservedPages() const noexcept { 
+            return ManagedPages - FreePages - AllocatedPages - DeferredBootPages - DeferredAcpiPages;
+        }
+
+        [[nodiscard]] constexpr Uint64 ReservedBytes() const noexcept { return ReservedPages() * PageSize; }
 
         [[nodiscard]] constexpr Uint64 ConventionalBytes() const noexcept { return ConventionalPages * PageSize; }
         [[nodiscard]] constexpr Uint64 FreeBytes() const noexcept { return FreePages * PageSize; }
@@ -83,7 +99,7 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] Uint64 PageCount() const noexcept { return m_Span.PageCount; }
         [[nodiscard]] Uint64 SizeBytes() const noexcept { return m_Span.SizeBytes(); }
         [[nodiscard]] PhysicalSpan Span() const noexcept { return m_Span; }
-
+        
     private:
         friend class PhysicalMemoryManager;
 
@@ -103,6 +119,7 @@ namespace Zos::Kernel::Memory {
         PhysicalMemoryManager& operator=(const PhysicalMemoryManager&) = delete;
 
         [[nodiscard]] PhysicalMemoryInitializationError Initialize(const Boot::BootEnvironment_V1& environment) noexcept;
+        [[nodiscard]] PhysicalMemoryReclamationError ReclaimBootMemory(PhysicalMemoryReclamationResult& result) noexcept;
 
         [[nodiscard]] PhysicalAllocationError AllocatePage(PhysicalAllocation& output, PhysicalAllocationConstraints constraints = PhysicalAllocationConstraints::General()) noexcept;
         [[nodiscard]] PhysicalAllocationError AllocateContiguous(Uint64 page_count, PhysicalAllocation& output, PhysicalAllocationConstraints constraints = PhysicalAllocationConstraints::General()) noexcept;
@@ -110,6 +127,9 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] const PhysicalMemoryStatistics& Statistics() const noexcept { return m_Statistics; }
         [[nodiscard]] PhysicalSpan MetadataSpan() const noexcept { return m_MetadataSpan; }
+        [[nodiscard]] bool IsBootMemoryReclaimed() const noexcept { return m_BootMemoryReclaimed; }
+        
+        [[nodiscard]] static const char* Describe(PhysicalMemoryReclamationError error) noexcept;
         [[nodiscard]] static const char* Describe(PhysicalMemoryInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(PhysicalAllocationError error) noexcept;
 
@@ -184,5 +204,6 @@ namespace Zos::Kernel::Memory {
         PhysicalSpan m_MetadataSpan{};
         PhysicalMemoryStatistics m_Statistics{};
         bool m_Initialized{};
+        bool m_BootMemoryReclaimed{};
     };
 }
