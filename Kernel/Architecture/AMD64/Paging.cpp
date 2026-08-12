@@ -14,6 +14,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
     inline constexpr Uint64 EferNxe{ 1ULL << 11 };
     inline constexpr Uint64 Cr0WriteProtect{ 1ULL << 16 };
     inline constexpr Uint64 Cr4PageGlobalEnable{ 1ULL << 7 };
+    inline constexpr Uint64 Cr4FiveLevelPaging{ 1ULL << 12 };
+    inline constexpr Uint64 RflagsInterruptEnable{ 1ULL << 9 };
 
     void Cpuid(Uint32 leaf, Uint32 subleaf, Uint32& eax, Uint32& ebx, Uint32& ecx, Uint32& edx) noexcept {
         __asm__ volatile(
@@ -117,6 +119,16 @@ namespace Zos::Kernel::Architecture::AMD64 {
             : "r"(value)
             : "memory"
         );
+    }
+
+    Uint64 ReadRflags() noexcept {
+        Uint64 value{};
+        __asm__ volatile(
+            "pushfq\n\t"
+            "popq %0"
+            : "=r"(value)
+        );
+        return value;
     }
 
     Uint64 PageMap::Pml4Index(VirtualAddress address) noexcept {
@@ -382,6 +394,16 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if ((ReadMsr(EferMsr) & EferNxe) == 0) 
             return PageMapActivationError::ProtectionEnableFailed;
 
+        Uint64 cr0 = ReadCr0();
+        cr0 |= Cr0WriteProtect;
+        WriteCr0(cr0);
+
+        if ((ReadCr0() & Cr0WriteProtect) == 0) 
+            return PageMapActivationError::ProtectionEnableFailed;
+
+        if ((ReadRflags() & RflagsInterruptEnable) != 0) 
+            return PageMapActivationError::InterruptsEnabled;
+
         /*
          * A CR3 reload does not necessarily evict
          * global translations when PGE is enabled.
@@ -392,6 +414,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
          */
         const Uint64 original_cr4 = ReadCr4();
         const bool pge_enabled = (original_cr4 & Cr4PageGlobalEnable) != 0;
+        if ((original_cr4 & Cr4FiveLevelPaging) != 0) return PageMapActivationError::UnsupportedPagingMode;
         if (pge_enabled) WriteCr4(original_cr4 & ~Cr4PageGlobalEnable);
         WriteCr3(m_RootTable.Value());
         if (pge_enabled) WriteCr4(original_cr4);
@@ -719,5 +742,20 @@ namespace Zos::Kernel::Architecture::AMD64 {
         case MappingError::CorruptPageTable: return "page-table structure is inconsistent";
         default: return "unknown page mapping error";
         }
+    }
+
+    const char* PageMap::Describe(PageMapActivationError error) noexcept {
+        switch (error) {
+        case PageMapActivationError::Success: return "success";
+        case PageMapActivationError::NotInitialized: return "page map is not initialized";
+        case PageMapActivationError::AlreadyActive: return "page map is already active";
+        case PageMapActivationError::ExecuteDisableUnsupported: return "execute-disable paging is unsupported";
+        case PageMapActivationError::UnsupportedPagingMode: return "active paging mode is unsupported";
+        case PageMapActivationError::InterruptsEnabled: return "interrupts must be disabled during page-map activation";
+        case PageMapActivationError::DirectMapUnavailable: return "required direct-map coverage is unavailable";
+        case PageMapActivationError::ProtectionEnableFailed: return "failed to enable paging protections";
+        case PageMapActivationError::RootTableMismatch: return "active CR3 does not match the page-map root";
+        }
+        return "unknown page-map activation error";
     }
 }

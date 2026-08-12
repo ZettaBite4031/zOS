@@ -790,10 +790,18 @@ namespace Zos::Kernel::Memory {
             : "=r"(rsp)
         );
 
+        Uint64 stack_end = 0;
+        if (!TryRangeEnd(environment.KernelStack.Base, environment.KernelStack.Size, stack_end)) return false;
+        if (rsp < environment.KernelStack.Base || rsp >= stack_end) return false;
+
         const auto stack_translation = m_PageMap->Translate(VirtualAddress(rsp));
         if (!stack_translation.Mapped || stack_translation.Physical.Value() != rsp) return false;
         if (m_PageMap->IsMapped(VirtualAddress(0))) return false;
         if (m_PageMap->IsMapped(Layout::KernelDynamicBase)) return false;
+
+        if (!HasAccess(stack_translation.Options.Access, PageAccess::Read) 
+         || !HasAccess(stack_translation.Options.Access, PageAccess::Write) 
+         || HasAccess(stack_translation.Options.Access, PageAccess::Execute)) return false;
 
         /*
          * PMM metadata must currently remain identity
