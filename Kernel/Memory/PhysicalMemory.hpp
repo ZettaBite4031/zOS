@@ -98,7 +98,7 @@ namespace Zos::Kernel::Memory {
 
     class PhysicalMemoryManager final {
     public:
-        PhysicalMemoryManager() noexcept = default;
+        constexpr PhysicalMemoryManager() noexcept = default;
         PhysicalMemoryManager(const PhysicalMemoryManager&) = delete;
         PhysicalMemoryManager& operator=(const PhysicalMemoryManager&) = delete;
 

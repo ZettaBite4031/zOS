@@ -53,7 +53,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
     class PageMap final {
     public:
-        PageMap() noexcept = default;
+        constexpr PageMap() noexcept = default;
         PageMap(const PageMap&) = delete;
         PageMap& operator=(const PageMap&) = delete;
 

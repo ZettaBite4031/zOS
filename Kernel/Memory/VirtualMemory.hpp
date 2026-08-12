@@ -65,7 +65,7 @@ namespace Zos::Kernel::Memory {
 
     class BootstrapMetadataArena final {
     public:
-        BootstrapMetadataArena() noexcept = default;
+        constexpr BootstrapMetadataArena() noexcept = default;
         BootstrapMetadataArena(const BootstrapMetadataArena&) = delete;
         BootstrapMetadataArena& operator=(const BootstrapMetadataArena&) = delete;
 
@@ -172,7 +172,7 @@ namespace Zos::Kernel::Memory {
 
     class VirtualAddressAllocator final {
     public:
-        VirtualAddressAllocator() noexcept = default;
+        constexpr VirtualAddressAllocator() noexcept = default;
         VirtualAddressAllocator(const VirtualAddressAllocator&) = delete;
         VirtualAddressAllocator& operator=(const VirtualAddressAllocator&) = delete;
 

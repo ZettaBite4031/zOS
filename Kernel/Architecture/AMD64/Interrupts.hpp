@@ -71,7 +71,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
     class InterruptManager final {
     public:
-        InterruptManager() noexcept = default;
+        constexpr InterruptManager() noexcept = default;
 
         InterruptManager(const InterruptManager&) = delete;
         InterruptManager& operator=(const InterruptManager&) = delete;
