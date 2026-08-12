@@ -243,7 +243,7 @@ namespace Zos::Kernel::Memory {
         KernelAddressSpace(const KernelAddressSpace&) = delete;
         KernelAddressSpace& operator=(const KernelAddressSpace&) = delete;
 
-        [[nodiscard]] KernelAddressSpaceError Build(const Boot::BootEnvironment_V1& environment) noexcept;
+        [[nodiscard]] KernelAddressSpaceError Build(const Boot::BootEnvironment& environment) noexcept;
 
         [[nodiscard]] KernelAddressSpaceError Activate() noexcept;
 
@@ -255,19 +255,19 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] static const char* Describe(KernelAddressSpaceError error) noexcept;
 
     private:
-        [[nodiscard]] bool ValidateKernelLayout(const Boot::BootEnvironment_V1& environment) const noexcept;
-        [[nodiscard]] KernelAddressSpaceError ValidateDirectMapCoverage(const Boot::BootEnvironment_V1& environment) const noexcept;
+        [[nodiscard]] bool ValidateKernelLayout(const Boot::BootEnvironment& environment) const noexcept;
+        [[nodiscard]] KernelAddressSpaceError ValidateDirectMapCoverage(const Boot::BootEnvironment& environment) const noexcept;
 
         [[nodiscard]] bool MapKernelSection(Uint64 start, Uint64 end, MappingOptions options) noexcept;
         [[nodiscard]] bool MapKernelImage() noexcept;
-        [[nodiscard]] bool MapBootstrapRanges(const Boot::BootEnvironment_V1& environment) noexcept;
+        [[nodiscard]] bool MapBootstrapRanges(const Boot::BootEnvironment& environment) noexcept;
         
-        [[nodiscard]] KernelAddressSpaceError MapDirectMemory(const Boot::BootEnvironment_V1& environment) noexcept;
+        [[nodiscard]] KernelAddressSpaceError MapDirectMemory(const Boot::BootEnvironment& environment) noexcept;
 
         [[nodiscard]] bool MapBootstrapMetadata() noexcept;
 
         [[nodiscard]] bool ValidateKernelSection(Uint64 start, Uint64 end, MappingOptions options) const noexcept;
-        [[nodiscard]] bool ValidateMappings(const Boot::BootEnvironment_V1& environment) const noexcept;
+        [[nodiscard]] bool ValidateMappings(const Boot::BootEnvironment& environment) const noexcept;
 
         [[nodiscard]] bool MapIdentityBytes(Uint64 base, Uint64 size, MappingOptions options) noexcept;
         
@@ -276,7 +276,7 @@ namespace Zos::Kernel::Memory {
         PhysicalMemoryManager* m_PhysicalMemory{};
         BootstrapMetadataArena* m_Metadata{};
         Architecture::AMD64::PageMap* m_PageMap{};
-        const Boot::BootEnvironment_V1* m_Environment{};
+        const Boot::BootEnvironment* m_Environment{};
 
         bool m_Built{};
     };

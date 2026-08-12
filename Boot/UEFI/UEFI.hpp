@@ -56,6 +56,11 @@ namespace Zos::Boot::UEFI {
         Uint8 Data4[8];
     };
 
+    struct ConfigurationTable final {
+        Guid VendorGuid;
+        void* VendorTable;
+    };
+
     struct Time {
         Uint16 Year;
         Uint8 Month;
@@ -265,32 +270,18 @@ namespace Zos::Boot::UEFI {
         SimpleTextOutputProtocol* StandardError;
         void* RuntimeServices;
         BootServices* pBootServices;
-        UintN COnfigurationTableCount;
-        void* ConfigurationTables;
+        UintN ConfigurationTableCount;
+        ConfigurationTable* ConfigurationTables;
     };
 
-    inline constexpr Guid LoadedImageProtocolGuid{
-        0x5B1B31A1,
-        0x9562,
-        0x11D2,
-        { 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B },
-    };
-
-    inline constexpr Guid SimpleFileSystemProtocolGuid{
-        0x964E5B22,
-        0x6459,
-        0x11D2,
-        { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B },
-    };
-
-    inline constexpr Guid FileInfoGuid{
-        0x09576E92,
-        0x6D3F,
-        0x11D2,
-        { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B },
-    };
+    inline constexpr Guid LoadedImageProtocolGuid{ 0x5B1B31A1, 0x9562, 0x11D2, { 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } };
+    inline constexpr Guid SimpleFileSystemProtocolGuid{ 0x964E5B22, 0x6459, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } };
+    inline constexpr Guid FileInfoGuid{ 0x09576E92, 0x6D3F, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } };
+    inline constexpr Guid Acpi20TableGuid{ 0x8868E871, 0xE4F1, 0x11D3, { 0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81 } };
+    inline constexpr Guid Acpi10TableGuid{ 0xEB9D2D30, 0x2D88, 0x11D3, { 0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D } };
 
     static_assert(sizeof(Guid) == 16);
+    static_assert(sizeof(ConfigurationTable) == 24);
     static_assert(sizeof(Time) == 16);
     static_assert(sizeof(MemoryDescriptor) == 40);
     static_assert(__builtin_offsetof(MemoryDescriptor, PhysStart) == 8);
@@ -313,4 +304,6 @@ namespace Zos::Boot::UEFI {
     static_assert(sizeof(SystemTable) == 120);
     static_assert(__builtin_offsetof(SystemTable, ConsoleOutput) == 64);
     static_assert(__builtin_offsetof(SystemTable, pBootServices) == 96);
+    static_assert(__builtin_offsetof(SystemTable, ConfigurationTableCount) == 104);
+    static_assert(__builtin_offsetof(SystemTable, ConfigurationTables) == 112);
 }

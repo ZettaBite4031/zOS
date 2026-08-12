@@ -6,11 +6,33 @@
 extern "C" [[noreturn]] void TransferControl(
     Zos::Boot::UEFI::PhysicalAddress entryPoint,
     Zos::Boot::UEFI::PhysicalAddress stackTop,
-    const Zos::Boot::BootEnvironment_V1* environment
+    const Zos::Boot::BootEnvironment* environment
 ) noexcept;
 
 namespace {
     using namespace Zos::Boot;
+
+    struct AcpiRsdp final {
+        UEFI::Uint8 Signature[8];
+
+        UEFI::Uint8 Checksum;
+        UEFI::Uint8 OemId[6];
+        UEFI::Uint8 Revision;
+
+        UEFI::Uint32 RsdtAddress;
+
+        UEFI::Uint32 Length;
+        UEFI::Uint64 XsdtAddress;
+
+        UEFI::Uint8 ExtendedChecksum;
+        UEFI::Uint8 Reserved[3];
+    } __attribute__((packed));
+
+    static_assert(sizeof(AcpiRsdp) == 36);
+    static_assert(__builtin_offsetof(AcpiRsdp, Revision) == 15);
+    static_assert(__builtin_offsetof(AcpiRsdp, RsdtAddress) == 16);
+    static_assert(__builtin_offsetof(AcpiRsdp, Length) == 20);
+    static_assert(__builtin_offsetof(AcpiRsdp, XsdtAddress) == 24);
 
     class TextWriter final {
     public:
@@ -91,7 +113,7 @@ namespace {
     class BootLoader final {
     public:
         BootLoader(UEFI::Handle image_handle, UEFI::SystemTable& st) noexcept  
-            : m_ImageHandle(image_handle), m_BootServices(st.pBootServices), m_Output(st) {}
+            : m_ImageHandle(image_handle), m_SystemTable(&st), m_BootServices(st.pBootServices), m_Output(st) {}
         
         ~BootLoader() { ReleaseResources(); }
 
@@ -116,7 +138,10 @@ namespace {
                 m_BootServices->SetMem == nullptr)
                 return ReportFailure("validate required boot services", UEFI::Unsupported);
 
-            UEFI::Status status = OpenBootVolume();
+            UEFI::Status status = ResolvePlatformTables();
+            if (UEFI::IsError(status)) return status; 
+
+            status = OpenBootVolume();
             if (UEFI::IsError(status)) return status;
 
             status = OpenKernelFile();
@@ -184,6 +209,88 @@ namespace {
             const UEFI::Uint64 first_end = first_base + first_size;
             const UEFI::Uint64 second_end = second_base + second_size;
             return first_base < second_end && second_base < first_end;
+        }
+
+        static bool GuidEquals(const UEFI::Guid& left, const UEFI::Guid& right) noexcept {
+            if (left.Data1 != right.Data1 || left.Data2 != right.Data2 || left.Data3 != right.Data3) return false;
+            for (UEFI::UintN i = 0; i < 8; i++) if (left.Data4[i] != right.Data4[i]) return false;
+            return true;
+        }
+
+        static bool ChecksumIsZero(const void* address, UEFI::UintN size) noexcept {
+            if (address == nullptr || size == 0) return false;
+            const auto* bytes = static_cast<const UEFI::Uint8*>(address);
+            UEFI::Uint8 checksum = 0;
+            for (UEFI::UintN i = 0; i < size; i++) 
+                checksum = static_cast<UEFI::Uint8>(checksum + bytes[i]);
+            return checksum == 0;
+        }
+
+        static bool ValidateAcpiRsdp(const void* address, bool require_extended) noexcept {
+            if (address == nullptr) return false;
+            static constexpr UEFI::Uint8 ExpectedSignature[8]{ 'R', 'S', 'D', ' ', 'P', 'T', 'R', ' ', };
+            const auto* rsdp = static_cast<const AcpiRsdp*>(address);
+            for (UEFI::UintN i = 0; i < sizeof(ExpectedSignature); i++) 
+                if (rsdp->Signature[i] != ExpectedSignature[i]) return false;
+            
+            /*
+             * ACPI 1.0 checksum always covers the first
+             * 20 bytes
+             */
+            if (!ChecksumIsZero(rsdp, 20)) return false;
+            if (rsdp->Revision < 2) return !require_extended && rsdp->RsdtAddress != 0;
+
+            /*
+             * ACPI 2.0+ currently defines a 36-byte RSDP,
+             * but Lenght allows backward-compatible future
+             * extensions.
+             * 
+             * Bound the firmware-provided length to one page
+             * before trusting it as a memory-read extent.
+             */
+            if (rsdp->Length < sizeof(AcpiRsdp) || rsdp->Length > PageSize) return false;
+            if (!ChecksumIsZero(rsdp, rsdp->Length)) return false;
+            return rsdp->XsdtAddress != 0 || rsdp->RsdtAddress != 0;
+        }
+
+        UEFI::Status ResolvePlatformTables() noexcept {
+            if (m_SystemTable == nullptr) return UEFI::InvalidParameter;
+            if (m_SystemTable->ConfigurationTableCount != 0 && m_SystemTable->ConfigurationTables == nullptr) 
+                return ReportFailure("validate UEFI configuration tables", UEFI::LoadError);
+            
+            const void* acpi20 = nullptr;
+            const void* acpi10 = nullptr;
+            for (UEFI::UintN i = 0; i < m_SystemTable->ConfigurationTableCount; i++) {
+                const UEFI::ConfigurationTable& table = m_SystemTable->ConfigurationTables[i];
+                if (GuidEquals(table.VendorGuid, UEFI::Acpi20TableGuid)) {
+                    acpi20 = table.VendorTable;
+                    continue;
+                }
+                if (GuidEquals(table.VendorGuid, UEFI::Acpi10TableGuid)) {
+                    acpi10 = table.VendorTable;
+                }
+            }
+
+            /*
+             * ACPI explicit requires the modern configuration
+             * table to be preferred, with ACPI 1.0 used only as
+             * a fallback.
+             */
+            if (acpi20 != nullptr) {
+                if (!ValidateAcpiRsdp(acpi20, true)) 
+                    return ReportFailure("validate ACPI 2.0+ RSDP", UEFI::LoadError);
+                m_AcpiRsdp = reinterpret_cast<UEFI::UintN>(acpi20);
+            } else if (acpi10 != nullptr)  {
+                if (!ValidateAcpiRsdp(acpi10, false)) 
+                    ReportFailure("validate ACPI 1.0 RSDP", UEFI::LoadError);
+                m_AcpiRsdp = reinterpret_cast<UEFI::UintN>(acpi10); 
+            } else return ReportFailure("locate ACPI RSDP", UEFI::NotFound);
+
+            m_Output.Write("[zOS/Boot] ACPI RSDP: ");
+            m_Output.WriteHex(m_AcpiRsdp);
+            m_Output.WriteLine("");
+
+            return UEFI::Success;
         }
 
         UEFI::Status OpenBootVolume() noexcept {
@@ -677,7 +784,7 @@ namespace {
             m_BootEnvironmentBase = environment_base;
             m_BootEnvironmentPageCount = 1;
             m_BootEnvironmentAllocated = true;
-            m_BootEnvironment = reinterpret_cast<BootEnvironment_V1*>(static_cast<UEFI::UintN>(environment_base));
+            m_BootEnvironment = reinterpret_cast<BootEnvironment*>(static_cast<UEFI::UintN>(environment_base));
 
             m_BootServices->SetMem(m_BootEnvironment, PageSize, 0);
             return UEFI::Success;
@@ -753,7 +860,7 @@ namespace {
         void PopulateBootEnvironment() noexcept {
             m_BootEnvironment->Signature = EnvironmentSignature;
             m_BootEnvironment->Version = ProtocolVersion;
-            m_BootEnvironment->Size = sizeof(BootEnvironment_V1);
+            m_BootEnvironment->Size = sizeof(BootEnvironment);
             m_BootEnvironment->KernelEntryPoint = m_EntryPoint;
             m_BootEnvironment->KernelImage.Base = m_LoadedKernelBase;
             m_BootEnvironment->KernelImage.Size = m_LoadedKernelSize;
@@ -763,7 +870,7 @@ namespace {
             m_BootEnvironment->EnvironmentStorage.Size = PageSize;
             m_BootEnvironment->MemoryMapStorage.Base = m_MemoryMapBase;
             m_BootEnvironment->MemoryMapStorage.Size = m_MemoryMapCapacity;
-            m_BootEnvironment->FirmwareSystemTable = reinterpret_cast<UEFI::UintN>(m_SystemTable);
+            m_BootEnvironment->AcpiRsdp = m_AcpiRsdp;
         }
 
         UEFI::Status PrepareHandoff() noexcept {
@@ -982,7 +1089,7 @@ namespace {
 
         UEFI::PhysicalAddress m_BootEnvironmentBase{};
         UEFI::UintN m_BootEnvironmentPageCount{};
-        BootEnvironment_V1* m_BootEnvironment{};
+        BootEnvironment* m_BootEnvironment{};
 
         UEFI::PhysicalAddress m_MemoryMapBase{};
         UEFI::UintN m_MemoryMapPageCount{};
@@ -991,6 +1098,7 @@ namespace {
         UEFI::UintN m_MemoryMapKey{};
         UEFI::UintN m_MemoryDescriptorSize{};
         UEFI::Uint32 m_MemoryDescriptorVersion{};
+        UEFI::UintN m_AcpiRsdp{};
 
         bool m_BootServicesExited{};
         bool m_MemoryMapAllocated{};

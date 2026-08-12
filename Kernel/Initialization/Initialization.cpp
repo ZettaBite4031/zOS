@@ -23,29 +23,45 @@ namespace Zos::Kernel::Initialization {
             }
         }
 
-        void ValidateBootEnvironment(const Boot::BootEnvironment_V1& environment) noexcept {
+        [[nodiscard]] bool IsPageRange(const Boot::PhysicalRange& range) noexcept {
+            return range.Base != 0 && range.Size != 0 && (range.Base & (PageSize - 1)) == 0 && (range.Size & (PageSize - 1)) == 0;
+        }
+
+        void ValidateBootEnvironment(const Boot::BootEnvironment& environment) noexcept {
             if (environment.Signature != Boot::EnvironmentSignature) 
                 Diagnostics::Fatal("Startup", "boot environment signature mismatch");
 
             if (environment.Version != Boot::ProtocolVersion) 
                 Diagnostics::Fatal("Startup", "unsupported boot protocol version");
 
-            if (environment.Size < sizeof(Boot::BootEnvironment_V1)) 
+            if (environment.Size < sizeof(Boot::BootEnvironment)) 
                 Diagnostics::Fatal("Startup", "boot environment structure is too small");
 
-            if (environment.KernelImage.Size == 0) 
-                Diagnostics::Fatal("Startup", "kernel image range is empty");
-
-            if (environment.KernelStack.Size == 0) 
-                Diagnostics::Fatal("Startup", "kernel stack range is empty");
+            if (!IsPageRange(environment.KernelImage) ||
+                !IsPageRange(environment.KernelStack) ||
+                !IsPageRange(environment.EnvironmentStorage) ||
+                !IsPageRange(environment.MemoryMapStorage)) 
+                Diagnostics::Fatal("Startup", "boot-owned physical ranges are not page aligned");
 
             if (environment.MemoryMapStorage.Base == 0 || environment.MemoryMapSize == 0 ||
                 environment.MemoryMapDescriptorSize == 0 || environment.MemoryMapSize > environment.MemoryMapStorage.Size ||
                 (environment.MemoryMapSize % environment.MemoryMapDescriptorSize) != 0) 
                 Diagnostics::Fatal("Startup", "firmware memory-map metadata is inconsistent");
+
+            if (environment.AcpiRsdp == 0) 
+                Diagnostics::Fatal("Startup", "ACPI RSDP was not supplied");
+
+            /*
+             * Prove that this structure actually lives inside the
+             * storage allocation the loader told us about;
+             */
+            const Uint64 environment_address = reinterpret_cast<Uint64>(&environment);
+            if (environment_address < environment. EnvironmentStorage.Base || 
+                environment_address - environment.EnvironmentStorage.Base > environment. EnvironmentStorage.Size - sizeof(Boot::BootEnvironment)) 
+                Diagnostics::Fatal("Startup", "boot environment lies outside its declared storage");
         }
 
-        void PrintBootEnvironment(const Boot::BootEnvironment_V1& environment) noexcept {
+        void PrintBootEnvironment(const Boot::BootEnvironment& environment) noexcept {
             Diagnostics::Write("[zOS/Startup] Boot protocol signature: ");
             PrintSignature(environment.Signature);
             Diagnostics::Write("\n");
@@ -118,7 +134,7 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Memory] Allocation, DMA32, and double-free self-test passed.\n");
         }
 
-        void InitializePhysicalMemory(KernelRuntime& runtime, const Boot::BootEnvironment_V1& environment) noexcept {
+        void InitializePhysicalMemory(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
             const auto error = runtime.PhysicalMemory.Initialize(environment);
             if (error != PhysicalMemoryInitializationError::Success) 
                 Diagnostics::Fatal("Memory", PhysicalMemoryManager::Describe(error));
@@ -273,7 +289,7 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/VMM] Mapping, translation, W^X, null-guard, and release self-test passed.\n");
         }
 
-        void ActivateKernelAddressSpace(KernelRuntime& runtime, const Boot::BootEnvironment_V1& environment) noexcept {
+        void ActivateKernelAddressSpace(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
             /*
              * Deliberately startup-local.
              * 
@@ -313,7 +329,7 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Interrupt] INT32 dispatch and IRETQ self-test passed.\n");
         }
 
-        void RelcaimBootMemory(KernelRuntime& runtime) noexcept {
+        void ReclaimBootMemory(KernelRuntime& runtime) noexcept {
             PhysicalMemoryManager& physical_memory = runtime.PhysicalMemory;
             if (!physical_memory.IsInitialized())
                 Diagnostics::Fatal("Memory", "cannot reclaim boot memory before PMM intialization");
@@ -416,9 +432,54 @@ namespace Zos::Kernel::Initialization {
 
             Diagnostics::Write("[zOS/Memory] Boot-memory reclamation self-test passed.\n");
         }
+
+        [[nodiscard]] bool ConvertBootRange(const Boot::PhysicalRange& source, PhysicalSpan& destination) noexcept {
+            if (!IsPageRange(source)) return false;
+            destination = PhysicalSpan{ PhysicalAddress(source.Base), source.Size / PageSize };
+            return !destination.IsEmpty();
+        }
+
+        void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
+            if (runtime.Boot.Initialized) 
+                Diagnostics::Fatal("Startup", "boot context was internalized more than once");
+            
+            BootContext context{};
+            if (!ConvertBootRange(environment.KernelImage, context.KernelImage) ||
+                !ConvertBootRange(environment.KernelStack, context.BootstrapStack) ||
+                !ConvertBootRange(environment.EnvironmentStorage, context.EnvironmentStorage) ||
+                !ConvertBootRange(environment.MemoryMapStorage, context.MemoryMapStorage)) 
+                Diagnostics::Fatal("Startup", "failed to internalize boot-owned physical ranges");
+            
+            context.AcpiRsdp = PhysicalAddress(environment.AcpiRsdp);
+            if (context.AcpiRsdp.IsNull())
+                Diagnostics::Fatal("Startup", "internalized ACPI RSDP is null");
+
+            context.Initialized = true;
+            runtime.Boot = context;
+
+            /*
+            * Verify all copied state while the original handoff is
+            * still available.
+            */
+            if (runtime.Boot.KernelImage.Base != PhysicalAddress(environment.KernelImage.Base) ||
+                runtime.Boot.KernelImage.SizeBytes() != environment.KernelImage.Size ||
+                runtime.Boot.BootstrapStack.Base != PhysicalAddress(environment.KernelStack.Base) ||
+                runtime.Boot.BootstrapStack.SizeBytes() != environment.KernelStack.Size ||
+                runtime.Boot.EnvironmentStorage.Base != PhysicalAddress(environment.EnvironmentStorage.Base) ||
+                runtime.Boot.EnvironmentStorage.SizeBytes() != environment.EnvironmentStorage.Size ||
+                runtime.Boot.MemoryMapStorage.Base != PhysicalAddress(environment.MemoryMapStorage.Base) ||
+                runtime.Boot.MemoryMapStorage.SizeBytes() != environment.MemoryMapStorage.Size ||
+                runtime.Boot.AcpiRsdp != PhysicalAddress(environment.AcpiRsdp)) 
+                Diagnostics::Fatal("Startup", "internalized boot context does not match the loader handoff");
+
+            Diagnostics::Write("[zOS/Startup] Boot context internalized.\n");
+            Diagnostics::Write("[zOS/Startup] ACPI RSDP: ");
+            Diagnostics::WriteHex(runtime.Boot.AcpiRsdp.Value());
+            Diagnostics::Write("\n");
+        }
     }
 
-    void Bootstrap(const Boot::BootEnvironment_V1& environment, KernelRuntime& runtime) noexcept {
+    void Bootstrap(const Boot::BootEnvironment& environment, KernelRuntime& runtime) noexcept {
         if (runtime.Phase != KernelPhase::Entry) 
             Diagnostics::Fatal("Startup", "Kernel bootstrap was entered more than once");
 
@@ -450,16 +511,28 @@ namespace Zos::Kernel::Initialization {
          * any current bootstrap dependency. Explicitly reserved handoff
          * ranges remain Reserved and are therefore unaffected.
          */
-        RelcaimBootMemory(runtime);
+        ReclaimBootMemory(runtime);
         RunBootMemoryReclamationSelfTest(runtime);
         AdvancePhase(runtime, KernelPhase::InterruptsReady, KernelPhase::BootMemoryReclaimed);
 
         /*
-         * The next roadmap phase will internalize the remaining boot
-         * context and eventually release the specifically reserved
-         * bootstrap stack/environment/memory-map allocations.
+         * Copy every remaining handoff fact into permanent
+         * kernel-owned storage.
+         * 
+         * After this call no persistent subsystem has any reason
+         * to retain BootEnvironment itself.
          */
-        AdvancePhase(runtime, KernelPhase::BootMemoryReclaimed, KernelPhase::BootstrapComplete);
+        InternalizeBootContext(runtime, environment);
+        AdvancePhase(runtime, KernelPhase::BootMemoryReclaimed, KernelPhase::BootContextInternalized);
+
+        /*
+         * The loader handoff is now conceptually disposable.
+         *
+         * Its physical pages remain reserved only because we are
+         * still executing on the loader-provided stack and have not
+         * yet reached the bootstrap-resource-release milestone.
+         */
+        AdvancePhase(runtime, KernelPhase::BootContextInternalized, KernelPhase::BootstrapComplete);
 
         Diagnostics::Write("[zOS/Startup] Boostrap infrastructure complete.\n");
     }

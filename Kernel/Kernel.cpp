@@ -19,7 +19,7 @@ namespace Zos::Kernel {
     }
 }
 
-extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void KernelMain(const Zos::Boot::BootEnvironment_V1* environment) noexcept {
+extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void KernelMain(const Zos::Boot::BootEnvironment* environment) noexcept {
     using namespace Zos;
 
     Kernel::Diagnostics::Write(

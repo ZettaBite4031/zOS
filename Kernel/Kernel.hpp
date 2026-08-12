@@ -7,6 +7,32 @@
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
 
 namespace Zos::Kernel {
+    struct BootContext final {
+        /*
+         * Permanent kernel image ownership.
+         */
+        Memory::PhysicalSpan KernelImage{};
+
+        /*
+         * Temporary bootstrap resources which remain reserved
+         * until later roadmap milestones explicitly replace them.
+         */
+        Memory::PhysicalSpan BootstrapStack{};
+        Memory::PhysicalSpan EnvironmentStorage{};
+        Memory::PhysicalSpan MemoryMapStorage{};
+
+        /*
+         * Firmware-independent physical root for later ACPI
+         * initialization
+         * 
+         * The underlying ACPI memory remains DeferredAcpi until
+         * the ACPI subsystem has consumed it.
+         */
+        Memory::PhysicalAddress AcpiRsdp{};
+
+        bool Initialized{};
+    };
+
     enum class KernelPhase : Memory::Uint32 {
         Entry,
         BootEnvironmentValidated,
@@ -15,6 +41,7 @@ namespace Zos::Kernel {
         AddressSpaceActive,
         InterruptsReady,
         BootMemoryReclaimed,
+        BootContextInternalized,
         BootstrapComplete,
         Runtime,
     };
@@ -32,6 +59,7 @@ namespace Zos::Kernel {
      *  - removing long-lived objects from the bootstrap stack.
      */
     struct KernelRuntime final {
+        BootContext Boot{};
         Memory::PhysicalMemoryManager PhysicalMemory{};
         Memory::BootstrapMetadataArena BootstrapMetadata{};
         Memory::VirtualAddressAllocator KernelAddresses{};

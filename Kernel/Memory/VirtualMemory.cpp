@@ -597,7 +597,7 @@ namespace Zos::Kernel::Memory {
         return true;
     }
 
-    bool KernelAddressSpace::ValidateKernelLayout(const Boot::BootEnvironment_V1& environment) const noexcept {
+    bool KernelAddressSpace::ValidateKernelLayout(const Boot::BootEnvironment& environment) const noexcept {
         const Uint64 image_start = SymbolAddress(__KernelImageStart);
         const Uint64 image_end = SymbolAddress(__KernelImageEnd);
         if (image_start != environment.KernelImage.Base) return false;
@@ -626,7 +626,7 @@ namespace Zos::Kernel::Memory {
             boundaries[6] <= boundaries[7];
     }
 
-    bool KernelAddressSpace::MapBootstrapRanges(const Boot::BootEnvironment_V1& environment) noexcept {
+    bool KernelAddressSpace::MapBootstrapRanges(const Boot::BootEnvironment& environment) noexcept {
         const MappingOptions writable{
             .Access = PageAccess::Read | PageAccess::Write | PageAccess::Global,
             .Cache = CachePolicy::WriteBack,
@@ -641,7 +641,7 @@ namespace Zos::Kernel::Memory {
         return true;
     }
 
-    KernelAddressSpaceError KernelAddressSpace::ValidateDirectMapCoverage(const Boot::BootEnvironment_V1& environment) const noexcept {
+    KernelAddressSpaceError KernelAddressSpace::ValidateDirectMapCoverage(const Boot::BootEnvironment& environment) const noexcept {
         const Uint64 descriptor_count = environment.MemoryMapSize / environment.MemoryMapDescriptorSize;
         const auto* map = reinterpret_cast<const Uint8*>(environment.MemoryMapStorage.Base);
 
@@ -682,7 +682,7 @@ namespace Zos::Kernel::Memory {
         };
     }
 
-    KernelAddressSpaceError KernelAddressSpace::MapDirectMemory(const Boot::BootEnvironment_V1& environment) noexcept {
+    KernelAddressSpaceError KernelAddressSpace::MapDirectMemory(const Boot::BootEnvironment& environment) noexcept {
         using Architecture::AMD64::MappingError;
 
         const Uint64 descriptor_count = environment.MemoryMapSize / environment.MemoryMapDescriptorSize;
@@ -763,7 +763,7 @@ namespace Zos::Kernel::Memory {
         return true;
     }
 
-    bool KernelAddressSpace::ValidateMappings(const Boot::BootEnvironment_V1& environment) const noexcept {
+    bool KernelAddressSpace::ValidateMappings(const Boot::BootEnvironment& environment) const noexcept {
         const MappingOptions text{
             .Access = PageAccess::Read | PageAccess::Execute | PageAccess::Global,
             .Cache = CachePolicy::WriteBack,
@@ -839,7 +839,7 @@ namespace Zos::Kernel::Memory {
         return true;
     }
 
-    KernelAddressSpaceError KernelAddressSpace::Build(const Boot::BootEnvironment_V1& environment) noexcept {
+    KernelAddressSpaceError KernelAddressSpace::Build(const Boot::BootEnvironment& environment) noexcept {
         if (m_Built) return KernelAddressSpaceError::AlreadyBuilt;
 
         if (m_PhysicalMemory == nullptr || m_Metadata == nullptr || m_PageMap == nullptr || 

@@ -88,12 +88,12 @@ namespace Zos::Kernel::Memory {
         return true;
     }
 
-    const Boot::FirmwareMemoryDescriptor* PhysicalMemoryManager::DescriptorAt(const Boot::BootEnvironment_V1& environment, Uint64 index) const noexcept {
+    const Boot::FirmwareMemoryDescriptor* PhysicalMemoryManager::DescriptorAt(const Boot::BootEnvironment& environment, Uint64 index) const noexcept {
         const auto* bytes = reinterpret_cast<const Uint8*>(environment.MemoryMapStorage.Base);
         return reinterpret_cast<const Boot::FirmwareMemoryDescriptor*>(bytes + (index * environment.MemoryMapDescriptorSize));
     }
 
-    PhysicalMemoryInitializationError PhysicalMemoryManager::ValidateMemoryMap(const Boot::BootEnvironment_V1& environment, Uint64 descriptor_count, Uint64& managed_pages, Uint64& managed_region_capacity, Uint64& conventional_pages) const noexcept {
+    PhysicalMemoryInitializationError PhysicalMemoryManager::ValidateMemoryMap(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64& managed_pages, Uint64& managed_region_capacity, Uint64& conventional_pages) const noexcept {
         managed_pages = 0;
         managed_region_capacity = 0;
         conventional_pages = 0;
@@ -142,7 +142,7 @@ namespace Zos::Kernel::Memory {
         return PhysicalMemoryInitializationError::Success;
     }
 
-    bool PhysicalMemoryManager::CandidateOverlapsProtectedRange(const Boot::BootEnvironment_V1& environment, Uint64 candidate_base, Uint64 candidate_end, Uint64& next_candidate_end) const noexcept {
+    bool PhysicalMemoryManager::CandidateOverlapsProtectedRange(const Boot::BootEnvironment& environment, Uint64 candidate_base, Uint64 candidate_end, Uint64& next_candidate_end) const noexcept {
         const Boot::PhysicalRange ranges[] = {
             environment.KernelImage, environment.KernelStack,
             environment.EnvironmentStorage, environment.MemoryMapStorage,
@@ -171,7 +171,7 @@ namespace Zos::Kernel::Memory {
         return overlap_found;
     }
 
-    bool PhysicalMemoryManager::FindMetadataRegion(const Boot::BootEnvironment_V1& environment, Uint64 descriptor_count, Uint64 metadata_page_count, PhysicalSpan& result) const noexcept {
+    bool PhysicalMemoryManager::FindMetadataRegion(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 metadata_page_count, PhysicalSpan& result) const noexcept {
         if (metadata_page_count == 0 || metadata_page_count > MaximumValue / PageSize) return false;
 
         const Uint64 metadata_size = metadata_page_count * PageSize;
@@ -227,7 +227,7 @@ namespace Zos::Kernel::Memory {
         m_Statistics.ManagedPages = managed_pages;
     }
 
-    void PhysicalMemoryManager::BuildManagedRegions(const Boot::BootEnvironment_V1& environment, Uint64 descriptor_count, Uint64 managed_region_capacity) noexcept {
+    void PhysicalMemoryManager::BuildManagedRegions(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 managed_region_capacity) noexcept {
         m_RegionCount = 0;
 
         for (Uint64 i = 0; i < descriptor_count; i++) {
@@ -375,7 +375,7 @@ namespace Zos::Kernel::Memory {
         }
     }
 
-    void PhysicalMemoryManager::ReserveBootOwnedRanges(const Boot::BootEnvironment_V1& environment) noexcept {
+    void PhysicalMemoryManager::ReserveBootOwnedRanges(const Boot::BootEnvironment& environment) noexcept {
         auto reserve_byte_range = [this](const Boot::PhysicalRange& range) noexcept {
             if (range.Size == 0) return;
 
@@ -400,12 +400,12 @@ namespace Zos::Kernel::Memory {
         ReserveSpan(PhysicalSpan{ PhysicalAddress(0), 1 });
     }
 
-    PhysicalMemoryInitializationError PhysicalMemoryManager::Initialize(const Boot::BootEnvironment_V1& environment) noexcept {
+    PhysicalMemoryInitializationError PhysicalMemoryManager::Initialize(const Boot::BootEnvironment& environment) noexcept {
         if (m_Initialized) return PhysicalMemoryInitializationError::AlreadyInitialized;
 
         if (environment.Signature != Boot::EnvironmentSignature
             || environment.Version != Boot::ProtocolVersion 
-            || environment.Size < sizeof(Boot::BootEnvironment_V1)
+            || environment.Size < sizeof(Boot::BootEnvironment)
             || environment.MemoryMapStorage.Base == 0 
             || environment.MemoryMapSize == 0
             || environment.MemoryMapDescriptorSize < sizeof(Boot::FirmwareMemoryDescriptor)

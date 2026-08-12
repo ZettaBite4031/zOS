@@ -13,7 +13,7 @@ namespace Zos::Kernel::Initialization {
      * On success, all permanent kernel infrastructure is owned
      * by KernelRuntime rather than the loader-provided stack.
      */
-    void Bootstrap(const Boot::BootEnvironment_V1& environment, KernelRuntime& runtime) noexcept;
+    void Bootstrap(const Boot::BootEnvironment& environment, KernelRuntime& runtime) noexcept;
 
     /*
      * Establishes the formal transition from bootstrap into
