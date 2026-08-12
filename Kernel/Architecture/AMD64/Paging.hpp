@@ -13,6 +13,16 @@ namespace Zos::Kernel::Architecture::AMD64 {
         PhysicalAddressUnsupported,
     };
 
+    enum class PageMapActivationError : Memory::Uint32 {
+        Success,
+        NotInitialized,
+        AlreadyActive,
+        ExecuteDisableUnsupported,
+        DirectMapUnavailable,
+        ProtectionEnableFailed,
+        RootTableMismatch,
+    };
+
     enum class MappingError : Memory::Uint32 {
         Success,
         NotInitialized,
@@ -47,7 +57,10 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         [[nodiscard]] PageMapInitializationError Initialize(Memory::PhysicalMemoryManager& physical_memory, Memory::BootstrapMetadataArena& metadata) noexcept;
 
+        [[nodiscard]] PageMapActivationError Activate() noexcept;
+
         [[nodiscard]] MappingError MapPage(Memory::VirtualAddress virt_addr, Memory::PhysicalAddress phys_addr, Memory::MappingOptions options) noexcept;
+        [[nodiscard]] MappingError MapRange(Memory::VirtualAddress virt_addr, Memory::PhysicalAddress phys_addr, Memory::Uint64 page_count, Memory::MappingOptions) noexcept;
 
         [[nodiscard]] MappingError UnmapPage(Memory::VirtualAddress virt_addr) noexcept;
 
@@ -55,14 +68,19 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] bool IsMapped(Memory::VirtualAddress virt_addr) const noexcept;
 
         [[nodiscard]] bool IsInitialized() const noexcept { return !m_RootTable.IsNull(); }
+        [[nodiscard]] bool IsActive() const noexcept { return m_Active; }
         [[nodiscard]] Memory::PhysicalAddress RootTable() const noexcept { return m_RootTable; }
         [[nodiscard]] const PageMapStatistics& Statistics() const noexcept { return m_Statistics; }
         [[nodiscard]] Memory::Uint64 TablePageCount() const noexcept { return m_Statistics.TablePages; }
 
         [[nodiscard]] Memory::PhysicalAddress TablePage(Memory::Uint64 index) const noexcept;
 
+        [[nodiscard]] static Memory::PhysicalAddress CurrentRootTable() noexcept;
+
         [[nodiscard]] static bool IsCanonical(Memory::VirtualAddress address) noexcept;
+
         [[nodiscard]] static const char* Describe(PageMapInitializationError error) noexcept;
+        [[nodiscard]] static const char* Describe(PageMapActivationError error) noexcept;
         [[nodiscard]] static const char* Describe(MappingError error) noexcept;
 
     private:
@@ -113,8 +131,9 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] static Memory::MappingOptions DecodeOptions(Entry entry) noexcept;
         [[nodiscard]] static Memory::PhysicalAddress EntryAddress(Entry entry) noexcept;
         [[nodiscard]] static bool TableIsEmpty(const Entry* table) noexcept;
+        static void InvalidatePage(Memory::VirtualAddress address) noexcept;
 
-        [[nodiscard]] Entry* BootstrapTablePointer(Memory::PhysicalAddress address) const noexcept;
+        [[nodiscard]] Entry* TablePointer(Memory::PhysicalAddress address) const noexcept;
         [[nodiscard]] PageMapInitializationError AllocateTable(Memory::PhysicalAddress& output) noexcept;
         [[nodiscard]] MappingError AllocateTableForMapping(Memory::PhysicalAddress& output) noexcept;
         [[nodiscard]] TableRecord* AcquireTableRecord() noexcept;
@@ -127,6 +146,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] bool RollbackResolution(TableResolution& resolution) noexcept;
         void RecycleTableRecord(TableRecord& record) noexcept;
 
+        bool m_Active{};
         Memory::PhysicalMemoryManager* m_PhysicalMemory{};
         Memory::BootstrapMetadataArena* m_Metadata{};
         Memory::PhysicalAddress m_RootTable{};

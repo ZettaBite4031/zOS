@@ -5,6 +5,120 @@ extern "C" void* memset(void* dst, int v, unsigned long long n) noexcept;
 namespace Zos::Kernel::Architecture::AMD64 {
     using namespace Memory;
 
+    inline constexpr Uint64 MaximumValue{ ~Uint64{ 0 } };
+
+    inline constexpr Uint32 ExtendedCpuidBase { 0x80000000u };
+    inline constexpr Uint32 ExtendedFeaturesLeaf { 0x80000001u };
+    inline constexpr Uint32 NxFeatureBit{ 1u << 20 };
+    inline constexpr Uint32 EferMsr{ 0xC0000080u };
+    inline constexpr Uint64 EferNxe{ 1ULL << 11 };
+    inline constexpr Uint64 Cr0WriteProtect{ 1ULL << 16 };
+    inline constexpr Uint64 Cr4PageGlobalEnable{ 1ULL << 7 };
+
+    void Cpuid(Uint32 leaf, Uint32 subleaf, Uint32& eax, Uint32& ebx, Uint32& ecx, Uint32& edx) noexcept {
+        __asm__ volatile(
+            "cpuid"
+            : "=a"(eax),
+              "=b"(ebx),
+              "=c"(ecx),
+              "=d"(edx)
+            : "a"(leaf),
+              "c"(subleaf)
+        );
+    }
+
+    bool SupportsExecuteDisable() noexcept { 
+        Uint32 eax{};
+        Uint32 ebx{};
+        Uint32 ecx{};
+        Uint32 edx{};
+
+        Cpuid(ExtendedCpuidBase, 0, eax, ebx, ecx, edx);
+        if (eax < ExtendedFeaturesLeaf) return false;
+
+        Cpuid(ExtendedFeaturesLeaf, 0, eax, ebx, ecx, edx);
+
+        return (edx & NxFeatureBit) != 0;
+    }
+
+    Uint64 ReadMsr(Uint32 msr) noexcept {
+        Uint32 low{};
+        Uint32 high{};
+
+        __asm__ volatile(
+            "rdmsr"
+            : "=a"(low), "=d"(high)
+            : "c"(msr)
+        );
+
+        return static_cast<Uint64>(low) | (static_cast<Uint64>(high) << 32);
+    }
+
+    void WriteMsr(Uint32 msr, Uint64 value) noexcept {
+        __asm__ volatile(
+            "wrmsr"
+            :
+            : "c"(msr),
+              "a"(static_cast<Uint32>(value)),
+              "d"(static_cast<Uint32>(value >> 32))
+            : "memory"
+        );
+    }
+
+    Uint64 ReadCr0() noexcept {
+        Uint64 value{};
+        __asm__ volatile(
+            "mov %%cr0, %0"
+            : "=r"(value)
+        ); 
+        return value;
+    }
+
+    void WriteCr0(Uint64 value) noexcept {
+        __asm__ volatile(
+            "mov %0, %%cr0"
+            :
+            : "r"(value)
+            : "memory"
+        );
+    }
+
+    Uint64 ReadCr3() noexcept {
+        Uint64 value{};
+        __asm__ volatile(
+            "mov %%cr3, %0"
+            : "=r"(value)
+        );
+        return value;
+    }
+
+    void WriteCr3(Uint64 value) noexcept {
+        __asm__ volatile(
+            "mov %0, %%cr3"
+            :
+            : "r"(value)
+            : "memory"
+        );
+    }
+
+    Uint64 ReadCr4() noexcept {
+        Uint64 value{};
+        __asm__ volatile(
+            "mov %%cr4, %0"
+            : "=r"(value)
+        );
+        return value;
+    }
+
+    void WriteCr4(Uint64 value) noexcept {
+        __asm__ volatile(
+            "mov %0, %%cr4"
+            :
+            : "r"(value)
+            : "memory"
+        );
+    }
+
     Uint64 PageMap::Pml4Index(VirtualAddress address) noexcept {
         return (address.Value() >> 39) & 0x1FF;
     }
@@ -32,6 +146,10 @@ namespace Zos::Kernel::Architecture::AMD64 {
             record = record->Next;
 
         return record != nullptr ? record->Address : PhysicalAddress{};
+    }
+
+    PhysicalAddress PageMap::CurrentRootTable() noexcept {
+        return PhysicalAddress(ReadCr3() & AddressMask);
     }
 
     bool PageMap::IsCanonical(VirtualAddress address) noexcept {
@@ -85,8 +203,22 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return true;
     }
 
-    PageMap::Entry* PageMap::BootstrapTablePointer(PhysicalAddress address) const noexcept {
-        return reinterpret_cast<Entry*>(address.Value());
+    void PageMap::InvalidatePage(VirtualAddress address) noexcept { 
+        const Uint64 value = address.Value();
+
+        __asm__ volatile(
+            "invlpg (%0)"
+            :
+            : "r"(value)
+            : "memory"
+        );
+    }
+
+    PageMap::Entry* PageMap::TablePointer(PhysicalAddress address) const noexcept {
+        if (address.IsNull() || !address.IsPageAligned()) return nullptr;
+        if (!m_Active) return reinterpret_cast<Entry*>(address.Value());
+        if (!Layout::IsDirectMappable(address)) return nullptr;
+        return reinterpret_cast<Entry*>(Layout::DirectMapAddress(address).Value());
     }
 
     PageMap::TableRecord* PageMap::FindTableRecord(PhysicalAddress address) noexcept {
@@ -111,7 +243,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return PageMapInitializationError::PhysicalAddressUnsupported;
         }
 
-        Entry* table = BootstrapTablePointer(allocation.Base());
+        Entry* table = TablePointer(allocation.Base());
         if (table == nullptr) {
             (void)m_PhysicalMemory->Release(allocation);
             return PageMapInitializationError::PhysicalAddressUnsupported;
@@ -208,6 +340,75 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return PageMapInitializationError::Success;
     }
 
+    PageMapActivationError PageMap::Activate() noexcept {
+        if (!IsInitialized()) return PageMapActivationError::NotInitialized;
+        if (m_Active) return PageMapActivationError::AlreadyActive;
+        if (!SupportsExecuteDisable()) return PageMapActivationError::ExecuteDisableUnsupported;
+
+        /*
+         * Once CR3 changes, PageMap accesses its own
+         * tables through the direct physical map.
+         * 
+         * Verify every owned table has that alias
+         * before making the transition
+         */
+        for (Uint64 i = 0; i < TablePageCount(); i++) {
+            const PhysicalAddress physical = TablePage(i);
+            if (!Layout::IsDirectMappable(physical)) return PageMapActivationError::DirectMapUnavailable;
+
+            const VirtualAddress direct = Layout::DirectMapAddress(physical);
+            const TranslationResult translation = Translate(direct);
+            if (!translation.Mapped || translation.Physical != physical)
+                return PageMapActivationError::DirectMapUnavailable;
+        }
+
+        /*
+         * The metadata arena also changes its
+         * physical-pointer conversion after CR3.
+         */
+        for (Uint64 i = 0; i < m_Metadata->BackingPageCount(); i++) {
+            const PhysicalAddress physical = m_Metadata->BackingPage(i);
+            if (!Layout::IsDirectMappable(physical)) return PageMapActivationError::DirectMapUnavailable;
+
+            const TranslationResult translation = Translate(Layout::DirectMapAddress(physical));
+            if (!translation.Mapped || translation.Physical != physical)
+                return PageMapActivationError::DirectMapUnavailable;
+        }
+
+        Uint64 efer = ReadMsr(EferMsr);
+        efer |= EferNxe;
+        WriteMsr(EferMsr, efer);
+
+        if ((ReadMsr(EferMsr) & EferNxe) == 0) 
+            return PageMapActivationError::ProtectionEnableFailed;
+
+        /*
+         * A CR3 reload does not necessarily evict
+         * global translations when PGE is enabled.
+         * 
+         * Temporarily clearing PGE ensures firmware
+         * global translations cannot survive into
+         * the new address space.
+         */
+        const Uint64 original_cr4 = ReadCr4();
+        const bool pge_enabled = (original_cr4 & Cr4PageGlobalEnable) != 0;
+        if (pge_enabled) WriteCr4(original_cr4 & ~Cr4PageGlobalEnable);
+        WriteCr3(m_RootTable.Value());
+        if (pge_enabled) WriteCr4(original_cr4);
+
+        /*
+         * Everything after this point executes using 
+         * zOS-owned tables.
+         */
+        m_Active = true;
+
+        m_Metadata->EnableDirectMapAccess();
+
+        if (CurrentRootTable() != m_RootTable)
+            return PageMapActivationError::RootTableMismatch;
+        return PageMapActivationError::Success;
+    }
+
     MappingError PageMap::ResolveNextTable(Entry* table, Uint64 index, bool user_mapping, TableResolution& output) noexcept {
         output = {};
         Entry& entry = table[index];
@@ -269,7 +470,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return nullptr;
         }
 
-        const Entry* next = BootstrapTablePointer(address);
+        const Entry* next = TablePointer(address);
         if (next == nullptr) {
             error = MappingError::CorruptPageTable;
             return nullptr;
@@ -298,7 +499,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return nullptr;
         }
 
-        Entry* next = BootstrapTablePointer(address);
+        Entry* next = TablePointer(address);
         if (next == nullptr) {
             error = MappingError::CorruptPageTable;
             return nullptr;
@@ -342,7 +543,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return MappingError::InvalidPhysicalAddress;
         if (!ValidOptions(options)) return MappingError::InvalidPermissions;
 
-        Entry* pml4 = BootstrapTablePointer(m_RootTable);
+        Entry* pml4 = TablePointer(m_RootTable);
         if (pml4 == nullptr) return MappingError::CorruptPageTable;
 
         const bool user_mapping = HasAccess(options.Access, PageAccess::User);
@@ -353,7 +554,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         MappingError error = ResolveNextTable(pml4, Pml4Index(virt_addr), user_mapping, pdpt_resolution);
         if (error != MappingError::Success) return error;
 
-        Entry* pdpt = BootstrapTablePointer(pdpt_resolution.Address);
+        Entry* pdpt = TablePointer(pdpt_resolution.Address);
         error = ResolveNextTable(pdpt, PdptIndex(virt_addr), user_mapping, pd_resolution);
         if (error != MappingError::Success) {
             if (!RollbackResolution(pdpt_resolution)) 
@@ -361,7 +562,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return error;
         }
 
-        Entry* pd = BootstrapTablePointer(pd_resolution.Address);
+        Entry* pd = TablePointer(pd_resolution.Address);
         error = ResolveNextTable(pd, PdIndex(virt_addr), user_mapping, pt_resolution);
         if (error != MappingError::Success) {
             if (!RollbackResolution(pd_resolution) || !RollbackResolution(pdpt_resolution)) 
@@ -369,7 +570,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return error;
         }
 
-        Entry* pt = BootstrapTablePointer(pt_resolution.Address);
+        Entry* pt = TablePointer(pt_resolution.Address);
         Entry& leaf = pt[PtIndex(virt_addr)];
         if ((leaf & Present) != 0) {
             // Existing paths should not have created new intermediate tables for
@@ -381,6 +582,29 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         leaf = (phys_addr.Value() & AddressMask) | LeafFlags(options);
         m_Statistics.MappedPages++;
+        if (m_Active) InvalidatePage(virt_addr);
+        return MappingError::Success;
+    }
+
+    MappingError PageMap::MapRange(VirtualAddress virt_addr, PhysicalAddress phys_addr, Uint64 page_count, MappingOptions options) noexcept {
+        if (page_count == 0 || page_count > MaximumValue / PageSize) return MappingError::InvalidVirtualAddress;
+
+        const Uint64 size = page_count * PageSize;
+        if (virt_addr.Value() > MaximumValue - (size - PageSize) || phys_addr.Value() > MaximumValue - (size - PageSize)) 
+            return MappingError::InvalidVirtualAddress;
+
+        Uint64 mapped_pages = 0;
+        for (; mapped_pages < page_count; mapped_pages++) {
+            const Uint64 offset = mapped_pages * PageSize;
+            const MappingError error = MapPage(virt_addr + offset, phys_addr + offset, options);
+            if (error == MappingError::Success) continue;
+            while (mapped_pages != 0) { 
+                mapped_pages--;
+                const MappingError rollback = UnmapPage(virt_addr + mapped_pages * PageSize);
+                if (rollback != MappingError::Success) return MappingError::CorruptPageTable;
+            }
+            return error;
+        }
         return MappingError::Success;
     }
 
@@ -388,7 +612,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if (!IsInitialized()) return MappingError::NotInitialized;
         if (!IsCanonical(virt_addr) || !virt_addr.IsPageAligned()) return MappingError::InvalidVirtualAddress; 
 
-        Entry* pml4 = BootstrapTablePointer(m_RootTable);
+        Entry* pml4 = TablePointer(m_RootTable);
         if (pml4 == nullptr) return MappingError::CorruptPageTable;
         
         Entry& pml4_entry = pml4[Pml4Index(virt_addr)];
@@ -420,6 +644,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if ((leaf & Present) == 0) return MappingError::NotMapped;
 
         leaf = 0;
+        if (m_Active) InvalidatePage(virt_addr);
         if (m_Statistics.MappedPages != 0) m_Statistics.MappedPages--;
         if (TableIsEmpty(pt)) {
             pd_entry = 0;
@@ -442,7 +667,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if (!IsInitialized() || !IsCanonical(virt_addr)) return result;
 
         MappingError error = MappingError::Success;
-        const Entry* pml4 = BootstrapTablePointer(m_RootTable);
+        const Entry* pml4 = TablePointer(m_RootTable);
         const Entry* pdpt = ResolveExistingNextTable(pml4, Pml4Index(virt_addr), error);
         if (pdpt == nullptr) return result;
 

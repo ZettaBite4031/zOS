@@ -20,25 +20,41 @@ SECTIONS
 
     .text ALIGN(0x1000) :
     {
+        __TextStart = .;
         KEEP(*(.text.KernelMain))
         *(.text .text.*)
+
+        . = ALIGN(0x1000);
+        __TextEnd = .;
     } :text
 
     .rodata ALIGN(0x1000) :
     {
+        __RodataStart = .;
+
         *(.rodata .rodata.*)
+
+        . = ALIGN(0x1000);
+        __RodataEnd = .;
     } :rodata
 
     .data ALIGN(0x1000) :
     {
+        __DataStart = .;
         *(.data .data.*)
+
+        . = ALIGN(0x1000);
+        __DataEnd = .;
     } :data
 
     .bss ALIGN(0x1000) (NOLOAD) :
     {
         __BssStart = .;
+        
         *(.bss .bss.*)
         *(COMMON)
+
+        . = ALIGN(0x1000);
         __BssEnd = .;
     } : data
 

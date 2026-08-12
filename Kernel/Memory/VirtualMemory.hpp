@@ -2,6 +2,10 @@
 
 #include <Kernel/Memory/PhysicalMemory.hpp>
 
+namespace Zos::Kernel::Architecture::AMD64 {
+    class PageMap;
+}
+
 namespace Zos::Kernel::Memory {
     namespace Layout {
         inline constexpr VirtualAddress NullGuardBase{ 0x0000000000000000ULL };
@@ -25,6 +29,15 @@ namespace Zos::Kernel::Memory {
 
         [[nodiscard]] constexpr VirtualSpan KernelMmioSpan() noexcept {
             return VirtualSpan{ KernelMmioBase, KernelMmioSize / PageSize };
+        }
+
+        [[nodiscard]] constexpr bool IsDirectMappable(PhysicalAddress address) noexcept {
+            return address.Value() < DirectMapSize;
+        }
+
+        [[nodiscard]] constexpr VirtualAddress DirectMapAddress(PhysicalAddress address) noexcept {
+            if (!IsDirectMappable(address)) return {};
+            return DirectMapBase + address.Value();
         }
 
         static_assert((DirectMapBase.Value() & (PageSize - 1)) == 0);
@@ -65,6 +78,9 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] PhysicalAddress FirstPage() const noexcept { return m_FirstPageAllocation.Base(); }
         [[nodiscard]] Uint64 BackingPageCount() const noexcept { return m_Statistics.PageCount; }
 
+        void EnableDirectMapAccess() noexcept { m_DirectMapAccess = true; }
+        [[nodiscard]] bool UsesDirectMapAccess() const noexcept { return m_DirectMapAccess; }
+
         [[nodiscard]] PhysicalAddress BackingPage(Uint64 index) const noexcept;
 
         [[nodiscard]] static const char* Describe(MetadataArenaInitializationError error) noexcept;
@@ -78,13 +94,15 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] static bool IsPowerOfTwo(Uint64 value) noexcept;
         [[nodiscard]] static bool TryAlignUp(Uint64 value, Uint64 alignment, Uint64& result) noexcept;
         [[nodiscard]] static Uint64 ReservedOwnershipOffset() noexcept;
-        [[nodiscard]] static void* BootstrapPointer(PhysicalAddress address) noexcept;
+
+        [[nodiscard]] void* PhysicalPointer(PhysicalAddress address) const noexcept;
 
         [[nodiscard]] bool Grow() noexcept;
         [[nodiscard]] void* TryAllocateFromCurrent(Uint64 size, Uint64 alignment) noexcept;
         void InitializePage(PageHeader* page) noexcept;
         void MoveTokenInto(PhysicalAllocation& destination, PhysicalAllocation& source) noexcept;
 
+        bool m_DirectMapAccess{};
         PhysicalMemoryManager* m_PhysicalMemory{};
         PhysicalAllocation m_FirstPageAllocation{};
         PageHeader* m_FirstPage{};
@@ -200,5 +218,66 @@ namespace Zos::Kernel::Memory {
         FreeExtent* m_RecycledExtents{};
         VirtualSpan m_ManagedRange{};
         VirtualAddressAllocatorStatistics m_Statistics{};
+    };
+
+    enum class KernelAddressSpaceError : Uint32 {
+        Success,
+        AlreadyBuilt,
+        NotBuilt,
+        AlreadyActive,
+        InvalidDependency,
+        InvalidBootEnvironment,
+        UnsupportedKernelLoadModel,
+        InvalidKernelLayout,
+        DirectMapTooSmall,
+        MappingFailed,
+        ValidationFailed,
+        ActivationFailed,
+    };
+
+    class KernelAddressSpace final {
+    public:
+        KernelAddressSpace(PhysicalMemoryManager& physical_memory, BootstrapMetadataArena& metadata, Architecture::AMD64::PageMap& page_map) noexcept
+            : m_PhysicalMemory(&physical_memory), m_Metadata(&metadata), m_PageMap(&page_map) {};
+
+        KernelAddressSpace(const KernelAddressSpace&) = delete;
+        KernelAddressSpace& operator=(const KernelAddressSpace&) = delete;
+
+        [[nodiscard]] KernelAddressSpaceError Build(const Boot::BootEnvironment_V1& environment) noexcept;
+
+        [[nodiscard]] KernelAddressSpaceError Activate() noexcept;
+
+        [[nodiscard]] bool IsBuilt() const noexcept { return m_Built; }
+        [[nodiscard]] bool IsActive() const noexcept;
+
+        [[nodiscard]] VirtualAddress DirectMap(PhysicalAddress address) const noexcept { return Layout::DirectMapAddress(address); }
+
+        [[nodiscard]] static const char* Describe(KernelAddressSpaceError error) noexcept;
+
+    private:
+        [[nodiscard]] bool ValidateKernelLayout(const Boot::BootEnvironment_V1& environment) const noexcept;
+        [[nodiscard]] KernelAddressSpaceError ValidateDirectMapCoverage(const Boot::BootEnvironment_V1& environment) const noexcept;
+
+        [[nodiscard]] bool MapKernelSection(Uint64 start, Uint64 end, MappingOptions options) noexcept;
+        [[nodiscard]] bool MapKernelImage() noexcept;
+        [[nodiscard]] bool MapBootstrapRanges(const Boot::BootEnvironment_V1& environment) noexcept;
+        
+        [[nodiscard]] KernelAddressSpaceError MapDirectMemory(const Boot::BootEnvironment_V1& environment) noexcept;
+
+        [[nodiscard]] bool MapBootstrapMetadata() noexcept;
+
+        [[nodiscard]] bool ValidateKernelSection(Uint64 start, Uint64 end, MappingOptions options) const noexcept;
+        [[nodiscard]] bool ValidateMappings(const Boot::BootEnvironment_V1& environment) const noexcept;
+
+        [[nodiscard]] bool MapIdentityBytes(Uint64 base, Uint64 size, MappingOptions options) noexcept;
+        
+        [[nodiscard]] bool EnsureIdentityPage(PhysicalAddress page, MappingOptions options) noexcept;
+
+        PhysicalMemoryManager* m_PhysicalMemory{};
+        BootstrapMetadataArena* m_Metadata{};
+        Architecture::AMD64::PageMap* m_PageMap{};
+        const Boot::BootEnvironment_V1* m_Environment{};
+
+        bool m_Built{};
     };
 }

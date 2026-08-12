@@ -307,7 +307,7 @@ namespace {
             Fatal("VMM", "page-table cleanup did not return to root-only state");
 
         WriteDebug("[zOS/VMM] Virtual range allocator initialized.\n");
-        WriteDebug("[zOS/VMM] Test page-map root: ");
+        WriteDebug("[zOS/VMM] Kernel page-map root: ");
         WriteHex(page_map.RootTable().Value());
         WriteDebug("\n");
         WriteDebug("[zOS/VMM] Page-table pages retained: ");
@@ -378,6 +378,32 @@ extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void Kernel
     InitializeVirtualMemoryInfrastructure(physical_memory, virtual_metadata, kernel_addresses, kernel_page_map);
     RunVirtualMemoryInfrastructureSelfTest(physical_memory, virtual_metadata, kernel_addresses, kernel_page_map);
     WriteDebug("[zOS/Kernel] Virtual-Memory infrastructure established.\n");
+
+    Kernel::Memory::KernelAddressSpace kernel_address_space(physical_memory, virtual_metadata, kernel_page_map);
+    const Kernel::Memory::KernelAddressSpaceError build_error = kernel_address_space.Build(*environment);
+    if (build_error != Kernel::Memory::KernelAddressSpaceError::Success) 
+        Fatal("VMM", Kernel::Memory::KernelAddressSpace::Describe(build_error));
+
+    WriteDebug("[zOS/VMM] Kernel address space constructed\n");
+    WriteDebug("[zOS/VMM] new CR3 root: ");
+    WriteHex(kernel_page_map.RootTable().Value());
+    WriteDebug("\n");
+
+    const Kernel::Memory::KernelAddressSpaceError activation_error = kernel_address_space.Activate();
+    if (activation_error != Kernel::Memory::KernelAddressSpaceError::Success) 
+        Fatal("VMM", Kernel::Memory::KernelAddressSpace::Describe(activation_error));
+    
+    /*
+     * If this line executes and reaches port 0xE9,
+     * then instruction fetch, stack access, rodata,
+     * globals, and the new address space all survived
+     * the CR3 transition.
+     */
+    WriteDebug("[zOS/VMM] Kernel-owned address space active.\n");
+    WriteDebug("[zOS/VMM] Active CR3: ");
+    WriteHex(Kernel::Architecture::AMD64::PageMap::CurrentRootTable().Value());
+    WriteDebug("\n");
+    
 
     __asm__ volatile("cli");
     for (;;) {
