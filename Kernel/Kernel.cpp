@@ -1,12 +1,16 @@
 #include <Boot/Protocol.hpp>
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
+#include <Kernel/Architecture/AMD64/Interrupts.hpp>
 
 #include <Kernel/Memory/PhysicalMemory.hpp>
 #include <Kernel/Memory/VirtualMemory.hpp>
 
+
 namespace {
     using namespace Zos;
+
+    Kernel::Architecture::AMD64::InterruptManager g_Interrupts{};
 
     void WriteDebugChar(char value) noexcept {
         constexpr unsigned short DebugPort = 0xE9;
@@ -403,6 +407,18 @@ extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void Kernel
     WriteDebug("[zOS/VMM] Active CR3: ");
     WriteHex(Kernel::Architecture::AMD64::PageMap::CurrentRootTable().Value());
     WriteDebug("\n");
+    WriteDebug("Kernel-owned address space active.\n");
+
+    const auto interrupt_error = g_Interrupts.Initialize(physical_memory, kernel_addresses, kernel_page_map);
+    if (interrupt_error != Kernel::Architecture::AMD64::InterruptInitializationError::Success)
+        Fatal("Interrupt", Kernel::Architecture::AMD64::InterruptManager::Describe(interrupt_error));
+
+    WriteDebug("[zOS/Interrupt] GDT, TSS, and IDT established.\n");
+
+    if (!g_Interrupts.RunBreakpointSelfTest())
+        Fatal("Interrupt", "INT3 round-trip self-test failed");
+
+    WriteDebug("[zOS/Interrupt] INT3 dispatch and IRETQ self-test passed.\n");
     
 
     __asm__ volatile("cli");
