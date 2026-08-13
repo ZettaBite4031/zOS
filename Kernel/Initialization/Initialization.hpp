@@ -8,19 +8,11 @@ namespace Zos::Kernel {
 
 namespace Zos::Kernel::Initialization {
     /*
-     * Performs the complete temporary bootstrap sequence.
-     * 
-     * On success, all permanent kernel infrastructure is owned
-     * by KernelRuntime rather than the loader-provided stack.
-     */
-    void Bootstrap(const Boot::BootEnvironment& environment, KernelRuntime& runtime) noexcept;
-
-    /*
-     * Establishes the formal transition from bootstrap into
+     * Performs the complete bootstrap transition and enters
      * permanent kernel runtime.
-     * 
-     * There is currently no scheduler, so the runtime simply
-     * enters the idle halt loop.
+     *
+     * This function never returns because the loader-provided
+     * call stack is explicitly retired during bootstrap.
      */
-    [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept;
+    [[noreturn]] void Bootstrap(const Boot::BootEnvironment& environment, KernelRuntime& runtime) noexcept;
 }

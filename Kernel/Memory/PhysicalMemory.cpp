@@ -419,10 +419,29 @@ namespace Zos::Kernel::Memory {
             environment.EnvironmentStorage,
             environment.MemoryMapStorage,
         };
+
         for (const Boot::PhysicalRange& range : protected_ranges) {
-            Uint64 end = 0;
-            if (range.Size != 0 && !TryRangeEnd(range.Base, range.Size, end)) 
+            if (range.Base == 0 || range.Size == 0 || (range.Base & (PageSize - 1)) != 0 || (range.Size & (PageSize - 1)) != 0) 
                 return PhysicalMemoryInitializationError::InvalidBootEnvironment;
+
+            Uint64 end = 0;
+            if (!TryRangeEnd(range.Base, range.Size, end)) 
+                return PhysicalMemoryInitializationError::InvalidBootEnvironment;
+        }
+
+        for (Uint64 left = 0; left < sizeof(protected_ranges) / sizeof(protected_ranges[0]); left++) {
+            Uint64 left_end = 0;
+            if (!TryRangeEnd(protected_ranges[left].Base, protected_ranges[left].Size, left_end)) 
+                return PhysicalMemoryInitializationError::InvalidBootEnvironment;
+
+            for (Uint64 right = left + 1; right < sizeof(protected_ranges) / sizeof(protected_ranges[0]); right++) {
+                Uint64 right_end = 0;
+                if (!TryRangeEnd(protected_ranges[right].Base, protected_ranges[right].Size, right_end))
+                    return PhysicalMemoryInitializationError::InvalidBootEnvironment;
+
+                if (Overlaps(protected_ranges[left].Base, left_end, protected_ranges[right].Base, right_end)) 
+                    return PhysicalMemoryInitializationError::InvalidBootEnvironment;
+            }
         }
 
         const Uint64 descriptor_count = environment.MemoryMapSize / environment.MemoryMapDescriptorSize;
@@ -461,6 +480,10 @@ namespace Zos::Kernel::Memory {
         BuildManagedRegions(environment, descriptor_count, managed_region_capacity);
         InitializePageStates();
         ReserveBootOwnedRanges(environment);
+
+        m_BootstrapStackSpan = PhysicalSpan{ PhysicalAddress(environment.KernelStack.Base), environment.KernelStack.Size / PageSize };
+        m_EnvironmentStorageSpan = PhysicalSpan{ PhysicalAddress(environment.EnvironmentStorage.Base), environment.EnvironmentStorage.Size / PageSize };
+        m_MemoryMapStorageSpan = PhysicalSpan{ PhysicalAddress(environment.MemoryMapStorage.Base), environment.MemoryMapStorage.Size / PageSize };
 
         m_Initialized = true;
         return PhysicalMemoryInitializationError::Success;
@@ -552,6 +575,54 @@ namespace Zos::Kernel::Memory {
         m_BootMemoryReclaimed = true;
         result.ReclaimedPages = deferred_boot_pages;
         return PhysicalMemoryReclamationError::Success;
+    }
+
+    BootstrapResourceReleaseError PhysicalMemoryManager::ReleaseBootstrapResources(BootstrapResourceReleaseResult& result) noexcept {
+        result = {};
+        if (!m_Initialized) return BootstrapResourceReleaseError::NotInitialized;
+        if (!m_BootMemoryReclaimed) return BootstrapResourceReleaseError::BootMemoryNotReclaimed;
+        if (m_BootstrapResourcesReleased) return BootstrapResourceReleaseError::AlreadyReleased;
+        if (m_BootstrapStackSpan.IsEmpty() ||
+            m_EnvironmentStorageSpan.IsEmpty() ||
+            m_MemoryMapStorageSpan.IsEmpty()) 
+            return BootstrapResourceReleaseError::InvalidState;
+
+        /*
+         * Preflight everything before changing a single page.
+         *
+         * These ranges were explicitly converted to Reserved during
+         * PMM initialization and must still be Reserved now.
+         */
+        if (!SpanHasState(m_BootstrapStackSpan, PageState::Reserved) ||
+            !SpanHasState(m_EnvironmentStorageSpan, PageState::Reserved) ||
+            !SpanHasState(m_MemoryMapStorageSpan, PageState::Reserved))
+            return BootstrapResourceReleaseError::InvalidState;
+
+        Uint64 released_pages = m_BootstrapStackSpan.PageCount;
+        if (m_EnvironmentStorageSpan.PageCount > MaximumValue - released_pages) 
+            return BootstrapResourceReleaseError::InvalidState;
+
+        released_pages += m_EnvironmentStorageSpan.PageCount;
+        if (m_MemoryMapStorageSpan.PageCount > MaximumValue - released_pages)
+            return BootstrapResourceReleaseError::InvalidState;
+
+        released_pages += m_MemoryMapStorageSpan.PageCount;
+        if (released_pages > MaximumValue - m_Statistics.FreePages)
+            return BootstrapResourceReleaseError::InvalidState;
+
+        /*
+         * Complete deterministic transition:
+         *  - Reserved -> Free
+         */
+        SetSpanState(m_BootstrapStackSpan, PageState::Free);
+        SetSpanState(m_EnvironmentStorageSpan, PageState::Free);
+        SetSpanState(m_MemoryMapStorageSpan, PageState::Free);
+
+        m_Statistics.FreePages += released_pages;
+
+        m_BootstrapResourcesReleased = true;
+        result.ReleasedPages = released_pages;
+        return BootstrapResourceReleaseError::Success;
     }
 
     bool PhysicalMemoryManager::RangeIsFree(const ManagedRegion& region, Uint64 first_page_offset, Uint64 page_count) const noexcept {
@@ -753,6 +824,35 @@ namespace Zos::Kernel::Memory {
         return nullptr;
     }
 
+    bool PhysicalMemoryManager::SpanHasState(PhysicalSpan span, PageState expected) const noexcept {
+        if (span.IsEmpty() || !span.Base.IsPageAligned() || span.PageCount > MaximumValue / PageSize) return false;
+        for (Uint64 page = 0; page < span.PageCount; page++) {
+            const PhysicalAddress address = span.Base + page * PageSize;
+            const PhysicalSpan single_page{ address, 1 };
+            const ManagedRegion* region = FindContainingRegion(single_page);
+            if (region == nullptr) return false;
+            const Uint64 page_offset = (address.Value() - region->Base) / PageSize;
+            if (GetState(*region, page_offset) != expected) return false;
+        }
+        return true;
+    }
+
+    void PhysicalMemoryManager::SetSpanState(PhysicalSpan span, PageState state) noexcept {
+        for (Uint64 page = 0; page < span.PageCount; page++) {
+            const PhysicalAddress address = span.Base + page * PageSize;
+            const PhysicalSpan single_page{ address, 1 };
+            const ManagedRegion* region = FindContainingRegion(single_page);
+
+            /*
+             * This is only called after a complete preflight using
+             * SpanHasState(), while the kernel is still single-CPU.
+             */
+            if (region == nullptr) return;
+            const Uint64 page_offset = (address.Value() - region->Base) / PageSize;
+            SetState(*region, page_offset, state);
+        }
+    }
+
     PhysicalAllocationError PhysicalMemoryManager::Release(PhysicalAllocation& allocation) noexcept {
         if (!m_Initialized) return PhysicalAllocationError::NotInitialized;
 
@@ -812,5 +912,16 @@ namespace Zos::Kernel::Memory {
         case PhysicalMemoryReclamationError::CorruptState: return "physical memory state is inconsistent";
         }
         return "unknown physical memory reclamation error";
+    }
+
+    const char* PhysicalMemoryManager::Describe(BootstrapResourceReleaseError error) noexcept {
+        switch (error) {
+        case BootstrapResourceReleaseError::Success: return "success";
+        case BootstrapResourceReleaseError::NotInitialized: return "physical memory manager is not initialized";
+        case BootstrapResourceReleaseError::BootMemoryNotReclaimed: return "deferred boot memory has not been reclaimed";
+        case BootstrapResourceReleaseError::AlreadyReleased: return "bootstrap resources have already been released";
+        case BootstrapResourceReleaseError::InvalidState: return "bootstrap resource page state is inconsistent";
+        }
+        return "unknown bootstrap resource release error";
     }
 }   

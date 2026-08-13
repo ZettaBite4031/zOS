@@ -36,5 +36,4 @@ extern "C" [[noreturn]] __attribute__((section(".text.KernelMain"))) void Kernel
     
     Kernel::KernelRuntime& runtime = Kernel::GetKernelRuntime();
     Kernel::Initialization::Bootstrap(*environment, runtime);
-    Kernel::Initialization::EnterRuntime(runtime);
 }

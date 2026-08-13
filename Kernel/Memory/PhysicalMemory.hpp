@@ -43,6 +43,19 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] Uint64 ReclaimedBytes() const noexcept { return ReclaimedPages * PageSize; }
     };
 
+    enum class BootstrapResourceReleaseError : Uint32 {
+        Success,
+        NotInitialized,
+        BootMemoryNotReclaimed,
+        AlreadyReleased,
+        InvalidState,
+    };
+
+    struct BootstrapResourceReleaseResult final {
+        Uint64 ReleasedPages;
+        [[nodiscard]] constexpr Uint64 ReleasedBytes() const noexcept { return ReleasedPages * PageSize; }
+    };
+
     struct PhysicalAllocationConstraints final {
         PhysicalAddress MinimumAddress{ PhysicalAddress(PageSize) };
         PhysicalAddress MaximumAddress{ PhysicalAddress(~Uint64{ 0 }) };
@@ -121,6 +134,9 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] PhysicalMemoryInitializationError Initialize(const Boot::BootEnvironment& environment) noexcept;
         [[nodiscard]] PhysicalMemoryReclamationError ReclaimBootMemory(PhysicalMemoryReclamationResult& result) noexcept;
 
+        [[nodiscard]] BootstrapResourceReleaseError ReleaseBootstrapResources(BootstrapResourceReleaseResult& result) noexcept;
+        [[nodiscard]] bool AreBootstrapResourcesReleased() const noexcept { return m_BootstrapResourcesReleased; }
+
         [[nodiscard]] PhysicalAllocationError AllocatePage(PhysicalAllocation& output, PhysicalAllocationConstraints constraints = PhysicalAllocationConstraints::General()) noexcept;
         [[nodiscard]] PhysicalAllocationError AllocateContiguous(Uint64 page_count, PhysicalAllocation& output, PhysicalAllocationConstraints constraints = PhysicalAllocationConstraints::General()) noexcept;
         [[nodiscard]] PhysicalAllocationError Release(PhysicalAllocation& allocation) noexcept;
@@ -132,6 +148,7 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] static const char* Describe(PhysicalMemoryReclamationError error) noexcept;
         [[nodiscard]] static const char* Describe(PhysicalMemoryInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(PhysicalAllocationError error) noexcept;
+        [[nodiscard]] static const char* Describe(BootstrapResourceReleaseError error) noexcept;
 
     private:
         // One byte per managed page is intentional. It costs ~0.024% of the RAM
@@ -198,12 +215,23 @@ namespace Zos::Kernel::Memory {
 
         [[nodiscard]] const ManagedRegion* FindContainingRegion(PhysicalSpan span) const noexcept;
 
+        [[nodiscard]] bool SpanHasState(PhysicalSpan span, PageState expected) const noexcept;
+        void SetSpanState(PhysicalSpan span, PageState state) noexcept;
+
         ManagedRegion* m_Regions{ };
         Uint8* m_PageStates{};
         Uint64 m_RegionCount{};
+
         PhysicalSpan m_MetadataSpan{};
+
+        PhysicalSpan m_BootstrapStackSpan{};
+        PhysicalSpan m_EnvironmentStorageSpan{};
+        PhysicalSpan m_MemoryMapStorageSpan{};
+
         PhysicalMemoryStatistics m_Statistics{};
+
         bool m_Initialized{};
         bool m_BootMemoryReclaimed{};
+        bool m_BootstrapResourcesReleased{};
     };
 }

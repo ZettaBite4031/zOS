@@ -14,8 +14,11 @@ namespace Zos::Kernel {
         Memory::PhysicalSpan KernelImage{};
 
         /*
-         * Temporary bootstrap resources which remain reserved
-         * until later roadmap milestones explicitly replace them.
+         * Loader-provided bootstrap resources. 
+         *
+         * These are copied here only so the permanent-stack transition
+         * can retire them without consulting BootEnvironment again.
+         * They are cleared after release.
          */
         Memory::PhysicalSpan BootstrapStack{};
         Memory::PhysicalSpan EnvironmentStorage{};
@@ -42,6 +45,11 @@ namespace Zos::Kernel {
         InterruptsReady,
         BootMemoryReclaimed,
         BootContextInternalized,
+
+        PermanentStackPrepared,
+        PermanentStackActive,
+        BootstrapResourcesReleased,
+
         BootstrapComplete,
         Runtime,
     };
@@ -65,6 +73,12 @@ namespace Zos::Kernel {
         Memory::VirtualAddressAllocator KernelAddresses{};
         Architecture::AMD64::PageMap KernelPageMap{};
         Architecture::AMD64::InterruptManager Interrupts{};
+
+        /*
+         * Permanent bootstrap/runtime stack until kernel threads
+         * introduce per-thread kernel stacks.
+         */
+        Memory::KernelStack PrimaryStack{};
 
         KernelPhase Phase{ KernelPhase::Entry };
     };

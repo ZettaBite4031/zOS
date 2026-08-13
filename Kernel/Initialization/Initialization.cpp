@@ -4,10 +4,68 @@
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 
+extern "C" [[noreturn]] void SwitchToPermanentKernelStack(Zos::Kernel::Memory::Uint64 stack_top, void(*continuation)(void*) noexcept, void* context) noexcept;
+
+__asm__(
+    ".pushsection "
+        ".text.SwitchToPermanentKernelStack,"
+        "\"ax\",@progbits\n"
+
+    ".global SwitchToPermanentKernelStack\n"
+    ".type SwitchToPermanentKernelStack,@function\n"
+
+    "SwitchToPermanentKernelStack:\n"
+
+    /*
+     * SysV AMD64:
+     * 
+     * RDI = new stack top
+     * RSI = continuation
+     * RDX = continuation context
+     */
+    "   movq %rdi, %rsp\n"
+
+    /*
+     * There is intentionally no frame-chain relationship with the
+     * discarded loader stack.
+     */
+    "   xorq %rbp, %rbp\n"
+
+    /*
+     * SysV requires DF clear on function entry.
+     */
+    "   cld\n"
+
+    /*
+     * First continuation argument = context.
+     */
+    "   movq %rdx, %rdi\n"
+
+    /*
+     * CALL intentionally creates a normal SysV entry condition:
+     * the callee observes RSP % 16 == 8.
+     */
+    "   call *%rsi\n"
+
+    /*
+     * The continuation is contractually noreturn.
+     */
+    "   ud2\n"
+
+    ".size SwitchToPermanentKernelStack, "
+        ".-SwitchToPermanentKernelStack\n"
+
+    ".popsection\n"
+);
+
+
 namespace Zos::Kernel::Initialization {
     namespace {
         using namespace Memory;
         using namespace Architecture::AMD64;
+
+        inline constexpr Uint64 PrimaryKernelStackPages{ 16 };
+        static_assert(PrimaryKernelStackPages * PageSize == 64 * 1024);
 
         void AdvancePhase(KernelRuntime& runtime, KernelPhase expected, KernelPhase next) noexcept {
             if (runtime.Phase != expected) 
@@ -321,12 +379,12 @@ namespace Zos::Kernel::Initialization {
             if (error != InterruptInitializationError::Success)
                 Diagnostics::Fatal("Interrupt", InterruptManager::Describe(error));
             
-            Diagnostics::Write("[zOSInterrupt] GDT, TSS, and IDT established.\n");
+            Diagnostics::Write("[zOS/Interrupt] GDT, TSS, and IDT established.\n");
 
             if (!runtime.Interrupts.RunBreakpointSelfTest()) 
                 Diagnostics::Fatal("Interrupt", "INT3 round-trip self-test failed");
             
-            Diagnostics::Write("[zOS/Interrupt] INT32 dispatch and IRETQ self-test passed.\n");
+            Diagnostics::Write("[zOS/Interrupt] INT3 dispatch and IRETQ self-test passed.\n");
         }
 
         void ReclaimBootMemory(KernelRuntime& runtime) noexcept {
@@ -439,6 +497,125 @@ namespace Zos::Kernel::Initialization {
             return !destination.IsEmpty();
         }
 
+        void PreparePermanentKernelStack(KernelRuntime& runtime) noexcept {
+            const auto error = runtime.PrimaryStack.Initialize(runtime.PhysicalMemory, runtime.KernelAddresses, runtime.KernelPageMap, PrimaryKernelStackPages);
+            if (error != KernelStackInitializationError::Success) 
+                Diagnostics::Fatal("Stack", KernelStack::Describe(error));
+
+            const VirtualSpan span = runtime.PrimaryStack.UsableSpan();
+            Diagnostics::Write("[zOS/Stack] Permanent kernel stack: ");
+            Diagnostics::WriteHex(span.Base.Value());
+            Diagnostics::Write(" + ");
+            Diagnostics::WriteDecimal(span.SizeBytes());
+            Diagnostics::Write(" bytes\n");
+
+            Diagnostics::Write("[zOS/Stack] Lower guard: ");
+            Diagnostics::WriteHex(runtime.PrimaryStack.LowerGuard().Value());
+            Diagnostics::Write("\n");
+
+            Diagnostics::Write("[zOS/Stack] Upper guard: ");
+            Diagnostics::WriteHex(runtime.PrimaryStack.UpperGuard().Value());
+            Diagnostics::Write("\n");
+        }
+
+        void UnmapIdentitySpan(Architecture::AMD64::PageMap& page_map, PhysicalSpan span) noexcept {
+            if (span.IsEmpty()) 
+                Diagnostics::Fatal("VMM", "attempted to retire an empty bootstrap span");
+
+            for (Uint64 page = 0; page < span.PageCount; page++) {
+                const PhysicalAddress physical = span.Base + page * PageSize;
+                const VirtualAddress identity{ physical.Value() };
+                const auto translation = page_map.Translate(identity);
+                if (!translation.Mapped || translation.Physical != physical) 
+                    Diagnostics::Fatal("VMM", "bootstrap identity mapping is inconsistent");
+
+                const auto error = page_map.UnmapPage(identity);
+                if (error != Architecture::AMD64::MappingError::Success) 
+                    Diagnostics::Fatal("VMM", Architecture::AMD64::PageMap::Describe(error));
+
+                if (page_map.IsMapped(identity))
+                    Diagnostics::Fatal("VMM", "retired bootstrap identity page still maps");
+
+                /*
+                 * The physical page remains available through the direct
+                 * map. After PMM release this is the only intentional kernel 
+                 * alias for ordinary reclaimed RAM.
+                 */
+                const VirtualAddress direct = Layout::DirectMapAddress(physical);
+                const auto direct_translation = page_map.Translate(direct);
+                if (!direct_translation.Mapped || direct_translation.Physical != physical) 
+                    Diagnostics::Fatal("VMM", "bootstrap resource lost direct-map coverage");
+            }
+        }
+
+        void ReleaseBootstrapResources(KernelRuntime& runtime) noexcept {
+            if (!runtime.Boot.Initialized) 
+                Diagnostics::Fatal("Startup", "boot context is not initialized");
+
+            /*
+             * No CPU state, persistent object, or C++ frame may refer to
+             * these identity aliases after this point.
+             */
+            UnmapIdentitySpan(runtime.KernelPageMap, runtime.Boot.BootstrapStack);
+            UnmapIdentitySpan(runtime.KernelPageMap, runtime.Boot.EnvironmentStorage);
+            UnmapIdentitySpan(runtime.KernelPageMap, runtime.Boot.MemoryMapStorage);
+
+            /*
+             * Page-table reclamation during UnmapPage() may itself modify
+             * PMM Free/Allocated counts, so establish the accounting
+             * baseline only after all three unmaps are complete
+             */
+            const PhysicalMemoryStatistics before = runtime.PhysicalMemory.Statistics();
+            BootstrapResourceReleaseResult result{};
+            const auto error = runtime.PhysicalMemory.ReleaseBootstrapResources(result);
+            if (error != BootstrapResourceReleaseError::Success) 
+                Diagnostics::Fatal("Memory", PhysicalMemoryManager::Describe(error));
+
+            const PhysicalMemoryStatistics after = runtime.PhysicalMemory.Statistics();
+            if (before.FreePages > ~Uint64{ 0 } - result.ReleasedPages) 
+                Diagnostics::Fatal("Memory", "bootstrap release accounting overflowed");
+
+            if (after.FreePages != before.FreePages + result.ReleasedPages ||
+                after.AllocatedPages != before.AllocatedPages ||
+                after.DeferredBootPages != before.DeferredBootPages ||
+                after.DeferredAcpiPages != before.DeferredAcpiPages ||
+                before.ReservedPages() < result.ReleasedPages ||
+                after.ReservedPages() != before.ReservedPages() - result.ReleasedPages) 
+                Diagnostics::Fatal("Memory", "bootstrap release accounting invariant failed");
+            
+            if (!runtime.PhysicalMemory.AreBootstrapResourcesReleased())
+                Diagnostics::Fatal("Memory", "bootstrap resources did not enter release state");
+
+            /*
+             * Prevent later code from treating the old physical ranges as
+             * live kernel-owened resources.
+             */
+            runtime.Boot.BootstrapStack = {};
+            runtime.Boot.EnvironmentStorage = {};
+            runtime.Boot.MemoryMapStorage = {};
+
+            Diagnostics::Write("[zOS/Memory] Released bootstrap resources: ");
+            Diagnostics::WriteDecimal(result.ReleasedPages);
+            Diagnostics::Write(" pages (");
+            Diagnostics::WriteDecimal(result.ReleasedBytes());
+            Diagnostics::Write(" bytes).\n");
+        }
+
+        void ValidatePermanentStackActive(KernelRuntime& runtime) noexcept {
+            Uint64 rsp = 0;
+            __asm__ volatile(
+                "mov %%rsp, %0"
+                : "=r"(rsp)
+            );
+
+            if (!runtime.PrimaryStack.Contains(VirtualAddress(rsp))) 
+                Diagnostics::Fatal("Stack", "RSP did not transition to the permanent kernel stack");
+
+            if (runtime.KernelPageMap.IsMapped(runtime.PrimaryStack.LowerGuard()) || 
+                runtime.KernelPageMap.IsMapped(runtime.PrimaryStack.UpperGuard())) 
+                Diagnostics::Fatal("Stack", "permanent kernel stack guard page is mapped");
+        }
+
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
             if (runtime.Boot.Initialized) 
                 Diagnostics::Fatal("Startup", "boot context was internalized more than once");
@@ -477,6 +654,58 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::WriteHex(runtime.Boot.AcpiRsdp.Value());
             Diagnostics::Write("\n");
         }
+
+    }
+
+    [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
+        AdvancePhase(runtime, KernelPhase::BootstrapComplete, KernelPhase::Runtime);
+
+        Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
+
+        /*
+         * No scheduler exists yet.
+         * 
+         * Maskable interrupts remain disabled until APIC/IOAPIC
+         * initialization establishes extern interrupt routing.
+         */
+        __asm__ volatile("cli");
+        for (;;) __asm__ volatile("hlt");
+    }
+
+    [[noreturn]] void ContinueBootstrapOnPermanentStack(void* context) noexcept {
+        if (context == nullptr) 
+            Diagnostics::Fatal("Stack", "permanent-stack continuation context is null");
+
+        auto& runtime = *static_cast<KernelRuntime*>(context);
+        if (runtime.Phase != KernelPhase::PermanentStackPrepared)
+            Diagnostics::Fatal("Startup", "permanent-state continuation phase is invalid");
+
+        ValidatePermanentStackActive(runtime);
+
+        AdvancePhase(runtime, KernelPhase::PermanentStackPrepared, KernelPhase::PermanentStackActive);
+        Diagnostics::Write("[zOS/Stack] Permanent kernel stack active.\n");
+
+        /*
+         * We are now executing entirely from the new stack and use only
+         * the internalized BootContext. The original BootEnvironment,
+         * loader stack, and firmware-map storage are no longer live.
+         */
+        ReleaseBootstrapResources(runtime);
+        if (!runtime.PhysicalMemory.AreBootstrapResourcesReleased())
+            Diagnostics::Fatal("Memory", "bootstrap resources remain reserved");
+
+        if (!runtime.Boot.BootstrapStack.IsEmpty() ||
+            !runtime.Boot.EnvironmentStorage.IsEmpty() ||
+            !runtime.Boot.MemoryMapStorage.IsEmpty()) 
+            Diagnostics::Fatal("Startup", "released bootstrap ranges remain in BootContext");
+
+        AdvancePhase(runtime, KernelPhase::PermanentStackActive, KernelPhase::BootstrapResourcesReleased);
+
+        AdvancePhase(runtime, KernelPhase::BootstrapResourcesReleased, KernelPhase::BootstrapComplete);
+
+        Diagnostics::Write("[zOS/Startup] Bootstrap infrastructure complete.\n");
+
+        EnterRuntime(runtime);
     }
 
     void Bootstrap(const Boot::BootEnvironment& environment, KernelRuntime& runtime) noexcept {
@@ -487,7 +716,7 @@ namespace Zos::Kernel::Initialization {
         PrintBootEnvironment(environment);
 
         AdvancePhase(runtime, KernelPhase::Entry, KernelPhase::BootEnvironmentValidated);
-        Diagnostics::Write("[zOS/Startup] Firmware handoff validate.\n");
+        Diagnostics::Write("[zOS/Startup] Firmware handoff validated.\n");
 
         InitializePhysicalMemory(runtime, environment);
         AdvancePhase(runtime, KernelPhase::BootEnvironmentValidated, KernelPhase::PhysicalMemoryReady);
@@ -526,29 +755,24 @@ namespace Zos::Kernel::Initialization {
         AdvancePhase(runtime, KernelPhase::BootMemoryReclaimed, KernelPhase::BootContextInternalized);
 
         /*
-         * The loader handoff is now conceptually disposable.
-         *
-         * Its physical pages remain reserved only because we are
-         * still executing on the loader-provided stack and have not
-         * yet reached the bootstrap-resource-release milestone.
+         * Everything needed from BootEnvironment now exists in
+         * KernelRuntime::Boot.
+         * 
+         * Prepare the permanent VMM-owned stack while the loader stack is
+         * still valid.
          */
-        AdvancePhase(runtime, KernelPhase::BootContextInternalized, KernelPhase::BootstrapComplete);
-
-        Diagnostics::Write("[zOS/Startup] Boostrap infrastructure complete.\n");
-    }
-
-    [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::BootstrapComplete, KernelPhase::Runtime);
-
-        Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
+        PreparePermanentKernelStack(runtime);
+        AdvancePhase(runtime, KernelPhase::BootContextInternalized, KernelPhase::PermanentStackPrepared);
+        Diagnostics::Write("[zOS/Stack] Switching away from loader-provided stack.\n");
 
         /*
-         * No scheduler exists yet.
+         * This call NEVER returns.
          * 
-         * Maskable interrupts intentionally remain disabled until
-         * APIC/IOAPIC initialization is implemented.
+         * Returning would require touching the caller frame on the loader
+         * stack, which the continuation will unmap and return to this PMM.
          */
-        __asm__ volatile("cli");
-        for(;;) __asm__ volatile("hlt");
+        SwitchToPermanentKernelStack(runtime.PrimaryStack.Top().Value(), &ContinueBootstrapOnPermanentStack, &runtime);
+
+        __builtin_unreachable();
     }
 }
