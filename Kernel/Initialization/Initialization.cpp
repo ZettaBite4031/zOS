@@ -265,8 +265,11 @@ namespace Zos::Kernel::Initialization {
                 !kernel_addresses.IsInitialized() || !page_map.IsInitialized()) 
                 Diagnostics::Fatal("VMM", "virtual-memory self-test dependencies are not initialized");
             
-
-            const Uint64 free_virtual_pages_before = kernel_addresses.Statistics(). FreePages;
+            if (!kernel_addresses.Validate())
+                Diagnostics::Fatal("VMM", "virtual address allocator failed initial validation");
+                
+            const VirtualAddressAllocatorStatistics virtual_baseline = kernel_addresses.Statistics();
+            
             VirtualReservation lead_reservation{};
             auto virtual_error = kernel_addresses.Reserve(1, lead_reservation);
             if (virtual_error != VirtualAllocationError::Success) 
@@ -348,16 +351,23 @@ namespace Zos::Kernel::Initialization {
             if (kernel_addresses.Release(lead_reservation) != VirtualAllocationError::Success) 
                 Diagnostics::Fatal("VMM", "lead virtual reservation release failed");
 
-            if (kernel_addresses.Statistics().FreePages != free_virtual_pages_before ||
-                kernel_addresses.Statistics().ReservedPages != 0 ||
-                kernel_addresses.Statistics().FreeExtentCount != 1) 
+            if (!kernel_addresses.Validate())
+                Diagnostics::Fatal("VMM", "virtual address allocator failed final validation");
+
+            const auto& final_virtual = kernel_addresses.Statistics();
+            if (final_virtual.FreePages != virtual_baseline.FreePages || 
+                final_virtual.ReservedPages != virtual_baseline.ReservedPages || 
+                final_virtual.FreeExtentCount != virtual_baseline.FreeExtentCount || 
+                final_virtual.ActiveReservations != virtual_baseline.ActiveReservations) 
                 Diagnostics::Fatal("VMM", "virtual address accounting did not return to baseline");
+            
 
             if (page_map.Statistics().MappedPages != 0 ||
                 page_map.Statistics().TablePages != 1) 
                 Diagnostics::Fatal("VMM", "page-table cleanup did not return to root-only state");
 
-            Diagnostics::Write("[zOS/VMM] Mapping, translation, W^X, null-guard, and release self-test passed.\n");
+
+            Diagnostics::Write("[zOS/VMM] Reservation ownership, mapping, translation, W^X, null-guard, and release self-test passed.\n");
         }
 
         void ActivateKernelAddressSpace(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {

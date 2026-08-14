@@ -216,7 +216,7 @@ namespace Zos::Kernel::Memory {
     }
 
     VirtualReservation::VirtualReservation(VirtualReservation&& other) noexcept
-        : m_Owner(other.m_Owner), m_Span(other.m_Span), m_ReleaseExtent(other.m_ReleaseExtent) { other.Invalidate(); }
+        : m_Owner(other.m_Owner), m_Span(other.m_Span), m_ReservationId(other.m_ReservationId) { other.Invalidate(); }
 
     bool VirtualAddressAllocator::IsPowerOfTwo(Uint64 value) noexcept { 
         return value != 0 && (value & (value - 1)) == 0;
@@ -336,6 +336,7 @@ namespace Zos::Kernel::Memory {
 
         m_Metadata = &metadata;
         m_ManagedRange = managed_range;
+        m_NextReservationId = 1;
 
         FreeExtent* initial = AcquireExtent(managed_range.Base.Value(), managed_range.PageCount);
         if (initial == nullptr) {
@@ -346,9 +347,13 @@ namespace Zos::Kernel::Memory {
 
         m_FreeHead = initial;
         m_FreeTail = initial;
+
         m_Statistics.ManagedPages = managed_range.PageCount;
         m_Statistics.FreePages = managed_range.PageCount;
         m_Statistics.FreeExtentCount = 1;
+        
+        m_Initialized = true;
+
         return VirtualAllocationError::Success;
     }
 
@@ -398,14 +403,39 @@ namespace Zos::Kernel::Memory {
         FreeExtent* release_extent = AcquireExtent(allocation_base, page_count);
         if (release_extent == nullptr) return VirtualAllocationError::OutOfMetadata;
 
+        ReservationRecord* reservation_record = AcquireReservationRecord();
+        if (reservation_record == nullptr) {
+            RecycleExtent(*release_extent);
+            return VirtualAllocationError::OutOfMetadata;
+        }
+
         FreeExtent* suffix = nullptr;
         if (prefix_pages != 0 && suffix_pages != 0) {
             suffix = AcquireExtent(allocation_end, suffix_pages);
             if (suffix == nullptr) {
+                RecycleReservationRecord(*reservation_record);
                 RecycleExtent(*release_extent);
                 return VirtualAllocationError::OutOfMetadata;
             }
         }
+
+        Uint64 reservation_id = 0;
+        if (!AllocateReservationId(reservation_id)) {
+            if (suffix != nullptr) RecycleExtent(*suffix);
+            RecycleReservationRecord(*reservation_record);
+            RecycleExtent(*release_extent);
+            return VirtualAllocationError::ReservationIdExhausted;
+        }
+
+        /*
+         * Everything that can fail has now completed.
+         *
+         * From this point onward the reservation operation is a 
+         * deterministic metadata transitino. 
+         */
+        reservation_record->Id = reservation_id;
+        reservation_record->Span = VirtualSpan{ VirtualAddress(allocation_base), page_count };
+        reservation_record->ReleaseExtent = release_extent;
 
         if (prefix_pages != 0 && suffix_pages != 0) {
             suffix->Previous = &extent;
@@ -429,9 +459,11 @@ namespace Zos::Kernel::Memory {
         m_Statistics.FreePages -= page_count;
         m_Statistics.ReservedPages += page_count;
 
+        InsertReservationRecord(*reservation_record);
+
         output.m_Owner = this;
         output.m_Span = VirtualSpan{ VirtualAddress(allocation_base), page_count };
-        output.m_ReleaseExtent = release_extent;
+        output.m_ReservationId = reservation_id;
         return VirtualAllocationError::Success;
     }
 
@@ -440,6 +472,8 @@ namespace Zos::Kernel::Memory {
         if (output.IsValid()) return VirtualAllocationError::OutputAlreadyOwnsRange;
         if (page_count == 0 || page_count > MaximumValue / PageSize || constraints.Alignment < PageSize || !IsPowerOfTwo(constraints.Alignment) || (constraints.Alignment % PageSize) != 0) 
             return VirtualAllocationError::InvalidRequest;
+        if (output.m_Owner != nullptr || !output.m_Span.IsEmpty() || output.m_ReservationId != 0) 
+            return VirtualAllocationError::OutputAlreadyOwnsRange;
 
         if (constraints.Preference == VirtualAllocationPreference::LowAddresses) 
             for (FreeExtent* extent = m_FreeHead; extent != nullptr; extent = extent->Next) {
@@ -468,58 +502,317 @@ namespace Zos::Kernel::Memory {
         return span.Base.Value() >= m_ManagedRange.Base.Value() && span_end <= managed_end;
     }
 
+    VirtualAddressAllocator::ReservationRecord* VirtualAddressAllocator::CreateReservationStorage() noexcept {
+        if (m_Metadata == nullptr) return nullptr;
+        void* storage = m_Metadata->Allocate(sizeof(ReservationRecord), alignof(ReservationRecord));
+        if (storage == nullptr) return nullptr;
+        return static_cast<ReservationRecord*>(storage);
+    }
+
+    VirtualAddressAllocator::ReservationRecord* VirtualAddressAllocator::AcquireReservationRecord() noexcept {
+        ReservationRecord* record = m_RecycledReservationRecords;
+        if (record != nullptr) 
+            m_RecycledReservationRecords = record->NextFree;
+        else {
+            record = CreateReservationStorage();
+            if (record == nullptr) return nullptr;
+        }
+        *record = {};
+        return record;
+    }
+
+    void VirtualAddressAllocator::RecycleReservationRecord(ReservationRecord& record) noexcept {
+        record.Id = 0;
+        record.Span = {};
+        record.ReleaseExtent = nullptr;
+        record.Previous = nullptr;
+        record.Next = nullptr;
+        record.NextFree = m_RecycledReservationRecords;
+        m_RecycledReservationRecords = &record;
+    }
+
+    void VirtualAddressAllocator::InsertReservationRecord(ReservationRecord& record) noexcept {
+        record.Previous = nullptr;
+        record.Next = m_ReservationHead;
+        if (m_ReservationHead != nullptr) m_ReservationHead->Previous = &record;
+        m_ReservationHead = &record;
+        m_Statistics.ActiveReservations++;
+    }
+
+    void VirtualAddressAllocator::RemoveReservationRecord(ReservationRecord& record) noexcept {
+        if (record.Previous != nullptr) record.Previous->Next = record.Next;
+        else m_ReservationHead = record.Next;
+        if (record.Next != nullptr) record.Next->Previous = record.Previous;
+        record.Previous = nullptr;
+        record.Next = nullptr;
+        if (m_Statistics.ActiveReservations != 0) m_Statistics.ActiveReservations--;
+    }
+
+    VirtualAddressAllocator::ReservationRecord* VirtualAddressAllocator::FindReservationRecord(Uint64 id) noexcept {
+        if (id == 0) return nullptr;
+        for (ReservationRecord* record = m_ReservationHead; record != nullptr; record = record->Next) 
+            if (record->Id == id) return record;
+        return nullptr;
+    }
+
+    const VirtualAddressAllocator::ReservationRecord* VirtualAddressAllocator::FindReservationRecord(Uint64 id) const noexcept {
+        if (id == 0) return nullptr;
+        for (const ReservationRecord* record = m_ReservationHead; record != nullptr; record = record->Next) 
+            if (record->Id == id) return record;
+        return nullptr;
+    }
+
+    bool VirtualAddressAllocator::AllocateReservationId(Uint64& id) noexcept {
+        id = 0;
+
+        /*
+         * Zero is permanently reserved as the invalid-token ID.
+         *
+         * Unsigned wraparound after UINT64_MAX deliberately moves the
+         * allocator into an exhausted state rather than reusing an old ID.
+         */
+        if (m_NextReservationId == 0) return false;
+        
+        id = m_NextReservationId;
+        m_NextReservationId++;
+
+        return true;
+    }
+
     VirtualAllocationError VirtualAddressAllocator::Release(VirtualReservation& reservation) noexcept {
         if (!IsInitialized()) return VirtualAllocationError::NotInitialized;
-        if (!reservation.IsValid() || reservation.m_ReleaseExtent == nullptr) return VirtualAllocationError::CorruptReservation;
+        if (!reservation.IsValid()) return VirtualAllocationError::CorruptReservation;
         if (reservation.m_Owner != this) return VirtualAllocationError::WrongOwner;
         if (!ReservationInsideManagedRange(reservation.m_Span) || m_Statistics.ReservedPages < reservation.m_Span.PageCount) 
             return VirtualAllocationError::CorruptReservation;
 
-        const Uint64 base = reservation.m_Span.Base.Value();
-        const Uint64 page_count = reservation.m_Span.PageCount;
-        const Uint64 size = reservation.m_Span.SizeBytes();
-        const Uint64 end = base + size;
-        auto* release_extent = static_cast<FreeExtent*>(reservation.m_ReleaseExtent);
+        ReservationRecord* record = FindReservationRecord(reservation.m_ReservationId);
+        if (record == nullptr) return VirtualAllocationError::CorruptReservation;
+
+        /*
+         * The external token and allocator-owned record must describe
+         * exactly the same reservation/
+         */
+        if (record->Id != reservation.m_ReservationId ||
+            record->Span.Base != reservation.m_Span.Base ||
+            record->Span.PageCount != reservation.m_Span.PageCount ||
+            record->ReleaseExtent == nullptr)
+            return VirtualAllocationError::CorruptReservation;
+
+        if (!ReservationInsideManagedRange(record->Span) || m_Statistics.ReservedPages < record->Span.PageCount) 
+            return VirtualAllocationError::CorruptReservation;
+
+        FreeExtent* release_extent = record->ReleaseExtent;
+
+        /*
+         * While the reservation is active, its release extent is private
+         * metadata and must not already participate in the free list.
+         */
+        if (release_extent->Base != record->Span.Base.Value() ||
+            release_extent->PageCount != record->Span.PageCount ||
+            release_extent->Previous != nullptr ||
+            release_extent->Next != nullptr)
+            return VirtualAllocationError::CorruptReservation;
+
+        const Uint64 base = record->Span.Base.Value();
+        const Uint64 page_count = record->Span.PageCount;
+        const Uint64 size = record->Span.SizeBytes();
+        Uint64 end = 0;
+        if (!TryRangeEnd(base, size, end)) 
+            return VirtualAllocationError::CorruptReservation;
 
         FreeExtent* position = m_FreeHead;
         while (position != nullptr && position->Base < base) position = position->Next;
 
         FreeExtent* previous = position != nullptr ? position->Previous : m_FreeTail;
+        Uint64 previous_end = 0;
         if (previous != nullptr) {
-            const Uint64 previous_end = previous->Base + previous->PageCount * PageSize;
+            if (previous->PageCount > MaximumValue / PageSize) 
+                return VirtualAllocationError::CorruptReservation;
+
+            if (!TryRangeEnd(previous->Base, previous->PageCount * PageSize, previous_end))
+                return VirtualAllocationError::CorruptReservation;
+
             if (base < previous_end) return VirtualAllocationError::CorruptReservation;
         }
 
         if (position != nullptr && end > position->Base) 
             return VirtualAllocationError::CorruptReservation;
 
-        const bool merge_previous = previous != nullptr && previous->Base + previous->PageCount * PageSize == base;
+        const bool merge_previous = previous != nullptr && previous_end == base;
         const bool merge_next = position != nullptr && end == position->Base;
 
+        /*
+         * Preflight all page-count arithmetic before changing links.
+         */
+        Uint64 merged_page_count = page_count;
+        if (merge_previous) {
+            if (previous->PageCount > MaximumValue - merged_page_count)
+                return VirtualAllocationError::CorruptReservation;
+            merged_page_count += previous->PageCount;
+        }
+        if (merge_next) {
+            if (position->PageCount > MaximumValue - merged_page_count) 
+                return VirtualAllocationError::CorruptReservation;
+            merged_page_count += position->PageCount;
+        }
+
+        if (m_Statistics.FreePages > m_Statistics.ManagedPages - page_count)
+            return VirtualAllocationError::CorruptReservation;
+
+        /*
+         * No failure is possible beyond this point.
+         */
         if (merge_previous && merge_next) {
-            previous->PageCount += page_count + position->PageCount;
+            previous->PageCount = merged_page_count;
             RemoveExtent(*position);
             RecycleExtent(*position);
             RecycleExtent(*release_extent);
         } else if (merge_previous) {
-            previous->PageCount += page_count;
+            previous->PageCount = merged_page_count;
             RecycleExtent(*release_extent);
         } else if (merge_next) {
             position->Base = base;
-            position->PageCount += page_count;
+            position->PageCount = merged_page_count;
             RecycleExtent(*release_extent);
         } else {
             release_extent->Base = base;
             release_extent->PageCount = page_count;
-            release_extent->Next = nullptr;
+
             release_extent->Previous = nullptr;
+            release_extent->Next = nullptr;
+
             InsertBefore(position, *release_extent);
         }
 
         m_Statistics.FreePages += page_count;
         m_Statistics.ReservedPages -= page_count;
+
+        RemoveReservationRecord(*record);
+        RecycleReservationRecord(*record);
+
         reservation.Invalidate();
+
         return VirtualAllocationError::Success;
+    }
+
+    bool VirtualAddressAllocator::Validate() const noexcept {
+        if (!m_Initialized || m_Metadata == nullptr || !m_Metadata->IsInitialized() ||
+            m_ManagedRange.IsEmpty() || !m_ManagedRange.Base.IsPageAligned()) return false;
+
+        if (m_Statistics.ManagedPages != m_ManagedRange.PageCount || 
+            m_Statistics.FreePages > m_Statistics.ManagedPages || 
+            m_Statistics.ReservedPages > m_Statistics.ManagedPages || 
+            m_Statistics.FreePages + m_Statistics.ReservedPages != m_Statistics.ManagedPages)
+            return false;
+
+        Uint64 observed_free_pages = 0;
+        Uint64 observed_free_extents = 0;
+        const FreeExtent* previous_extent = nullptr;
+
+        for (const FreeExtent* extent = m_FreeHead; extent != nullptr; extent = extent->Next) {
+            if (extent->PageCount == 0 || (extent->Base & (PageSize - 1)) != 0 || extent->Previous != previous_extent) 
+                return false;
+
+            const VirtualSpan span{
+                VirtualAddress(extent->Base),
+                extent->PageCount
+            };
+
+            if (!ReservationInsideManagedRange(span))
+                return false;
+
+            Uint64 extent_end = 0;
+
+            if (!TryRangeEnd(extent->Base, extent->PageCount * PageSize, extent_end)) 
+                return false;
+
+            if (previous_extent != nullptr) {
+                Uint64 previous_end = 0;
+
+                if (!TryRangeEnd(previous_extent->Base, previous_extent->PageCount * PageSize, previous_end)) 
+                    return false;
+
+                /*
+                * Adjacent free extents should already have been
+                * coalesced.
+                */
+                if (previous_end >= extent->Base)
+                    return false;
+            }
+
+            if (observed_free_pages > MaximumValue - extent->PageCount) 
+                return false;
+
+            observed_free_pages += extent->PageCount;
+            observed_free_extents++;
+            previous_extent = extent;
+        }
+
+        if (previous_extent != m_FreeTail || observed_free_pages != m_Statistics.FreePages || observed_free_extents != m_Statistics.FreeExtentCount) 
+            return false;
+
+        Uint64 observed_reserved_pages = 0;
+        Uint64 observed_reservations = 0;
+        const ReservationRecord* previous_record = nullptr;
+
+        for (const ReservationRecord* record = m_ReservationHead; record != nullptr; record = record->Next) {
+            if (record->Id == 0 || record->Previous != previous_record || record->Span.IsEmpty() || record->ReleaseExtent == nullptr)
+                return false;
+
+            if (!ReservationInsideManagedRange(record->Span))
+                return false;
+
+            if (record->ReleaseExtent->Base != record->Span.Base.Value() || 
+                record->ReleaseExtent->PageCount != record->Span.PageCount || 
+                record->ReleaseExtent->Previous != nullptr || 
+                record->ReleaseExtent->Next != nullptr)
+                return false;
+
+            Uint64 record_end = 0;
+            if (!TryRangeEnd(record->Span.Base.Value(), record->Span.SizeBytes(), record_end))
+                return false;
+
+            /*
+            * No active reservation may overlap a free extent.
+            */
+            for (const FreeExtent* extent = m_FreeHead; extent != nullptr; extent = extent->Next) {
+                Uint64 extent_end = 0;
+                if (!TryRangeEnd(extent->Base, extent->PageCount * PageSize, extent_end))
+                    return false;
+
+                if (record->Span.Base.Value() < extent_end && extent->Base < record_end)
+                    return false;
+            }
+
+            /*
+            * IDs must be unique and reservations may not overlap.
+            *
+            * O(n²) is intentional here; Validate() is a diagnostic
+            * integrity path, not an allocation fast path.
+            */
+            for (const ReservationRecord* other = record->Next; other != nullptr; other = other->Next) {
+                if (other->Id == record->Id) return false;
+
+                Uint64 other_end = 0;
+                if (!TryRangeEnd(other->Span.Base.Value(), other->Span.SizeBytes(), other_end)) 
+                    return false;
+
+                if (record->Span.Base.Value() < other_end && other->Span.Base.Value() < record_end)
+                    return false;
+            }
+
+            if (observed_reserved_pages > MaximumValue - record->Span.PageCount)
+                return false;
+
+            observed_reserved_pages += record->Span.PageCount;
+            observed_reservations++;
+            previous_record = record;
+        }
+
+        if (observed_reserved_pages != m_Statistics.ReservedPages || observed_reservations != m_Statistics.ActiveReservations)
+            return false;
+        return true;
     }
 
     const char* VirtualAddressAllocator::Describe(VirtualAllocationError error) noexcept {
@@ -531,6 +824,7 @@ namespace Zos::Kernel::Memory {
         case VirtualAllocationError::OutputAlreadyOwnsRange: return "output already owns a virtual range";
         case VirtualAllocationError::OutOfAddressSpace: return "virtual address space is exhausted";
         case VirtualAllocationError::OutOfMetadata: return "virtual address allocator metadata is exhausted";
+        case VirtualAllocationError::ReservationIdExhausted: return "virtual reservation identifier space is exhausted";
         case VirtualAllocationError::WrongOwner: return "virtual reservation belongs to another allocator";
         case VirtualAllocationError::CorruptReservation: return "virtual reservation state is invalid";
         default: return "unknown virtual allocation error";

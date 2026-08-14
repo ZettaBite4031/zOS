@@ -128,6 +128,7 @@ namespace Zos::Kernel::Memory {
         OutputAlreadyOwnsRange,
         OutOfAddressSpace,
         OutOfMetadata,
+        ReservationIdExhausted,
         WrongOwner,
         CorruptReservation,
     };
@@ -137,6 +138,7 @@ namespace Zos::Kernel::Memory {
         Uint64 FreePages{};
         Uint64 ReservedPages{};
         Uint64 FreeExtentCount{};
+        Uint64 ActiveReservations{};
     };
 
     class VirtualAddressAllocator;
@@ -150,7 +152,7 @@ namespace Zos::Kernel::Memory {
         VirtualReservation(VirtualReservation&& other) noexcept;
         VirtualReservation& operator=(VirtualReservation&&) = delete;
 
-        [[nodiscard]] bool IsValid() const noexcept { return m_Owner != nullptr && !m_Span.IsEmpty(); }
+        [[nodiscard]] bool IsValid() const noexcept { return m_Owner != nullptr && !m_Span.IsEmpty() && m_ReservationId != 0; }
         [[nodiscard]] VirtualAddress Base() const noexcept { return m_Span.Base; }
         [[nodiscard]] Uint64 PageCount() const noexcept { return m_Span.PageCount; }
         [[nodiscard]] Uint64 SizeBytes() const noexcept { return m_Span.SizeBytes(); }
@@ -162,12 +164,12 @@ namespace Zos::Kernel::Memory {
         void Invalidate() noexcept {
             m_Owner = nullptr;
             m_Span = {};
-            m_ReleaseExtent = nullptr;
+            m_ReservationId = 0;
         }
 
         VirtualAddressAllocator* m_Owner{};
         VirtualSpan m_Span{};
-        void* m_ReleaseExtent{};
+        Uint64 m_ReservationId{};
     };
 
     class VirtualAddressAllocator final {
@@ -182,7 +184,9 @@ namespace Zos::Kernel::Memory {
 
         [[nodiscard]] VirtualAllocationError Release(VirtualReservation& reservation) noexcept;
 
-        [[nodiscard]] bool IsInitialized() const noexcept { return m_Metadata != nullptr; }
+        [[nodiscard]] bool Validate() const noexcept;
+
+        [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] VirtualSpan ManagedRange() const noexcept { return m_ManagedRange; }
         [[nodiscard]] const VirtualAddressAllocatorStatistics& Statistics() const noexcept { return m_Statistics; }
         
@@ -196,7 +200,30 @@ namespace Zos::Kernel::Memory {
             FreeExtent* Next{};
         };
 
-    [[nodiscard]] static bool IsPowerOfTwo(Uint64 value) noexcept;
+        struct ReservationRecord final {
+            Uint64 Id{};
+            VirtualSpan Span{};
+
+            /*
+             * Preallocated at Reserved() time.
+             *
+             * Release() may need to insert a new free extent into
+             * the address-space free list. Owning this node here
+             * guarantees that releasing a valid reservation never
+             * requires another metadata allocation
+             */
+            FreeExtent* ReleaseExtent{};
+
+            ReservationRecord* Previous{};
+            ReservationRecord* Next{};
+
+            /*
+             * Recycled reservation-record storage.
+             */
+            ReservationRecord* NextFree{};
+        };
+
+        [[nodiscard]] static bool IsPowerOfTwo(Uint64 value) noexcept;
         [[nodiscard]] static bool TryRangeEnd(Uint64 base, Uint64 size, Uint64& end) noexcept;
         [[nodiscard]] static bool TryAlignUp(Uint64 value, Uint64 alignment, Uint64& result) noexcept;
         [[nodiscard]] static Uint64 AlignDown(Uint64 value, Uint64 alignment) noexcept;
@@ -212,12 +239,31 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] bool FindHighCandidate(const FreeExtent& extent, Uint64 pageCount, Uint64 alignment, Uint64& candidate) const noexcept;
         [[nodiscard]] bool ReservationInsideManagedRange(VirtualSpan span) const noexcept;
 
+        [[nodiscard]] ReservationRecord* CreateReservationStorage() noexcept;
+        [[nodiscard]] ReservationRecord* AcquireReservationRecord() noexcept;
+        void RecycleReservationRecord(ReservationRecord& record) noexcept;
+        void InsertReservationRecord(ReservationRecord& record) noexcept;
+        void RemoveReservationRecord(ReservationRecord& record) noexcept;
+        [[nodiscard]] ReservationRecord* FindReservationRecord(Uint64 id) noexcept;
+        [[nodiscard]] const ReservationRecord* FindReservationRecord(Uint64 id) const noexcept;
+        [[nodiscard]] bool AllocateReservationId(Uint64& id) noexcept;
+
         BootstrapMetadataArena* m_Metadata{};
+
         FreeExtent* m_FreeHead{};
         FreeExtent* m_FreeTail{};
         FreeExtent* m_RecycledExtents{};
+
+        ReservationRecord* m_ReservationHead{};
+        ReservationRecord* m_RecycledReservationRecords{};
+
         VirtualSpan m_ManagedRange{};
+
         VirtualAddressAllocatorStatistics m_Statistics{};
+
+        Uint64 m_NextReservationId{ 1 };
+
+        bool m_Initialized{};
     };
 
     enum class KernelStackInitializationError : Uint32 {
