@@ -936,7 +936,7 @@ namespace Zos::Kernel::Initialization {
             if (nothrow_aligned == nullptr || !heap.Contains(nothrow_aligned) || (reinterpret_cast<Uint64>(nothrow_aligned) & 512) != 0) 
                 Diagnostics::Fatal("C++ Runtime", "aligned nothrow allocation failed");
 
-            ::operator delete(nothrow_aligned, static_cast<std::align_val_t>(512), std::nothrow);
+            ::operator delete(nothrow_aligned, static_cast<std::align_val_t>(511), std::nothrow);
 
             /*
              * A request that cannot possibly fit in the aerna must fail

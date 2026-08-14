@@ -2,6 +2,8 @@
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 
+#include <Kernel/Runtime/New.hpp>
+
 extern "C" {
     void* memset(void* dst, int v, unsigned long long n) noexcept;
 
@@ -19,10 +21,6 @@ extern "C" {
 
     extern unsigned char __BssStart[];
     extern unsigned char __BssEnd[];
-}
-
-void* operator new(__SIZE_TYPE__, void* addr) noexcept { 
-    return addr;
 }
 
 namespace Zos::Kernel::Memory {

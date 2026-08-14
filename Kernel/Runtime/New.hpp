@@ -28,10 +28,16 @@ namespace std {
 [[nodiscard]] void* operator new[](__SIZE_TYPE__ size);
 
 /*
- * Over-aligned allocation.
+ * Scalar/array nothrow allocation.
  */
 [[nodiscard]] void* operator new(__SIZE_TYPE__ size, const std::nothrow_t&) noexcept;
 [[nodiscard]] void* operator new[](__SIZE_TYPE__ size, const std::nothrow_t&) noexcept;
+
+/*
+ * Overaligned allocation.
+ */
+[[nodiscard]] void* operator new(__SIZE_TYPE__, std::align_val_t);
+[[nodiscard]] void* operator new[](__SIZE_TYPE__, std::align_val_t);
 
 /*
  * Over-aligned nothrow allocation.
