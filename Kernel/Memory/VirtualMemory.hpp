@@ -229,6 +229,7 @@ namespace Zos::Kernel::Memory {
         VirtualAllocationFailed,
         MappingFailed,
         ValidationFailed,
+        RollbackFailed,
     };
 
     class KernelStack final {
@@ -268,6 +269,8 @@ namespace Zos::Kernel::Memory {
         static const char* Describe(KernelStackInitializationError error) noexcept;
         
     private:
+        [[nodiscard]] bool RollbackInitialization(PhysicalMemoryManager& physical_memory, VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map) noexcept;
+
         PhysicalAllocation m_PhysicalBacking{};
         VirtualReservation m_VirtualReservation{};
         VirtualSpan m_UsableSpan{};

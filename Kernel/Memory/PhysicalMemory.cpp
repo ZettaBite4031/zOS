@@ -699,9 +699,10 @@ namespace Zos::Kernel::Memory {
          * Complete deterministic transition:
          *  - Reserved -> Free
          */
-        SetSpanState(m_BootstrapStackSpan, PageState::Free);
-        SetSpanState(m_EnvironmentStorageSpan, PageState::Free);
-        SetSpanState(m_MemoryMapStorageSpan, PageState::Free);
+        if (!SetSpanState(m_BootstrapStackSpan, PageState::Free) || 
+            !SetSpanState(m_EnvironmentStorageSpan, PageState::Free) ||
+            !SetSpanState(m_MemoryMapStorageSpan, PageState::Free))
+            return BootstrapResourceReleaseError::InvalidState;
 
         m_Statistics.FreePages += released_pages;
 
@@ -922,7 +923,7 @@ namespace Zos::Kernel::Memory {
         return true;
     }
 
-    void PhysicalMemoryManager::SetSpanState(PhysicalSpan span, PageState state) noexcept {
+    bool PhysicalMemoryManager::SetSpanState(PhysicalSpan span, PageState state) noexcept {
         for (Uint64 page = 0; page < span.PageCount; page++) {
             const PhysicalAddress address = span.Base + page * PageSize;
             const PhysicalSpan single_page{ address, 1 };
@@ -932,10 +933,12 @@ namespace Zos::Kernel::Memory {
              * This is only called after a complete preflight using
              * SpanHasState(), while the kernel is still single-CPU.
              */
-            if (region == nullptr) return;
+            if (region == nullptr) return false;
             const Uint64 page_offset = (address.Value() - region->Base) / PageSize;
             SetState(*region, page_offset, state);
         }
+
+        return true;
     }
 
     PhysicalAllocationError PhysicalMemoryManager::Release(PhysicalAllocation& allocation) noexcept {

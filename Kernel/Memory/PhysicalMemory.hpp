@@ -48,7 +48,7 @@ namespace Zos::Kernel::Memory {
 
     struct PhysicalMemoryReclamationResult final {
         Uint64 ReleasedPages{};
-        [[nodiscard]] Uint64 ReclaimedBytes() const noexcept { return ReleasedPages * PageSize; }
+        [[nodiscard]] Uint64 ReleasedBytes() const noexcept { return ReleasedPages * PageSize; }
     };
 
     enum class BootstrapResourceReleaseError : Uint32 {
@@ -60,7 +60,7 @@ namespace Zos::Kernel::Memory {
     };
 
     struct BootstrapResourceReleaseResult final {
-        Uint64 ReleasedPages;
+        Uint64 ReleasedPages{};
         [[nodiscard]] constexpr Uint64 ReleasedBytes() const noexcept { return ReleasedPages * PageSize; }
     };
 
@@ -230,7 +230,7 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] const ManagedRegion* FindContainingRegion(PhysicalSpan span) const noexcept;
 
         [[nodiscard]] bool SpanHasState(PhysicalSpan span, PageState expected) const noexcept;
-        void SetSpanState(PhysicalSpan span, PageState state) noexcept;
+        [[nodiscard]] bool SetSpanState(PhysicalSpan span, PageState state) noexcept;
 
         ManagedRegion* m_Regions{ };
         Uint8* m_PageStates{};

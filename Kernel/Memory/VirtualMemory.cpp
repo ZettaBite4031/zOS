@@ -890,16 +890,22 @@ namespace Zos::Kernel::Memory {
         const MappingError mapping_error = page_map.MapRange(m_UsableSpan.Base, m_PhysicalBacking.Base(), usable_page_count, writable);
         if (mapping_error != MappingError::Success) {
             m_UsableSpan = {};
-            (void)virtual_addresses.Release(m_VirtualReservation);
-            (void)physical_memory.Release(m_PhysicalBacking);
+            const PhysicalAllocationError physical_release = physical_memory.Release(m_PhysicalBacking);
+            const VirtualAllocationError virtual_release = virtual_addresses.Release(m_VirtualReservation);
+            if (physical_release != PhysicalAllocationError::Success ||
+                virtual_release != VirtualAllocationError::Success)
+                    return KernelStackInitializationError::RollbackFailed;
             return KernelStackInitializationError::MappingFailed;
         }
 
         /*
          * Neither guard page may have acquired a translation.
          */
-        if (page_map.IsMapped(m_VirtualReservation.Base()) || page_map.IsMapped(m_UsableSpan.Base + m_UsableSpan.SizeBytes())) 
+        if (page_map.IsMapped(m_VirtualReservation.Base()) || page_map.IsMapped(m_UsableSpan.Base + m_UsableSpan.SizeBytes())) {
+            if (!RollbackInitialization(physical_memory, virtual_addresses, page_map))
+                return KernelStackInitializationError::RollbackFailed;
             return KernelStackInitializationError::ValidationFailed;
+        }
 
         /*
          * Validate every usable page rather than only the endpoints.
@@ -917,8 +923,11 @@ namespace Zos::Kernel::Memory {
                 !HasAccess(translation.Options.Access, PageAccess::Write) || 
                 !HasAccess(translation.Options.Access, PageAccess::Global) || 
                 HasAccess(translation.Options.Access, PageAccess::Execute) || 
-                translation.Options.Cache != CachePolicy::WriteBack) 
-                return KernelStackInitializationError::ValidationFailed;
+                translation.Options.Cache != CachePolicy::WriteBack) {
+                    if (!RollbackInitialization(physical_memory, virtual_addresses, page_map))
+                        return KernelStackInitializationError::RollbackFailed;
+                    return KernelStackInitializationError::ValidationFailed;
+                }
         }
 
         /*
@@ -932,6 +941,44 @@ namespace Zos::Kernel::Memory {
         return KernelStackInitializationError::Success;
     }
 
+    bool KernelStack::RollbackInitialization(PhysicalMemoryManager& physical_memory, VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map) noexcept {
+        using Architecture::AMD64::MappingError;
+
+        /*
+         * Only the usable pages belong to this stack mapping.
+         * 
+         * The guard pages are intentionally not touched here. If either guard
+         * unexpectedly maps, that mapping was never created or owned by this
+         * KernelStack instance.
+         */
+        if (!m_UsableSpan.IsEmpty()) {
+            for (Uint64 page = 0; page < m_UsableSpan.PageCount; page++) {
+                const VirtualAddress address = m_UsableSpan.Base + page * PageSize;
+
+                /*
+                 * MapRang() succeeded before validation began, so every usable
+                 * page is expected to still be mapped.
+                 * 
+                 * If this fails, do not release either ownership token. A live
+                 * translation may still reference the physical backing.
+                 */
+                if (page_map.UnmapPage(address) != MappingError::Success) return false;
+            }
+        }
+
+        /*
+         * At this point no stack mapping references the physical allocation.
+         * The two ownership tokens can now be returned independently.
+         */
+        if (physical_memory.Release(m_PhysicalBacking) != PhysicalAllocationError::Success) return false;
+        if (virtual_addresses.Release(m_VirtualReservation) != VirtualAllocationError::Success) return false;
+
+        m_UsableSpan = {};
+        m_Initialized = false;
+
+        return true;
+    }
+
     const char* KernelStack::Describe(KernelStackInitializationError error) noexcept {
         switch (error) {
         case KernelStackInitializationError::Success: return "success";
@@ -942,6 +989,7 @@ namespace Zos::Kernel::Memory {
         case KernelStackInitializationError::VirtualAllocationFailed: return "failed to reserve kernel stack virtual address space";
         case KernelStackInitializationError::MappingFailed: return "failed to map kernel stack";
         case KernelStackInitializationError::ValidationFailed: return "kernel stack mapping validation failed";
+        case KernelStackInitializationError::RollbackFailed: return "failed to roll back kernel stack initialization";
         }
         return "unknown kernel stack initialization error";
     }

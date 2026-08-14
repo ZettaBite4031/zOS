@@ -443,7 +443,7 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Memory] Reclaimed boot/loader memory: ");
             Diagnostics::WriteDecimal(result.ReleasedPages);
             Diagnostics::Write(" pages (");
-            Diagnostics::WriteDecimal(result.ReclaimedBytes());
+            Diagnostics::WriteDecimal(result.ReleasedBytes());
             Diagnostics::Write(" bytes).\n");
 
             Diagnostics::Write("[zOS/Memory] Free memory after reclamation: ");
