@@ -85,6 +85,17 @@ namespace Zos::Kernel::Initialization {
             return range.Base != 0 && range.Size != 0 && (range.Base & (PageSize - 1)) == 0 && (range.Size & (PageSize - 1)) == 0;
         }
 
+        [[nodiscard]] bool SamePhysicalMemoryStatistics(const PhysicalMemoryStatistics& left, const PhysicalMemoryStatistics& right) noexcept {
+            return left.ManagedPages == right.ManagedPages
+                && left.ConventionalPages == right.ConventionalPages
+                && left.FreePages == right.FreePages
+                && left.AllocatedPages == right.AllocatedPages
+                && left.DeferredBootPages == right.DeferredBootPages
+                && left.DeferredAcpiPages == right.DeferredAcpiPages
+                && left.MetadataBytes == right.MetadataBytes
+                && left.ManagedRegionCount == right.ManagedRegionCount;
+        }
+
         void ValidateBootEnvironment(const Boot::BootEnvironment& environment) noexcept {
             if (environment.Signature != Boot::EnvironmentSignature) 
                 Diagnostics::Fatal("Startup", "boot environment signature mismatch");
@@ -412,7 +423,7 @@ namespace Zos::Kernel::Initialization {
              * Every page previously marked DeferredBoot must have become
              * Free, and no other accounting category may change.
              */
-            if (result.ReclaimedPages != before.DeferredBootPages ||
+            if (result.ReleasedPages != before.DeferredBootPages ||
                 after.DeferredBootPages != 0 || after.ManagedPages != before.ManagedPages || 
                 after.ConventionalPages != before.ConventionalPages ||
                 after.AllocatedPages != before.AllocatedPages ||
@@ -420,17 +431,17 @@ namespace Zos::Kernel::Initialization {
                 after.ReservedPages() != before.ReservedPages()) 
                 Diagnostics::Fatal("Memory", "boot-memory reclamation accounting invariant failed");
 
-            if (before.FreePages > ~Uint64{ 0 } - result.ReclaimedPages) 
+            if (before.FreePages > ~Uint64{ 0 } - result.ReleasedPages) 
                 Diagnostics::Fatal("Memory", "boot-memory reclamation free-page accounting overflowed");
 
-            if (after.FreePages != before.FreePages + result.ReclaimedPages) 
+            if (after.FreePages != before.FreePages + result.ReleasedPages) 
                 Diagnostics::Fatal("Memory", "reclaimed boot pages were not added to free memory");
 
             if (!physical_memory.IsBootMemoryReclaimed())
                 Diagnostics::Fatal("Memory", "boot-memory reclamation did not enter the completed state");
 
             Diagnostics::Write("[zOS/Memory] Reclaimed boot/loader memory: ");
-            Diagnostics::WriteDecimal(result.ReclaimedPages);
+            Diagnostics::WriteDecimal(result.ReleasedPages);
             Diagnostics::Write(" pages (");
             Diagnostics::WriteDecimal(result.ReclaimedBytes());
             Diagnostics::Write(" bytes).\n");
@@ -456,7 +467,7 @@ namespace Zos::Kernel::Initialization {
             PhysicalMemoryReclamationResult duplicate_result{};
 
             const auto duplicate_error = manager.ReclaimBootMemory(duplicate_result);
-            if (duplicate_error != PhysicalMemoryReclamationError::AlreadyReclaimed || duplicate_result.ReclaimedPages != 0) 
+            if (duplicate_error != PhysicalMemoryReclamationError::AlreadyReclaimed || duplicate_result.ReleasedPages != 0) 
                 Diagnostics::Fatal("Memory", "duplicate boot-memory reclamation protection failed");
             
             const PhysicalMemoryStatistics after_duplicate = manager.Statistics();
@@ -520,32 +531,130 @@ namespace Zos::Kernel::Initialization {
 
         void UnmapIdentitySpan(Architecture::AMD64::PageMap& page_map, PhysicalSpan span) noexcept {
             if (span.IsEmpty()) 
-                Diagnostics::Fatal("VMM", "attempted to retire an empty bootstrap span");
+                Diagnostics::Fatal("VMM", "attempted to retire an empty identity span");
 
             for (Uint64 page = 0; page < span.PageCount; page++) {
                 const PhysicalAddress physical = span.Base + page * PageSize;
                 const VirtualAddress identity{ physical.Value() };
                 const auto translation = page_map.Translate(identity);
                 if (!translation.Mapped || translation.Physical != physical) 
-                    Diagnostics::Fatal("VMM", "bootstrap identity mapping is inconsistent");
+                    Diagnostics::Fatal("VMM", "identity mapping is inconsistent");
 
                 const auto error = page_map.UnmapPage(identity);
                 if (error != Architecture::AMD64::MappingError::Success) 
                     Diagnostics::Fatal("VMM", Architecture::AMD64::PageMap::Describe(error));
 
                 if (page_map.IsMapped(identity))
-                    Diagnostics::Fatal("VMM", "retired bootstrap identity page still maps");
+                    Diagnostics::Fatal("VMM", "retired identity page still maps");
 
                 /*
-                 * The physical page remains available through the direct
-                 * map. After PMM release this is the only intentional kernel 
-                 * alias for ordinary reclaimed RAM.
+                 * Retirement of the identity alias must never remove the
+                 * authoritative direct-map alias.
                  */
                 const VirtualAddress direct = Layout::DirectMapAddress(physical);
+                if (direct.IsNull()) 
+                    Diagnostics::Fatal("VMM", "physical page is outside the direct map");
+
                 const auto direct_translation = page_map.Translate(direct);
                 if (!direct_translation.Mapped || direct_translation.Physical != physical) 
-                    Diagnostics::Fatal("VMM", "bootstrap resource lost direct-map coverage");
+                    Diagnostics::Fatal("VMM", "physical page lost direct-map coverage");
             }
+        }
+
+        void PromotePhysicalMemoryMetadata(KernelRuntime& runtime) noexcept {
+            PhysicalMemoryManager& physical_memory = runtime.PhysicalMemory;
+            PageMap& page_map = runtime.KernelPageMap;
+
+            if (!physical_memory.IsInitialized())
+                Diagnostics::Fatal("Memory", "cannot promote PMM metadata before initialization");
+            
+            if (!page_map.IsActive()) 
+                Diagnostics::Fatal("Memory", "cannot promote PMM metadata before address-space activation");
+
+            if (physical_memory.IsMetadataAccessPromoted())
+                Diagnostics::Fatal("Memory", "PMM metadata was promoted more than once");
+
+            const PhysicalSpan metadata = physical_memory.MetadataSpan();
+            if (metadata.IsEmpty()) Diagnostics::Fatal("Memory", "PMM metadata span is empty");
+
+            const VirtualAddress direct_base = Layout::DirectMapAddress(metadata.Base);
+            if (direct_base.IsNull())
+                Diagnostics::Fatal("Memory", "PMM metadata lies outside the direct map");
+
+            const MappingOptions expected{
+                .Access = PageAccess::Read | PageAccess::Write | PageAccess::Global,
+                .Cache = CachePolicy::WriteBack,
+            };
+
+            /*
+             * Validate every direct-map page before giving that mapping to
+             * the PMM as its permanent metadata view.
+             */
+            for (Uint64 page = 0; page < metadata.PageCount; page++) {
+                const PhysicalAddress physical = metadata.Base + page * PageSize;
+                const VirtualAddress direct = Layout::DirectMapAddress(physical);
+                if (direct.IsNull()) Diagnostics::Fatal("Memory", "PMM metadata direct-map address is unavailable");
+
+                const TranslationResult translation = page_map.Translate(direct);
+                if (!translation.Mapped ||
+                    translation.Physical != physical ||
+                    translation.Options.Access != expected.Access || 
+                    translation.Options.Cache != expected.Cache) 
+                    Diagnostics::Fatal("Memory", "PMM metadata direct-map mapping is invalid");
+            }
+
+            const PhysicalMemoryStatistics before = physical_memory.Statistics();
+            const auto error = physical_memory.PromoteMetadataAccess(direct_base);
+            if (error != PhysicalMemoryMetadataAccessError::Success) 
+                Diagnostics::Fatal("Memory", PhysicalMemoryManager::Describe(error));
+
+            if (!physical_memory.IsMetadataAccessPromoted() || physical_memory.MetadataAccessBase() != direct_base) 
+                Diagnostics::Fatal("Memory", "PMM metadata promotion state is inconsistent");
+
+            /*
+             * Merely rebasing the metadata pointers must not change physical
+             * ownership or allocator accounting.
+             */
+            const PhysicalMemoryStatistics after_promotion = physical_memory.Statistics();
+            if (!SamePhysicalMemoryStatistics(before, after_promotion))
+                Diagnostics::Fatal("Memory", "PMM metadatapromotion modified allocator accounting");
+            
+            Diagnostics::Write("[zOS/Memory] PMM metadata promoted to direct map at ");
+            Diagnostics::WriteHex(direct_base.Value());
+            Diagnostics::Write("\n");
+
+            /*
+             * From this point onward, m_Regions and m_PageStates both point
+             * into the higher-half direct map, so the lower aliases is no longer
+             * a PMM dependency.
+             * 
+             * UnmapPage() may reclaim now-empty page-table pages. Those
+             * release themselves go through the newly-promoted PMM and
+             * therefore provide an immediate real-world test of the new
+             * metadata view. 
+             */
+            UnmapIdentitySpan(page_map, metadata);
+
+            /*
+             * Perform an explicit allocator round trip after the identity
+             * alias is gone. If any persistent PMM pointer still referenced
+             * the low mapping, this operating will fail.
+             */
+            const PhysicalMemoryStatistics baseline = physical_memory.Statistics();
+            PhysicalAllocation probe{};
+            const PhysicalAllocationError allocation_error = physical_memory.AllocatePage(probe);
+            if (allocation_error != PhysicalAllocationError::Success) 
+                Diagnostics::Fatal("Memory", "post-promotion PMM allocation failed");
+
+            if (physical_memory.Release(probe) != PhysicalAllocationError::Success) 
+                Diagnostics::Fatal("Memory", "post-promotion PMM release failed");
+
+            const PhysicalMemoryStatistics final = physical_memory.Statistics();
+            if (!SamePhysicalMemoryStatistics(baseline, final)) 
+                Diagnostics::Fatal("Memory", "post-promotion PMM accounting did not return to baseline");
+
+            Diagnostics::Write("[zOS/Memory] PMM identity alias retired.\n");
+            Diagnostics::Write("[zOS/Memory] PMM direct-map self-test passed.\n");
         }
 
         void ReleaseBootstrapResources(KernelRuntime& runtime) noexcept {
@@ -728,9 +837,18 @@ namespace Zos::Kernel::Initialization {
 
         ActivateKernelAddressSpace(runtime, environment);
         AdvancePhase(runtime, KernelPhase::VirtualMemoryReady, KernelPhase::AddressSpaceActive);
+        
+        /*
+         * The first zOS-owned page map intentionally carried the PMM's low
+         * metadata alias through CR3 activation. The permanent direct map is
+         * now authoritative, so detach the PMM from that bootstrap mapping
+         * before bringing up additional runtime infrastructure.
+         */
+        PromotePhysicalMemoryMetadata(runtime);
+        AdvancePhase(runtime, KernelPhase::AddressSpaceActive, KernelPhase::PhysicalMemoryMetadataPromoted);
 
         InitializeInterrupts(runtime);
-        AdvancePhase(runtime, KernelPhase::AddressSpaceActive, KernelPhase::InterruptsReady);
+        AdvancePhase(runtime, KernelPhase::PhysicalMemoryMetadataPromoted, KernelPhase::InterruptsReady);
 
         /*
          * ExitBootServices has already occurred in the loader and zOS now

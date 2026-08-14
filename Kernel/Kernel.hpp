@@ -42,6 +42,9 @@ namespace Zos::Kernel {
         PhysicalMemoryReady,
         VirtualMemoryReady,
         AddressSpaceActive,
+
+        PhysicalMemoryMetadataPromoted,
+
         InterruptsReady,
         BootMemoryReclaimed,
         BootContextInternalized,
@@ -85,8 +88,8 @@ namespace Zos::Kernel {
 
     /*
      * Intended for startup ownership/orchestration only.
-     * 
-     * Do not use this as a globale dependency accessor throughout
+     *
+     * Do not use this as a global dependency accessor throughout
      * normal kernel code.
      */
     [[nodiscard]] KernelRuntime& GetKernelRuntime() noexcept;

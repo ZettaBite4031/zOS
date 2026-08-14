@@ -804,8 +804,12 @@ namespace Zos::Kernel::Memory {
          || HasAccess(stack_translation.Options.Access, PageAccess::Execute)) return false;
 
         /*
-         * PMM metadata must currently remain identity
-         * accessible and also be direct-mapped.
+         * PMM metadata must remain identity-accessible through the initial
+         * CR3 transition and must already have its permanent direct-map
+         * alias.
+         * 
+         * Startup promotes the PMM to the direct-map view and removes this
+         * temporary identity alias immediately after activation succeeds.
          */
         const PhysicalAddress pmm_metadata = m_PhysicalMemory->MetadataSpan().Base;
         if (!m_PageMap->Translate(VirtualAddress(pmm_metadata.Value())).Mapped) return false;

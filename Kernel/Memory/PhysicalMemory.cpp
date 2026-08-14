@@ -171,6 +171,37 @@ namespace Zos::Kernel::Memory {
         return overlap_found;
     }
 
+    bool PhysicalMemoryManager::MetadataViewsMatch(const ManagedRegion* candidate_regions, const Uint8* candidate_page_states) const noexcept {
+        if (candidate_regions == nullptr ||
+            candidate_page_states == nullptr ||
+            m_Regions == nullptr || 
+            m_PageStates == nullptr) 
+            return false;
+
+        /*
+         * Compare the logical ManagedRegion contents rather than raw
+         * structure bytes. Padding/reserved storage is not part of the
+         * allocator's semantic state.
+         */
+        for (Uint64 i = 0; i < m_RegionCount; i++) {
+            const ManagedRegion& current = m_Regions[i];
+            const ManagedRegion& candidate = candidate_regions[i];
+            if (candidate.Base != current.Base ||
+                candidate.PageCount != current.PageCount ||
+                candidate.StateOffset != current.StateOffset ||
+                candidate.InitialState != current.InitialState)
+                return false;
+        }
+
+        /*
+         * Every managed physical page has exactly one state byte.
+         */
+        for (Uint64 page = 0; page < m_Statistics.ManagedPages; page++) 
+            if (candidate_page_states[page] != m_PageStates[page]) return false;
+
+        return true;
+    }
+
     bool PhysicalMemoryManager::FindMetadataRegion(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 metadata_page_count, PhysicalSpan& result) const noexcept {
         if (metadata_page_count == 0 || metadata_page_count > MaximumValue / PageSize) return false;
 
@@ -222,6 +253,8 @@ namespace Zos::Kernel::Memory {
 
         const Uint64 region_metadata_bytes = managed_region_capacity * sizeof(ManagedRegion);
 
+        m_PageStatesOffset = managed_region_capacity * sizeof(ManagedRegion);
+        m_MetadataAccessBase = VirtualAddress(m_MetadataSpan.Base.Value());
         m_Regions = reinterpret_cast<ManagedRegion*>(storage);
         m_PageStates = storage + region_metadata_bytes;
         m_Statistics.ManagedPages = managed_pages;
@@ -573,8 +606,60 @@ namespace Zos::Kernel::Memory {
         m_Statistics.FreePages += deferred_boot_pages;
         m_Statistics.DeferredBootPages = 0;
         m_BootMemoryReclaimed = true;
-        result.ReclaimedPages = deferred_boot_pages;
+        result.ReleasedPages = deferred_boot_pages;
         return PhysicalMemoryReclamationError::Success;
+    }
+
+    PhysicalMemoryMetadataAccessError PhysicalMemoryManager::PromoteMetadataAccess(VirtualAddress metadata_base) noexcept {
+        if (!m_Initialized) return PhysicalMemoryMetadataAccessError::NotInitialized;
+        if (m_MetadataAccessPromoted) return PhysicalMemoryMetadataAccessError::AlreadyPromoted;
+        if (metadata_base.IsNull() ||
+            !metadata_base.IsPageAligned() ||
+            metadata_base == m_MetadataAccessBase ||
+            m_MetadataSpan.IsEmpty() ||
+            m_Regions == nullptr ||
+            m_PageStates == nullptr ||
+            m_RegionCount == 0)
+            return PhysicalMemoryMetadataAccessError::InvalidAddress;
+
+        const Uint64 metadata_size = m_MetadataSpan.SizeBytes();
+        if (m_PageStatesOffset > metadata_size) return PhysicalMemoryMetadataAccessError::MetadataMismatch;
+        if (m_Statistics.ManagedPages > metadata_size - m_PageStatesOffset)
+            return PhysicalMemoryMetadataAccessError::MetadataMismatch;
+
+        /*
+         * Ensure the candidate virtual span itself cannot wrap.
+         */
+        if (metadata_base.Value() > MaximumValue - metadata_size)
+            return PhysicalMemoryMetadataAccessError::InvalidAddress;
+
+        auto* candidate_storage = reinterpret_cast<Uint8*>(metadata_base.Value());
+        auto* candidate_regions = reinterpret_cast<ManagedRegion*>(candidate_storage);
+        Uint8* candidate_page_states = candidate_storage + m_PageStatesOffset;
+
+        /*
+         * Both aliases are still present here.
+         *
+         * The caller has already proven that metadata_base maps the same
+         * physical pages. This check additionally proves that the complete
+         * allocator state is visible through the candidate virtual view
+         * before changing any persistent pointer.
+         */
+        if (!MetadataViewsMatch(candidate_regions, candidate_page_states)) 
+            return PhysicalMemoryMetadataAccessError::MetadataMismatch;
+
+        /*
+         * One-way pointer transition.
+         *
+         * From this point onward the PMM no longer dereferences its
+         * bootstrap identity alias.
+         */
+        m_Regions = candidate_regions;
+        m_PageStates = candidate_page_states;
+        m_MetadataAccessBase = metadata_base;
+        m_MetadataAccessPromoted = true;
+
+        return PhysicalMemoryMetadataAccessError::Success;
     }
 
     BootstrapResourceReleaseError PhysicalMemoryManager::ReleaseBootstrapResources(BootstrapResourceReleaseResult& result) noexcept {
@@ -923,5 +1008,16 @@ namespace Zos::Kernel::Memory {
         case BootstrapResourceReleaseError::InvalidState: return "bootstrap resource page state is inconsistent";
         }
         return "unknown bootstrap resource release error";
+    }
+
+    const char* PhysicalMemoryManager::Describe(PhysicalMemoryMetadataAccessError error) noexcept {
+        switch (error) {
+        case PhysicalMemoryMetadataAccessError::Success: return "success";
+        case PhysicalMemoryMetadataAccessError::NotInitialized: return "physical memory manager is not initialized";
+        case PhysicalMemoryMetadataAccessError::AlreadyPromoted: return "physical-memory metadata access is already promoted";
+        case PhysicalMemoryMetadataAccessError::InvalidAddress: return "physical-memory metadata access address is invalid";
+        case PhysicalMemoryMetadataAccessError::MetadataMismatch: return "physical-memory metadata aliases do not contain identical state";
+        }
+        return "unknown physical-memory metadata access error";
     }
 }   

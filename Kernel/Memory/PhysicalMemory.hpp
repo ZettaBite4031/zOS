@@ -33,14 +33,22 @@ namespace Zos::Kernel::Memory {
         CorruptState,
     };
 
+    enum class PhysicalMemoryMetadataAccessError : Uint32 {
+        Success,
+        NotInitialized,
+        AlreadyPromoted,
+        InvalidAddress,
+        MetadataMismatch,
+    };
+
     enum class PhysicalAllocationPreference : Uint32 {
         HighAddresses,
         LowAddresses,
     };
 
     struct PhysicalMemoryReclamationResult final {
-        Uint64 ReclaimedPages{};
-        [[nodiscard]] Uint64 ReclaimedBytes() const noexcept { return ReclaimedPages * PageSize; }
+        Uint64 ReleasedPages{};
+        [[nodiscard]] Uint64 ReclaimedBytes() const noexcept { return ReleasedPages * PageSize; }
     };
 
     enum class BootstrapResourceReleaseError : Uint32 {
@@ -133,6 +141,7 @@ namespace Zos::Kernel::Memory {
 
         [[nodiscard]] PhysicalMemoryInitializationError Initialize(const Boot::BootEnvironment& environment) noexcept;
         [[nodiscard]] PhysicalMemoryReclamationError ReclaimBootMemory(PhysicalMemoryReclamationResult& result) noexcept;
+        [[nodiscard]] PhysicalMemoryMetadataAccessError PromoteMetadataAccess(VirtualAddress metadata_base) noexcept;
 
         [[nodiscard]] BootstrapResourceReleaseError ReleaseBootstrapResources(BootstrapResourceReleaseResult& result) noexcept;
         [[nodiscard]] bool AreBootstrapResourcesReleased() const noexcept { return m_BootstrapResourcesReleased; }
@@ -142,13 +151,16 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] PhysicalAllocationError Release(PhysicalAllocation& allocation) noexcept;
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] const PhysicalMemoryStatistics& Statistics() const noexcept { return m_Statistics; }
+        [[nodiscard]] VirtualAddress MetadataAccessBase() const noexcept { return m_MetadataAccessBase; }
         [[nodiscard]] PhysicalSpan MetadataSpan() const noexcept { return m_MetadataSpan; }
         [[nodiscard]] bool IsBootMemoryReclaimed() const noexcept { return m_BootMemoryReclaimed; }
+        [[nodiscard]] bool IsMetadataAccessPromoted() const noexcept { return m_MetadataAccessPromoted; }
         
         [[nodiscard]] static const char* Describe(PhysicalMemoryReclamationError error) noexcept;
         [[nodiscard]] static const char* Describe(PhysicalMemoryInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(PhysicalAllocationError error) noexcept;
         [[nodiscard]] static const char* Describe(BootstrapResourceReleaseError error) noexcept;
+        [[nodiscard]] static const char* Describe(PhysicalMemoryMetadataAccessError error) noexcept;
 
     private:
         // One byte per managed page is intentional. It costs ~0.024% of the RAM
@@ -190,6 +202,8 @@ namespace Zos::Kernel::Memory {
 
         [[nodiscard]] bool CandidateOverlapsProtectedRange(const Boot::BootEnvironment& environment, Uint64 candidate_base, Uint64 candidate_end, Uint64& next_candidate_end) const noexcept;
 
+        [[nodiscard]] bool MetadataViewsMatch(const ManagedRegion* candidate_regions, const Uint8* candidate_page_states) const noexcept;
+
         void InitializeMetadataStorage(Uint64 managed_region_capcity, Uint64 managed_pages) noexcept;
         void BuildManagedRegions(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 managed_region_capacity) noexcept;
         void SortManagedRegions() noexcept;
@@ -224,6 +238,25 @@ namespace Zos::Kernel::Memory {
 
         PhysicalSpan m_MetadataSpan{};
 
+        /*
+         * Offset from the beginning of the PMM metadata allocation to the
+         * one-byte-per-page state array.
+         * 
+         * This must retain the original ManagedRegion capacity rather than 
+         * deriving the offset from m_RegionCount, because adjacent regions
+         * may be merged after initial construction.
+         */
+        Uint64 m_PageStatesOffset{};
+
+        /*
+         * Virtual address currently used to access m_MetadataSpan.
+         * 
+         * During bootstrap this is the temporary identity alias. After the
+         * kernel-owned address space is active it is promoted to the
+         * permanent direct-map alias.
+         */
+        VirtualAddress m_MetadataAccessBase{};
+
         PhysicalSpan m_BootstrapStackSpan{};
         PhysicalSpan m_EnvironmentStorageSpan{};
         PhysicalSpan m_MemoryMapStorageSpan{};
@@ -231,6 +264,7 @@ namespace Zos::Kernel::Memory {
         PhysicalMemoryStatistics m_Statistics{};
 
         bool m_Initialized{};
+        bool m_MetadataAccessPromoted{};
         bool m_BootMemoryReclaimed{};
         bool m_BootstrapResourcesReleased{};
     };
