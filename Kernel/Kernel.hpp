@@ -54,6 +54,7 @@ namespace Zos::Kernel {
         PermanentStackActive,
         BootstrapResourcesReleased,
         KernelHeapReady,
+        CxxAllocationReady,
 
         BootstrapComplete,
         Runtime,

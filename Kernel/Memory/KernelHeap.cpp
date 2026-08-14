@@ -2,12 +2,12 @@
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 
+#include <Kernel/Runtime/New.hpp>
+
 extern "C" {
     void* memset(void* dst, int v, unsigned long long n) noexcept;
     void* memcpy(void* dst, const void* src, unsigned long long n) noexcept;
 }
-
-void* operator new(__SIZE_TYPE__, void* address) noexcept;
 
 namespace Zos::Kernel::Memory {
     namespace {
@@ -237,7 +237,7 @@ namespace Zos::Kernel::Memory {
                     return KernelHeapError::RollbackFailed;
                 if (mapped_pages != 0 && !RollbackSegmentCreation(*segment, mapped_pages)) 
                     return KernelHeapError::RollbackFailed;
-                return KernelHeapError::CorruptHeap;
+                return KernelHeapError::MappingFailed;
             }
 
             memset(reinterpret_cast<void*>(virtual_address.Value()), 0, PageSize);
@@ -701,7 +701,7 @@ namespace Zos::Kernel::Memory {
                 if (combined - required_total >= MinimumBlockBytes())
                     final_total = required_total;
 
-                const Uint64 allocation_growth = final_total = old_total;
+                const Uint64 allocation_growth = final_total - old_total;
                 const Uint64 requested_growth = new_size - old_requested_bytes;
 
                 if (m_Statistics.FreeBlockBytes < allocation_growth ||

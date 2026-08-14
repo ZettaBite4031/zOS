@@ -4,6 +4,8 @@
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 
+#include <Kernel/Runtime/New.hpp>
+
 extern "C" [[noreturn]] void SwitchToPermanentKernelStack(Zos::Kernel::Memory::Uint64 stack_top, void(*continuation)(void*) noexcept, void* context) noexcept;
 
 __asm__(
@@ -859,6 +861,116 @@ namespace Zos::Kernel::Initialization {
 
             Diagnostics::Write("[zOS/Heap] Allocation, alignment, reallocation, coalescing, and protection self-test passed.\n");
         }
+
+        void BindCxxAllocationRuntime(KernelRuntime& runtime) noexcept {
+            if (!runtime.Heap.IsInitialized() || !runtime.Heap.Validate())
+                Diagnostics::Fatal("C++ Runtime", "cannot bind C++ allocation before permanent heap validation");
+
+            if (!Runtime::BindKernelHeap(runtime.Heap))
+                Diagnostics::Fatal("C++ Runtime", "failed to bind permanent heap to C++ allocation runtime");
+
+            if (!Runtime::IsKernelHeapBound())
+                Diagnostics::Fatal("C++ Runtime", "C++ allocation runtime did not enter the bound state");
+
+            Diagnostics::Write("[zOS/Runtime] C++ allocation operators bound to permanent kernel heap.\n");
+        }
+
+        struct CxxAllocationProbe final {
+            Uint64 First;
+            Uint64 Second;
+        };
+
+        struct alignas(256) CxxAlignedAllocationProbe final {
+            Uint8 Payload[257]{};
+        };
+
+        void RunCxxAllocationSelfTest(KernelRuntime& runtime) noexcept {
+            if (!Runtime::IsKernelHeapBound()) 
+                Diagnostics::Fatal("C++ Runtime", "C++ allocation self-test ran before heap binding");
+
+            KernelHeap& heap = runtime.Heap;
+            const KernelHeapStatistics baseline = heap.Statistics();
+
+            /*
+             * Scalar new/delete
+             */
+            auto* scalar = new CxxAllocationProbe{ 0x1122334455667788ULL, 0x8877665544332211ULL };
+            if (!heap.Contains(scalar) || scalar->First != 0x1122334455667788ULL || scalar->Second != 0x8877665544332211) 
+                Diagnostics::Fatal("C++ Runtime", "scalar new did not use the permanent kernel heap");
+
+            /*
+             * Array new/delete
+             */
+            auto* array = new Uint64[32]{};
+            if (!heap.Contains(array)) 
+                Diagnostics::Fatal("C++ Runtime", "array new did not use the permanent kernel heap");
+
+            for (Uint64 i = 0; i < 32; i++)
+                array[i] = 0x1000 + i;
+
+            for (Uint64 i = 0; i < 32; i++) 
+                if (array[i] != 0x1000 + i) 
+                    Diagnostics::Fatal("C++ Runtime", "array new allocation payload is invalid");
+            
+            /*
+             * Compiler-generated over-aligned allocation.
+             */
+            auto* aligned = new CxxAlignedAllocationProbe{};
+            if (!heap.Contains(aligned) || (reinterpret_cast<Uint64>(aligned) & 255) != 0) 
+                Diagnostics::Fatal("C++ Runtime", "over-aligned new did not satisfy requested alignment");
+
+            /*
+             * Zero-length arrays are legal in C++.
+             *
+             * The runtime normalizes the underlying zero-sized allocation to
+             * one byte so the successful result remains non-null and owned.
+             */
+            auto empty = new Uint8[0];
+            if (empty == nullptr || !heap.Contains(empty)) 
+                Diagnostics::Fatal("C++ Runtime", "zero-length array allocation contract failed");
+
+            /*
+             * Exercise a direct aligned nothrow allocation
+             */
+            void* nothrow_aligned = ::operator new(73, static_cast<std::align_val_t>(512), std::nothrow);
+            if (nothrow_aligned == nullptr || !heap.Contains(nothrow_aligned) || (reinterpret_cast<Uint64>(nothrow_aligned) & 512) != 0) 
+                Diagnostics::Fatal("C++ Runtime", "aligned nothrow allocation failed");
+
+            ::operator delete(nothrow_aligned, static_cast<std::align_val_t>(512), std::nothrow);
+
+            /*
+             * A request that cannot possibly fit in the aerna must fail
+             * without halting when the nothrow form is explicitly selected.
+             */
+            void* impossible = ::operator new(static_cast<__SIZE_TYPE__>(~Uint64{ 0 }), std::nothrow);
+            if (impossible != nullptr) {
+                ::operator delete(impossible, std::nothrow);
+                Diagnostics::Fatal("C++ Runtime", "nothrow allocation did not report exhaustion");
+            }
+
+            delete scalar;
+            delete[] array;
+            delete aligned;
+            delete[] empty;
+
+            if (!heap.Validate()) 
+                Diagnostics::Fatal("C++ Runtime", "kernel heap validation failed after C++ allocation test");
+
+            const KernelHeapStatistics after = heap.Statistics();
+
+            /*
+            * These test allocations are intentionally small enough to fit in
+            * the initial segment, so all logical allocation accounting should
+            * return exactly to baseline.
+            */
+            if (after.ReservedPages != baseline.ReservedPages || after.CommittedPages != baseline.CommittedPages || 
+                after.SegmentCount != baseline.SegmentCount || after.AllocationCount != baseline.AllocationCount || 
+                after.RequestedBytes != baseline.RequestedBytes || after.AllocatedBlockBytes != baseline.AllocatedBlockBytes || 
+                after.FreeBlockBytes != baseline.FreeBlockBytes || after.SegmentMetadataBytes != baseline.SegmentMetadataBytes) 
+                Diagnostics::Fatal("C++ Runtime", "C++ allocation self-test did not return heap accounting to baseline");
+
+            Diagnostics::Write("[zOS/Runtime] Scalar, array, aligned, and nothrow C++ allocation self-test passed.\n");
+        }
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
@@ -909,9 +1021,17 @@ namespace Zos::Kernel::Initialization {
         RunKernelHeapSelfTest(runtime);
         AdvancePhase(runtime, KernelPhase::BootstrapResourcesReleased, KernelPhase::KernelHeapReady);
         
-        
+        /*
+         * The raw heap is independently proven before the language runtime is
+         * allowed to depend on it.
+         */
+        BindCxxAllocationRuntime(runtime);
+        RunCxxAllocationSelfTest(runtime);
+        AdvancePhase(runtime, KernelPhase::KernelHeapReady, KernelPhase::CxxAllocationReady);
 
-        AdvancePhase(runtime, KernelPhase::KernelHeapReady, KernelPhase::BootstrapComplete);
+
+
+        AdvancePhase(runtime, KernelPhase::CxxAllocationReady, KernelPhase::BootstrapComplete);
         Diagnostics::Write("[zOS/Startup] Bootstrap infrastructure complete.\n");
 
         EnterRuntime(runtime);
