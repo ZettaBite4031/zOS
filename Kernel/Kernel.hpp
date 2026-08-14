@@ -2,6 +2,7 @@
 
 #include <Kernel/Memory/PhysicalMemory.hpp>
 #include <Kernel/Memory/VirtualMemory.hpp>
+#include <Kernel/Memory/KernelHeap.hpp>
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
@@ -52,6 +53,7 @@ namespace Zos::Kernel {
         PermanentStackPrepared,
         PermanentStackActive,
         BootstrapResourcesReleased,
+        KernelHeapReady,
 
         BootstrapComplete,
         Runtime,
@@ -76,6 +78,7 @@ namespace Zos::Kernel {
         Memory::VirtualAddressAllocator KernelAddresses{};
         Architecture::AMD64::PageMap KernelPageMap{};
         Architecture::AMD64::InterruptManager Interrupts{};
+        Memory::KernelHeap Heap{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads

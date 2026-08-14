@@ -764,6 +764,101 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("\n");
         }
 
+        void InitializeKernelHeap(KernelRuntime& runtime) noexcept {
+            const KernelHeapError error = runtime.Heap.Initialize(runtime.PhysicalMemory, runtime.KernelAddresses, runtime.KernelPageMap);
+            if (error != KernelHeapError::Success) 
+                Diagnostics::Fatal("Heap", KernelHeap::Describe(error));
+            if (!runtime.Heap.Validate())
+                Diagnostics::Fatal("Heap", "initial kernel heap validation failed");
+
+            const KernelHeapStatistics& statistics = runtime.Heap.Statistics();
+            Diagnostics::Write("[zOS/Heap] Permanent kernel heap initialized.\n");
+            Diagnostics::Write("[zOS/Heap] Arena: ");
+            Diagnostics::WriteHex(runtime.Heap.ArenaSpan().Base.Value());
+            Diagnostics::Write(" + ");
+            Diagnostics::WriteDecimal(statistics.ReservedBytes());
+            Diagnostics::Write(" bytes\n");
+
+            Diagnostics::Write("[zOS/Heap] Initial committed memory: ");
+            Diagnostics::WriteDecimal(statistics.CommittedBytes());
+            Diagnostics::Write(" bytes\n");
+        }
+
+        void RunKernelHeapSelfTest(KernelRuntime& runtime) noexcept {
+            KernelHeap& heap = runtime.Heap;
+            if (!heap.IsInitialized())
+                Diagnostics::Fatal("Heap", "kernel heap self-test ran before initialization");
+
+            const KernelHeapStatistics baseline = heap.Statistics();
+
+            void* first = nullptr;
+            void* second = nullptr;
+            void* third = nullptr;
+
+            if (heap.Allocate(24, first) != KernelHeapError::Success ||
+                heap.Allocate(257, second, 64) != KernelHeapError::Success ||
+                heap.Allocate(513, third, 256) != KernelHeapError::Success)
+                Diagnostics::Fatal("Heap", "basic kernel heap allocation failed");
+
+            if (first == nullptr || second == nullptr || third == nullptr ||
+                first == second || first == third || second == third ||
+                (reinterpret_cast<Uint64>(first) & (KernelHeap::DefaultAlignment - 1)) != 0 ||
+                (reinterpret_cast<Uint64>(second) & 63) != 0 ||
+                (reinterpret_cast<Uint64>(third) & 255) != 0)
+                Diagnostics::Fatal("Heap", "kernel heap alignment or uniqueness invariant failed");
+
+            auto* first_bytes = static_cast<Uint8*>(first);
+            for (Uint64 i = 0; i < 24; ++i)
+                first_bytes[i] = static_cast<Uint8>(0xA0 + i);
+
+            void* resized = nullptr;
+            if (heap.Reallocate(first, 2048, resized) != KernelHeapError::Success || resized == nullptr)
+                Diagnostics::Fatal("Heap", "kernel heap reallocation failed");
+
+            auto* resized_bytes = static_cast<Uint8*>(resized);
+            for (Uint64 i = 0; i < 24; ++i)
+                if (resized_bytes[i] != static_cast<Uint8>(0xA0 + i))
+                    Diagnostics::Fatal("Heap", "kernel heap reallocation did not preserve payload data");
+
+            first = resized;
+
+            if (heap.Free(third) != KernelHeapError::Success)
+                Diagnostics::Fatal("Heap", "kernel heap free failed");
+
+            if (heap.Free(third) != KernelHeapError::DoubleFree)
+                Diagnostics::Fatal("Heap", "kernel heap double-free protection failed");
+
+            void* page_aligned = nullptr;
+            if (heap.Allocate(128, page_aligned, PageSize) != KernelHeapError::Success ||
+                page_aligned == nullptr ||
+                (reinterpret_cast<Uint64>(page_aligned) & (PageSize - 1)) != 0)
+                Diagnostics::Fatal("Heap", "page-aligned kernel heap allocation failed");
+
+            if (heap.Free(second) != KernelHeapError::Success ||
+                heap.Free(page_aligned) != KernelHeapError::Success ||
+                heap.Free(first) != KernelHeapError::Success)
+                Diagnostics::Fatal("Heap", "kernel heap release/coalescing test failed");
+
+            Uint64 foreign = 0;
+            if (heap.Free(&foreign) != KernelHeapError::InvalidPointer)
+                Diagnostics::Fatal("Heap", "kernel heap foreign-pointer protection failed");
+
+            if (!heap.Validate())
+                Diagnostics::Fatal("Heap", "kernel heap structural validation failed");
+
+            const KernelHeapStatistics after = heap.Statistics();
+            if (after.ReservedPages != baseline.ReservedPages ||
+                after.CommittedPages != baseline.CommittedPages ||
+                after.SegmentCount != baseline.SegmentCount ||
+                after.SegmentMetadataBytes != baseline.SegmentMetadataBytes ||
+                after.FreeBlockBytes != baseline.FreeBlockBytes ||
+                after.AllocationCount != 0 ||
+                after.RequestedBytes != 0 ||
+                after.AllocatedBlockBytes != 0)
+                Diagnostics::Fatal("Heap", "kernel heap accounting did not return to baseline");
+
+            Diagnostics::Write("[zOS/Heap] Allocation, alignment, reallocation, coalescing, and protection self-test passed.\n");
+        }
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
@@ -810,8 +905,13 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::PermanentStackActive, KernelPhase::BootstrapResourcesReleased);
 
-        AdvancePhase(runtime, KernelPhase::BootstrapResourcesReleased, KernelPhase::BootstrapComplete);
+        InitializeKernelHeap(runtime);
+        RunKernelHeapSelfTest(runtime);
+        AdvancePhase(runtime, KernelPhase::BootstrapResourcesReleased, KernelPhase::KernelHeapReady);
+        
+        
 
+        AdvancePhase(runtime, KernelPhase::KernelHeapReady, KernelPhase::BootstrapComplete);
         Diagnostics::Write("[zOS/Startup] Bootstrap infrastructure complete.\n");
 
         EnterRuntime(runtime);
