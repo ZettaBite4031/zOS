@@ -55,6 +55,7 @@ namespace Zos::Kernel {
         BootstrapResourcesReleased,
         KernelHeapReady,
         CxxAllocationReady,
+        VirtualAddressMetadataPromoted,
 
         BootstrapComplete,
         Runtime,

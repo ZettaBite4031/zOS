@@ -2,6 +2,8 @@
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 
+#include <Kernel/Memory/KernelHeap.hpp>
+
 #include <Kernel/Runtime/New.hpp>
 
 extern "C" {
@@ -240,12 +242,15 @@ namespace Zos::Kernel::Memory {
     }
 
     VirtualAddressAllocator::FreeExtent* VirtualAddressAllocator::CreateExtentStorage() noexcept {
-        if (m_Metadata == nullptr) return nullptr;
+        if (m_PermanentMetadata != nullptr)
+            return AllocatePermanentExtent(*m_PermanentMetadata);
 
-        void* storage = m_Metadata->Allocate(sizeof(FreeExtent), alignof(FreeExtent));
+        if (m_BootstrapMetadata == nullptr) return nullptr;
+
+        void* storage = m_BootstrapMetadata->Allocate(sizeof(FreeExtent), alignof(FreeExtent));
         if (storage == nullptr) return nullptr;
 
-        return static_cast<FreeExtent*>(storage);
+        return new (storage) FreeExtent{};
     }
 
     VirtualAddressAllocator::FreeExtent* VirtualAddressAllocator::AcquireExtent(Uint64 base, Uint64 page_count) noexcept {
@@ -334,13 +339,15 @@ namespace Zos::Kernel::Memory {
 
         (void)managed_end;
 
-        m_Metadata = &metadata;
+        m_BootstrapMetadata = &metadata;
+        m_PermanentMetadata = nullptr;
+
         m_ManagedRange = managed_range;
         m_NextReservationId = 1;
 
         FreeExtent* initial = AcquireExtent(managed_range.Base.Value(), managed_range.PageCount);
         if (initial == nullptr) {
-            m_Metadata = nullptr;
+            m_BootstrapMetadata = nullptr;
             m_ManagedRange = {};
             return VirtualAllocationError::OutOfMetadata;
         }
@@ -503,10 +510,13 @@ namespace Zos::Kernel::Memory {
     }
 
     VirtualAddressAllocator::ReservationRecord* VirtualAddressAllocator::CreateReservationStorage() noexcept {
-        if (m_Metadata == nullptr) return nullptr;
-        void* storage = m_Metadata->Allocate(sizeof(ReservationRecord), alignof(ReservationRecord));
+        if (m_PermanentMetadata != nullptr)
+            return AllocatePermanentReservationRecord(*m_PermanentMetadata);
+
+        if (m_BootstrapMetadata == nullptr) return nullptr;
+        void* storage = m_BootstrapMetadata->Allocate(sizeof(ReservationRecord), alignof(ReservationRecord));
         if (storage == nullptr) return nullptr;
-        return static_cast<ReservationRecord*>(storage);
+        return new (storage) ReservationRecord{};
     }
 
     VirtualAddressAllocator::ReservationRecord* VirtualAddressAllocator::AcquireReservationRecord() noexcept {
@@ -576,6 +586,90 @@ namespace Zos::Kernel::Memory {
         id = m_NextReservationId;
         m_NextReservationId++;
 
+        return true;
+    }
+
+    VirtualAddressAllocator::FreeExtent* VirtualAddressAllocator::AllocatePermanentExtent(KernelHeap& heap) noexcept {
+        void* storage = nullptr;
+        const KernelHeapError error = heap.Allocate(sizeof(FreeExtent), storage, alignof(FreeExtent));
+        if (error != KernelHeapError::Success) return nullptr;
+        return new (storage) FreeExtent{};
+    }
+
+    VirtualAddressAllocator::ReservationRecord* VirtualAddressAllocator::AllocatePermanentReservationRecord(KernelHeap& heap) noexcept {
+        void* storage = nullptr;
+        const KernelHeapError error = heap.Allocate(sizeof(ReservationRecord), storage, alignof(ReservationRecord));
+        if (error != KernelHeapError::Success) return nullptr;
+        return new (storage) ReservationRecord{};
+    }
+
+    bool VirtualAddressAllocator::BuildPermanentMetadataGraph(KernelHeap& heap, MetadataGraph& output) const noexcept {
+        output = {};
+        for (const FreeExtent* source = m_FreeHead; source != nullptr; source = source->Next) {
+            FreeExtent* dst = AllocatePermanentExtent(heap);
+            if (dst == nullptr) return false;
+            dst->Base = source->Base;
+            dst->PageCount = source->PageCount;
+            dst->Previous = output.FreeTail;
+            dst->Next = nullptr;
+            if (output.FreeTail != nullptr) output.FreeTail->Next = dst;
+            else output.FreeHead = dst;
+            output.FreeTail = dst;
+        }
+        for (const ReservationRecord* source = m_ReservationHead; source != nullptr; source = source->Next) {
+            ReservationRecord* dst = AllocatePermanentReservationRecord(heap);
+            if (dst == nullptr) return false;
+
+            /*
+             * Link immediately.
+             *
+             * If the following ReleaseExtent allocation fails, rollback
+             * can still discover and destroy this partially constructed
+             * record.
+             */
+            dst->Id = source->Id;
+            dst->Span = source->Span;
+            dst->Previous = output.ReservationTail;
+            dst->Next = nullptr;
+            if (output.ReservationTail != nullptr) output.ReservationTail->Next = dst;
+            else output.ReservationHead = dst;
+            output.ReservationTail = dst;
+
+            if (source->ReleaseExtent == nullptr) return false;
+            FreeExtent* release_extent = AllocatePermanentExtent(heap);
+            if (release_extent == nullptr) return false;
+            release_extent->Base = source->ReleaseExtent->Base;
+            release_extent->PageCount = source->ReleaseExtent->PageCount;
+            dst->ReleaseExtent = release_extent;
+        }
+
+        return true;
+    }
+
+    bool VirtualAddressAllocator::DestroyPermanentMetadataGraph(KernelHeap& heap, MetadataGraph& graph) noexcept {
+        ReservationRecord* record = graph.ReservationHead;
+        while (record != nullptr) {
+            ReservationRecord* next = record->Next;
+            if (record->ReleaseExtent != nullptr) {
+                FreeExtent* release = record->ReleaseExtent;
+                release->~FreeExtent();
+                if (heap.Free(release) != KernelHeapError::Success) return false;
+            }
+
+            record->~ReservationRecord();
+            if (heap.Free(record) != KernelHeapError::Success) return false;
+            record = next;
+        }
+
+        FreeExtent* extent = graph.FreeHead;
+        while (extent != nullptr) {
+            FreeExtent* next = extent->Next;
+            extent->~FreeExtent();
+            if (heap.Free(extent) != KernelHeapError::Success) return false;
+            extent = next;
+        }
+
+        graph = {};
         return true;
     }
 
@@ -696,34 +790,114 @@ namespace Zos::Kernel::Memory {
         return VirtualAllocationError::Success;
     }
 
-    bool VirtualAddressAllocator::Validate() const noexcept {
-        if (!m_Initialized || m_Metadata == nullptr || !m_Metadata->IsInitialized() ||
-            m_ManagedRange.IsEmpty() || !m_ManagedRange.Base.IsPageAligned()) return false;
+    VirtualAddressMetadataPromotionError VirtualAddressAllocator::PromoteMetadata(KernelHeap& heap) noexcept {
+        if (!m_Initialized) return VirtualAddressMetadataPromotionError::NotInitialized;
+        if (m_PermanentMetadata != nullptr) return VirtualAddressMetadataPromotionError::AlreadyPromoted;
+        if (m_BootstrapMetadata == nullptr ||
+            !m_BootstrapMetadata->IsInitialized() ||
+            !heap.IsInitialized())
+            return VirtualAddressMetadataPromotionError::InvalidDependency;
 
-        if (m_Statistics.ManagedPages != m_ManagedRange.PageCount || 
-            m_Statistics.FreePages > m_Statistics.ManagedPages || 
-            m_Statistics.ReservedPages > m_Statistics.ManagedPages || 
-            m_Statistics.FreePages + m_Statistics.ReservedPages != m_Statistics.ManagedPages)
+        /*
+         * Do not attempt to migrate already-corrupt ownership state.
+         */
+        if (!Validate() || !heap.Validate()) 
+            return VirtualAddressMetadataPromotionError::CorruptState;
+
+        MetadataGraph candidate{};
+        if (!BuildPermanentMetadataGraph(heap, candidate)) {
+            if (!DestroyPermanentMetadataGraph(heap, candidate))
+                return VirtualAddressMetadataPromotionError::RollbackFailed;
+            return VirtualAddressMetadataPromotionError::HeapAllocationFailed;
+        }
+
+        /*
+         * Validate the candidate while the bootstrap graph remains
+         * authoritative
+         */
+        if (!ValidateState(candidate.FreeHead, candidate.FreeTail, candidate.ReservationHead, m_Statistics, &heap)) {
+            if (!DestroyPermanentMetadataGraph(heap, candidate)) 
+                return VirtualAddressMetadataPromotionError::RollbackFailed;
+            return VirtualAddressMetadataPromotionError::ValidationFailed;
+        }
+
+        /*
+         * Save every old root so even a post-cutover validation failure
+         * can restore the bootstrap graph.
+         */
+        BootstrapMetadataArena* old_bootstrap_metadata = m_BootstrapMetadata;
+        FreeExtent* old_free_head = m_FreeHead;
+        FreeExtent* old_free_tail = m_FreeTail;
+        FreeExtent* old_recycled_extents = m_RecycledExtents;
+        ReservationRecord* old_reservation_head = m_ReservationHead;
+        ReservationRecord* old_recycled_reservations = m_RecycledReservationRecords;
+
+        /*
+         * Atomic logical cutover.
+         *
+         * Existing VirtualReservation objects require no modification.
+         * Their IDs resolve against the equivalent records in this new
+         * graph.
+         */
+        m_FreeHead = candidate.FreeHead;
+        m_FreeTail = candidate.FreeTail;
+        m_RecycledExtents = nullptr;
+        m_ReservationHead = candidate.ReservationHead;
+        m_RecycledReservationRecords = nullptr;
+        m_BootstrapMetadata = nullptr;
+        m_PermanentMetadata = &heap;
+
+        if (!Validate()) {
+            /*
+             * Restore the bootstrap graph before touching the candidate.
+             */
+            m_PermanentMetadata = nullptr;
+            m_BootstrapMetadata = old_bootstrap_metadata;
+            m_FreeHead = old_free_head;
+            m_FreeTail = old_free_tail;
+            m_RecycledExtents = old_recycled_extents;
+            m_ReservationHead = old_reservation_head;
+            m_RecycledReservationRecords = old_recycled_reservations;
+            if (!DestroyPermanentMetadataGraph(heap, candidate))
+                return VirtualAddressMetadataPromotionError::RollbackFailed;
+            return VirtualAddressMetadataPromotionError::ValidationFailed;
+        }
+
+        /*
+         * The new graph is now owned by this VAA.
+         *
+         * The old graph remains physical present in
+         * BootstrapMetadataArena but is unreachable from the VAA.
+         * It will disappear when the arena itself is retired after
+         * PageMap metadata is migrated.
+         */
+        candidate = {};
+
+        return VirtualAddressMetadataPromotionError::Success;
+    }
+
+    bool VirtualAddressAllocator::ValidateState(const FreeExtent* free_head, const FreeExtent* free_tail, const ReservationRecord* reservation_head, const VirtualAddressAllocatorStatistics& statistics, const KernelHeap* required_heap) const noexcept {
+        (void)required_heap;
+
+        if (statistics.ManagedPages != m_ManagedRange.PageCount || 
+            statistics.FreePages > statistics.ManagedPages || 
+            statistics.ReservedPages > statistics.ManagedPages || 
+            statistics.FreePages + statistics.ReservedPages != statistics.ManagedPages)
             return false;
 
         Uint64 observed_free_pages = 0;
         Uint64 observed_free_extents = 0;
         const FreeExtent* previous_extent = nullptr;
 
-        for (const FreeExtent* extent = m_FreeHead; extent != nullptr; extent = extent->Next) {
+        for (const FreeExtent* extent = free_head; extent != nullptr; extent = extent->Next) {
             if (extent->PageCount == 0 || (extent->Base & (PageSize - 1)) != 0 || extent->Previous != previous_extent) 
                 return false;
 
-            const VirtualSpan span{
-                VirtualAddress(extent->Base),
-                extent->PageCount
-            };
-
+            const VirtualSpan span{ VirtualAddress(extent->Base), extent->PageCount };
             if (!ReservationInsideManagedRange(span))
                 return false;
 
             Uint64 extent_end = 0;
-
             if (!TryRangeEnd(extent->Base, extent->PageCount * PageSize, extent_end)) 
                 return false;
 
@@ -749,14 +923,14 @@ namespace Zos::Kernel::Memory {
             previous_extent = extent;
         }
 
-        if (previous_extent != m_FreeTail || observed_free_pages != m_Statistics.FreePages || observed_free_extents != m_Statistics.FreeExtentCount) 
+        if (previous_extent != free_tail || observed_free_pages != statistics.FreePages || observed_free_extents != statistics.FreeExtentCount) 
             return false;
 
         Uint64 observed_reserved_pages = 0;
         Uint64 observed_reservations = 0;
         const ReservationRecord* previous_record = nullptr;
 
-        for (const ReservationRecord* record = m_ReservationHead; record != nullptr; record = record->Next) {
+        for (const ReservationRecord* record = reservation_head; record != nullptr; record = record->Next) {
             if (record->Id == 0 || record->Previous != previous_record || record->Span.IsEmpty() || record->ReleaseExtent == nullptr)
                 return false;
 
@@ -776,7 +950,7 @@ namespace Zos::Kernel::Memory {
             /*
             * No active reservation may overlap a free extent.
             */
-            for (const FreeExtent* extent = m_FreeHead; extent != nullptr; extent = extent->Next) {
+            for (const FreeExtent* extent = free_head; extent != nullptr; extent = extent->Next) {
                 Uint64 extent_end = 0;
                 if (!TryRangeEnd(extent->Base, extent->PageCount * PageSize, extent_end))
                     return false;
@@ -810,8 +984,42 @@ namespace Zos::Kernel::Memory {
             previous_record = record;
         }
 
-        if (observed_reserved_pages != m_Statistics.ReservedPages || observed_reservations != m_Statistics.ActiveReservations)
+        if (observed_reserved_pages != statistics.ReservedPages || observed_reservations != statistics.ActiveReservations)
             return false;
+        return true;
+    }
+
+    bool VirtualAddressAllocator::Validate() const noexcept {
+        if (!m_Initialized || m_ManagedRange.IsEmpty() || !m_ManagedRange.Base.IsPageAligned()) return false;
+
+        const bool bootstrap_metadata = m_BootstrapMetadata != nullptr;
+        const bool permanent_metadata = m_PermanentMetadata != nullptr;
+
+        /*
+         * Exactly one backend must be authoritative.
+         */
+        if (bootstrap_metadata == permanent_metadata) return false;
+
+        if (bootstrap_metadata && !m_BootstrapMetadata->IsInitialized())
+            return false;
+
+        if (permanent_metadata && !m_PermanentMetadata->IsInitialized())
+            return false;
+
+        if (!ValidateState(m_FreeHead, m_FreeTail, m_ReservationHead, m_Statistics, m_PermanentMetadata))
+            return false;
+
+        /*
+         * Once promoted, even recycled metadata must be permament.
+         */
+        if (m_PermanentMetadata != nullptr) {
+            for (const FreeExtent* extent = m_RecycledExtents; extent != nullptr; extent = extent->Next)
+                if (!m_PermanentMetadata->Contains(extent)) return false;
+
+            for (const ReservationRecord* record = m_RecycledReservationRecords; record != nullptr; record = record->Next)
+                if (!m_PermanentMetadata->Contains(record)) return false;
+        }
+
         return true;
     }
 
@@ -829,6 +1037,20 @@ namespace Zos::Kernel::Memory {
         case VirtualAllocationError::CorruptReservation: return "virtual reservation state is invalid";
         default: return "unknown virtual allocation error";
         }
+    }
+
+    const char* VirtualAddressAllocator::Describe(VirtualAddressMetadataPromotionError error) noexcept {
+        switch (error) {
+        case VirtualAddressMetadataPromotionError::Success: return "success";
+        case VirtualAddressMetadataPromotionError::NotInitialized: return "virtual address allocator is not initialized";
+        case VirtualAddressMetadataPromotionError::AlreadyPromoted: return "virtual address allocator metadata is already permanent";
+        case VirtualAddressMetadataPromotionError::InvalidDependency: return "virtual address metadata promotion dependency is invalid";
+        case VirtualAddressMetadataPromotionError::CorruptState: return "virtual address allocator state is corrupt";
+        case VirtualAddressMetadataPromotionError::HeapAllocationFailed: return "failed to allocate permanent virtual address metadata";
+        case VirtualAddressMetadataPromotionError::ValidationFailed: return "permanent virtual address metadata failed validation";
+        case VirtualAddressMetadataPromotionError::RollbackFailed: return "failed to roll back virtual address metadata promotion";
+        }
+        return "unknown virtual address metadata promotion error";
     }
 
     bool KernelAddressSpace::MapIdentityBytes(Uint64 base, Uint64 size, MappingOptions options) noexcept {

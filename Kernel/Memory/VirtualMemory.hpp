@@ -133,6 +133,17 @@ namespace Zos::Kernel::Memory {
         CorruptReservation,
     };
 
+    enum class VirtualAddressMetadataPromotionError : Uint32 {
+        Success,
+        NotInitialized,
+        AlreadyPromoted,
+        InvalidDependency,
+        CorruptState,
+        HeapAllocationFailed,
+        ValidationFailed,
+        RollbackFailed,
+    };
+
     struct VirtualAddressAllocatorStatistics final {
         Uint64 ManagedPages{};
         Uint64 FreePages{};
@@ -172,6 +183,8 @@ namespace Zos::Kernel::Memory {
         Uint64 m_ReservationId{};
     };
 
+    class KernelHeap;
+
     class VirtualAddressAllocator final {
     public:
         constexpr VirtualAddressAllocator() noexcept = default;
@@ -184,13 +197,24 @@ namespace Zos::Kernel::Memory {
 
         [[nodiscard]] VirtualAllocationError Release(VirtualReservation& reservation) noexcept;
 
+        /*
+         * Replace all live VAA metadata with equivalent allocations from
+         * the permanent kernel heap.
+         * 
+         * Existing VirtualReservation objects remain valid because their
+         * stable IDs and spans do not change.
+         */
+        [[nodiscard]] VirtualAddressMetadataPromotionError PromoteMetadata(KernelHeap& heap) noexcept;
+
         [[nodiscard]] bool Validate() const noexcept;
 
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
+        [[nodiscard]] bool IsMetadataPromoted() const noexcept { return m_PermanentMetadata != nullptr; }
         [[nodiscard]] VirtualSpan ManagedRange() const noexcept { return m_ManagedRange; }
         [[nodiscard]] const VirtualAddressAllocatorStatistics& Statistics() const noexcept { return m_Statistics; }
         
         [[nodiscard]] static const char* Describe(VirtualAllocationError error) noexcept;
+        [[nodiscard]] static const char* Describe(VirtualAddressMetadataPromotionError error) noexcept;
 
     private:
         struct FreeExtent final {
@@ -223,6 +247,14 @@ namespace Zos::Kernel::Memory {
             ReservationRecord* NextFree{};
         };
 
+        struct MetadataGraph final {
+            FreeExtent* FreeHead{};
+            FreeExtent* FreeTail{};
+
+            ReservationRecord* ReservationHead{};
+            ReservationRecord* ReservationTail{};
+        };
+
         [[nodiscard]] static bool IsPowerOfTwo(Uint64 value) noexcept;
         [[nodiscard]] static bool TryRangeEnd(Uint64 base, Uint64 size, Uint64& end) noexcept;
         [[nodiscard]] static bool TryAlignUp(Uint64 value, Uint64 alignment, Uint64& result) noexcept;
@@ -248,7 +280,16 @@ namespace Zos::Kernel::Memory {
         [[nodiscard]] const ReservationRecord* FindReservationRecord(Uint64 id) const noexcept;
         [[nodiscard]] bool AllocateReservationId(Uint64& id) noexcept;
 
-        BootstrapMetadataArena* m_Metadata{};
+        [[nodiscard]] static FreeExtent* AllocatePermanentExtent(KernelHeap& heap) noexcept;
+        [[nodiscard]] static ReservationRecord* AllocatePermanentReservationRecord(KernelHeap& heap) noexcept;
+
+        [[nodiscard]] bool BuildPermanentMetadataGraph(KernelHeap& heap, MetadataGraph& output) const noexcept;
+        [[nodiscard]] static bool DestroyPermanentMetadataGraph(KernelHeap& heap, MetadataGraph& graph) noexcept;
+
+        [[nodiscard]] bool ValidateState(const FreeExtent* free_head, const FreeExtent* free_tail, const ReservationRecord* reservation_head, const VirtualAddressAllocatorStatistics& statistics, const KernelHeap* required_heap) const noexcept;
+
+        BootstrapMetadataArena* m_BootstrapMetadata{};
+        KernelHeap* m_PermanentMetadata{};
 
         FreeExtent* m_FreeHead{};
         FreeExtent* m_FreeTail{};
