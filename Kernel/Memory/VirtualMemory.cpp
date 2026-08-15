@@ -877,8 +877,6 @@ namespace Zos::Kernel::Memory {
     }
 
     bool VirtualAddressAllocator::ValidateState(const FreeExtent* free_head, const FreeExtent* free_tail, const ReservationRecord* reservation_head, const VirtualAddressAllocatorStatistics& statistics, const KernelHeap* required_heap) const noexcept {
-        (void)required_heap;
-
         if (statistics.ManagedPages != m_ManagedRange.PageCount || 
             statistics.FreePages > statistics.ManagedPages || 
             statistics.ReservedPages > statistics.ManagedPages || 
@@ -890,6 +888,8 @@ namespace Zos::Kernel::Memory {
         const FreeExtent* previous_extent = nullptr;
 
         for (const FreeExtent* extent = free_head; extent != nullptr; extent = extent->Next) {
+            if (required_heap != nullptr && !required_heap->Contains(extent)) return false;
+
             if (extent->PageCount == 0 || (extent->Base & (PageSize - 1)) != 0 || extent->Previous != previous_extent) 
                 return false;
 
@@ -931,11 +931,15 @@ namespace Zos::Kernel::Memory {
         const ReservationRecord* previous_record = nullptr;
 
         for (const ReservationRecord* record = reservation_head; record != nullptr; record = record->Next) {
+            if (required_heap != nullptr && !required_heap->Contains(record)) return false;
+
             if (record->Id == 0 || record->Previous != previous_record || record->Span.IsEmpty() || record->ReleaseExtent == nullptr)
                 return false;
 
             if (!ReservationInsideManagedRange(record->Span))
                 return false;
+
+            if (required_heap != nullptr && !required_heap->Contains(record->ReleaseExtent)) return false;
 
             if (record->ReleaseExtent->Base != record->Span.Base.Value() || 
                 record->ReleaseExtent->PageCount != record->Span.PageCount || 
@@ -1013,11 +1017,22 @@ namespace Zos::Kernel::Memory {
          * Once promoted, even recycled metadata must be permament.
          */
         if (m_PermanentMetadata != nullptr) {
-            for (const FreeExtent* extent = m_RecycledExtents; extent != nullptr; extent = extent->Next)
-                if (!m_PermanentMetadata->Contains(extent)) return false;
+            for (const FreeExtent* extent = m_RecycledExtents; extent != nullptr; extent = extent->Next) {
+                if (!m_PermanentMetadata->Contains(extent))
+                    return false;
 
-            for (const ReservationRecord* record = m_RecycledReservationRecords; record != nullptr; record = record->Next)
-                if (!m_PermanentMetadata->Contains(record)) return false;
+                if (extent->Base != 0 || extent->PageCount != 0 || extent->Previous != nullptr)
+                    return false;
+            }
+
+            for (const ReservationRecord* record = m_RecycledReservationRecords; record != nullptr; record = record->NextFree) {
+                if (!m_PermanentMetadata->Contains(record))
+                    return false;
+
+                if (record->Id != 0 || !record->Span.IsEmpty() || record->ReleaseExtent != nullptr || 
+                    record->Previous != nullptr || record->Next != nullptr)
+                    return false;
+            }
         }
 
         return true;

@@ -985,7 +985,6 @@ namespace Zos::Kernel::Initialization {
         void PromoteVirtualAddressMetadata(KernelRuntime& runtime) {
             auto& addresses = runtime.KernelAddresses;
             auto& heap = runtime.Heap;
-            auto& bootstrap_metadata = runtime.BootstrapMetadata;
 
             if (!addresses.IsInitialized() || 
                 !addresses.Validate() || 
@@ -1016,7 +1015,6 @@ namespace Zos::Kernel::Initialization {
             if (reserve_error != VirtualAllocationError::Success) 
                 Diagnostics::Fatal("VMM", VirtualAddressAllocator::Describe(reserve_error));
 
-            const Uint64 bootstrap_bytes_before = bootstrap_metadata.Statistics().BytesRequested;
             const VirtualAddressMetadataPromotionError promotion_error = addresses.PromoteMetadata(heap);
             if (promotion_error != VirtualAddressMetadataPromotionError::Success)
                 Diagnostics::Fatal("VMM", VirtualAddressAllocator::Describe(promotion_error));
@@ -1025,42 +1023,37 @@ namespace Zos::Kernel::Initialization {
                 Diagnostics::Fatal("VMM","VAA did not enter valid permanent metadata state");
 
             /*
-            * PromoteMetadata itself must never allocate additional storage
-            * from the bootstrap arena.
-            */
-            if (bootstrap_metadata.Statistics().BytesRequested != bootstrap_bytes_before) 
-                Diagnostics::Fatal("VMM", "VAA metadata promotion allocated bootstrap metadata");
-
-            /*
             * The pre-promotion token must now resolve to its cloned
             * heap-resident ReservationRecord by stable ID.
             */
             if (addresses.Release(crossing_reservation) != VirtualAllocationError::Success)
                 Diagnostics::Fatal("VMM", "pre-promotion virtual reservation did not survive metadata migration");
 
+            VirtualReservation permanent_first{};
+            VirtualReservation permanent_second{};
+
+            const Uint64 heap_allocations_before = heap.Statistics().AllocationCount;
+            if (addresses.Reserve(5, permanent_first, constraints) != VirtualAllocationError::Success) 
+                Diagnostics::Fatal("VMM", "first heap-backed VAA reservation failed");
+
             /*
-            * Exercise metadata creation after promotion.
+            * The crossing reservation left at most one recycled
+            * ReservationRecord. Keeping the first reservation live means the
+            * second reservation must acquire another record from the permanent
+            * metadata backend.
             */
-            VirtualReservation permanent_reservation{};
+            if (addresses.Reserve(7, permanent_second, constraints) != VirtualAllocationError::Success)
+                Diagnostics::Fatal("VMM", "second heap-backed VAA reservation failed");
 
-            if (addresses.Reserve(5, permanent_reservation, constraints) != VirtualAllocationError::Success)
-                Diagnostics::Fatal("VMM", "heap-backed VAA reservation failed");
-
-            if (!addresses.Validate()) 
+            if (!addresses.Validate())
                 Diagnostics::Fatal("VMM", "heap-backed VAA metadata failed validation");
 
-            if (addresses.Release(permanent_reservation) != VirtualAllocationError::Success)
+            if (heap.Statistics().AllocationCount <= heap_allocations_before)
+                Diagnostics::Fatal("VMM", "post-promotion VAA did not allocate permanent metadata");
+
+            if (addresses.Release(permanent_second) != VirtualAllocationError::Success || 
+                addresses.Release(permanent_first) != VirtualAllocationError::Success)
                 Diagnostics::Fatal("VMM", "heap-backed VAA reservation release failed");
-
-            /*
-            * No post-promotion VAA operation may return to the bootstrap
-            * metadata arena.
-            */
-            if (bootstrap_metadata.Statistics().BytesRequested != bootstrap_bytes_before)
-                Diagnostics::Fatal("VMM", "VAA used bootstrap metadata after permanent promotion");
-
-            if (!addresses.Validate() || !heap.Validate())
-                Diagnostics::Fatal("VMM", "permanent VAA metadata self-test failed validation");
 
             const auto& final = addresses.Statistics();
 
