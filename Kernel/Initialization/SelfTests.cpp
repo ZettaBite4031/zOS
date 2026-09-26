@@ -2,6 +2,8 @@
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 
+#include <Kernel/Memory/Layout.hpp>
+
 #include <Kernel/Runtime/New.hpp>
 
 namespace Zos::Kernel {
@@ -67,6 +69,8 @@ namespace Zos::Kernel {
         
         if (!kernel_addresses.Validate())
             Diagnostics::Fatal("VMM", "virtual address allocator failed initial validation");
+        if (!page_map.Validate())
+            Diagnostics::Fatal("VMM", "page map failed initial ownership validation");
             
         const VirtualAddressAllocatorStatistics virtual_baseline = kernel_addresses.Statistics();
         
@@ -165,6 +169,8 @@ namespace Zos::Kernel {
         if (page_map.Statistics().MappedPages != 0 ||
             page_map.Statistics().TablePages != 1) 
             Diagnostics::Fatal("VMM", "page-table cleanup did not return to root-only state");
+        if (!page_map.Validate())
+            Diagnostics::Fatal("VMM", "page map failed final ownership validation");
 
 
         Diagnostics::Write("[zOS/VMM] Reservation ownership, mapping, translation, W^X, null-guard, and release self-test passed.\n");
@@ -399,4 +405,76 @@ namespace Zos::Kernel {
 
         Diagnostics::Write("[zOS/Runtime] Scalar, array, aligned, and nothrow C++ allocation self-test passed.\n");
     }
+
+    void RunPermanentMemorySelfTest(KernelRuntime& runtime) noexcept {
+        using namespace Memory;
+        using namespace Architecture::AMD64;
+
+        PhysicalMemoryManager& physical_memory = runtime.PhysicalMemory;
+        VirtualAddressAllocator& virtual_addresses = runtime.KernelAddresses;
+        PageMap& page_map = runtime.KernelPageMap;
+        KernelHeap& heap = runtime.Heap;
+        BootstrapMetadataArena& bootstrap_metadata = runtime.BootstrapMetadata;
+
+        if (!bootstrap_metadata.IsRetired() || bootstrap_metadata.IsInitialized() || !physical_memory.IsInitialized() ||
+            !physical_memory.IsMetadataAccessPromoted() || !virtual_addresses.IsMetadataPromoted() || !page_map.IsMetadataPromoted() ||
+            !page_map.IsActive() || !heap.IsInitialized())
+            Diagnostics::Fatal("Memory", "permanent-memory self-test dependencies are invalid");
+
+        VirtualReservation reservation{};
+        if (virtual_addresses.Reserve(1, reservation) != VirtualAllocationError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement virtual reservation failed");
+        if (virtual_addresses.Release(reservation) != VirtualAllocationError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement virtual reservation release failed");
+
+        const VirtualAddress probe_virtual = Layout::KernelMmioBase;
+        if (page_map.IsMapped(probe_virtual)) Diagnostics::Fatal("Memory", "permanent PageMap probe address is already mapped");
+
+        PhysicalAllocation backing{};
+        if (physical_memory.AllocatePage(backing) != PhysicalAllocationError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement physical allocation failed");
+
+        const Uint64 table_pages_before = page_map.TablePageCount();
+        const MappingOptions options{
+            .Access = PageAccess::Read | PageAccess::Write | PageAccess::Global,
+            .Cache = CachePolicy::WriteBack,
+        };
+
+        const MappingError mapping_error = page_map.MapPage(probe_virtual, backing.Base(), options);
+        if (mapping_error != MappingError::Success) Diagnostics::Fatal("Memory", PageMap::Describe(mapping_error));
+        if (page_map.TablePageCount() <= table_pages_before)
+            Diagnostics::Fatal("Memory", "post-retirement mapping did not create permanent PageMap metadata");
+
+        const TranslationResult translation = page_map.Translate(probe_virtual);
+        if (!translation.Mapped || translation.Physical != backing.Base() || translation.Options.Access != options.Access || translation.Options.Cache != options.Cache)
+            Diagnostics::Fatal("Memory", "post-retirement PageMap translation failed");
+
+        const VirtualAddress direct = Layout::DirectMapAddress(backing.Base());
+        if (direct.IsNull()) Diagnostics::Fatal("Memory", "permanent PageMap probe backing is outside the direct map");
+
+        constexpr Uint64 ProbeValue{ 0x5A4F535045524D41ULL };
+        auto* mapped_pointer = reinterpret_cast<volatile Uint64*>(probe_virtual.Value());
+        auto* direct_pointer = reinterpret_cast<volatile Uint64*>(direct.Value());
+        *mapped_pointer = ProbeValue;
+        if (*direct_pointer != ProbeValue) Diagnostics::Fatal("Memory", "post-retirement PageMap hardware alias test failed");
+
+        if (page_map.UnmapPage(probe_virtual) != MappingError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement PageMap unmap failed");
+        if (page_map.TablePageCount() != table_pages_before)
+            Diagnostics::Fatal("Memory", "post-retirement PageMap table accounting did not return to baseline");
+        if (physical_memory.Release(backing) != PhysicalAllocationError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement physical release failed");
+
+        void* heap_probe = nullptr;
+        if (heap.Allocate(256, heap_probe) != KernelHeapError::Success || heap_probe == nullptr)
+            Diagnostics::Fatal("Memory", "post-retirement heap allocation failed");
+        if (heap.Free(heap_probe) != KernelHeapError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement heap release failed");
+
+        if (!virtual_addresses.Validate() || !page_map.Validate() || !heap.Validate())
+            Diagnostics::Fatal("Memory", "permanent memory infrastructure failed final validation");
+
+        Diagnostics::Write("[zOS/Memory] Permanent PMM, VAA, PageMap, and heap self-test passed.\n");
+    }
+
 }

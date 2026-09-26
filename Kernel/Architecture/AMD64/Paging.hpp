@@ -1,6 +1,7 @@
 #pragma once
 
-#include <Kernel/Memory/VirtualAddressAllocator.hpp>
+#include <Kernel/Memory/BootstrapMetadata.hpp>
+#include <Kernel/Memory/Layout.hpp>
 
 namespace Zos::Kernel::Architecture::AMD64 {
     enum class PageMapInitializationError : Memory::Uint32 {
@@ -23,6 +24,17 @@ namespace Zos::Kernel::Architecture::AMD64 {
         DirectMapUnavailable,
         ProtectionEnableFailed,
         RootTableMismatch,
+    };
+
+    enum class PageMapMetadataPromotionError : Memory::Uint32 {
+        Success,
+        NotInitialized,
+        AlreadyPromoted,
+        InvalidDependency,
+        CorruptState,
+        AllocationFailed,
+        ValidationFailed,
+        RollbackFailed,
     };
 
     enum class MappingError : Memory::Uint32 {
@@ -58,31 +70,31 @@ namespace Zos::Kernel::Architecture::AMD64 {
         PageMap& operator=(const PageMap&) = delete;
 
         [[nodiscard]] PageMapInitializationError Initialize(Memory::PhysicalMemoryManager& physical_memory, Memory::BootstrapMetadataArena& metadata) noexcept;
-
         [[nodiscard]] PageMapActivationError Activate() noexcept;
+        [[nodiscard]] PageMapMetadataPromotionError PromoteMetadata() noexcept;
 
         [[nodiscard]] MappingError MapPage(Memory::VirtualAddress virt_addr, Memory::PhysicalAddress phys_addr, Memory::MappingOptions options) noexcept;
-        [[nodiscard]] MappingError MapRange(Memory::VirtualAddress virt_addr, Memory::PhysicalAddress phys_addr, Memory::Uint64 page_count, Memory::MappingOptions) noexcept;
-
+        [[nodiscard]] MappingError MapRange(Memory::VirtualAddress virt_addr, Memory::PhysicalAddress phys_addr, Memory::Uint64 page_count, Memory::MappingOptions options) noexcept;
         [[nodiscard]] MappingError UnmapPage(Memory::VirtualAddress virt_addr) noexcept;
 
         [[nodiscard]] TranslationResult Translate(Memory::VirtualAddress virt_addr) const noexcept;
         [[nodiscard]] bool IsMapped(Memory::VirtualAddress virt_addr) const noexcept;
+        [[nodiscard]] bool Validate() const noexcept;
 
         [[nodiscard]] bool IsInitialized() const noexcept { return !m_RootTable.IsNull(); }
         [[nodiscard]] bool IsActive() const noexcept { return m_Active; }
+        [[nodiscard]] bool IsMetadataPromoted() const noexcept { return m_MetadataPromoted; }
         [[nodiscard]] Memory::PhysicalAddress RootTable() const noexcept { return m_RootTable; }
         [[nodiscard]] const PageMapStatistics& Statistics() const noexcept { return m_Statistics; }
         [[nodiscard]] Memory::Uint64 TablePageCount() const noexcept { return m_Statistics.TablePages; }
 
         [[nodiscard]] Memory::PhysicalAddress TablePage(Memory::Uint64 index) const noexcept;
-
         [[nodiscard]] static Memory::PhysicalAddress CurrentRootTable() noexcept;
-
         [[nodiscard]] static bool IsCanonical(Memory::VirtualAddress address) noexcept;
 
         [[nodiscard]] static const char* Describe(PageMapInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(PageMapActivationError error) noexcept;
+        [[nodiscard]] static const char* Describe(PageMapMetadataPromotionError error) noexcept;
         [[nodiscard]] static const char* Describe(MappingError error) noexcept;
 
     private:
@@ -97,7 +109,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         enum EntryFlag : Memory::Uint64 {
             Present = 1ULL << 0,
             Writable = 1ULL << 1,
-            User = 1ULL << 2, 
+            User = 1ULL << 2,
             PageWriteThrough = 1ULL << 3,
             PageCacheDisable = 1ULL << 4,
             Accessed = 1ULL << 5,
@@ -109,15 +121,32 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         struct TableRecord final {
             Memory::PhysicalAddress Address{};
-            Memory::PhysicalAllocation* Ownership{};
+            Memory::PhysicalAllocation Ownership{};
             TableRecord* Previous{};
             TableRecord* Next{};
             TableRecord* NextFree{};
         };
 
+        struct MetadataPage final {
+            Memory::PhysicalAllocation Ownership{};
+            MetadataPage* Next{};
+            Memory::Uint64 UsedRecords{};
+        };
+
+        struct MetadataPool final {
+            MetadataPage* Head{};
+            MetadataPage* Tail{};
+        };
+
+        inline static constexpr Memory::Uint64 MetadataRecordsOffset{ (sizeof(MetadataPage) + alignof(TableRecord) - 1) & ~(static_cast<Memory::Uint64>(alignof(TableRecord)) - 1) };
+        inline static constexpr Memory::Uint64 MetadataRecordsPerPage{ (Memory::PageSize - MetadataRecordsOffset) / sizeof(TableRecord) };
+
+        static_assert(MetadataRecordsOffset < Memory::PageSize);
+        static_assert(MetadataRecordsPerPage != 0);
+
         struct TableResolution final {
             Entry* ParentEntry{};
-            Entry OriginalEntry;
+            Entry OriginalEntry{};
             Memory::PhysicalAddress Address{};
             bool Created{};
             bool Modified{};
@@ -135,6 +164,14 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] static bool TableIsEmpty(const Entry* table) noexcept;
         static void InvalidatePage(Memory::VirtualAddress address) noexcept;
 
+        [[nodiscard]] static bool MoveOwnership(Memory::PhysicalAllocation& destination, Memory::PhysicalAllocation& source) noexcept;
+        [[nodiscard]] static TableRecord* MetadataRecordAt(MetadataPage& page, Memory::Uint64 index) noexcept;
+        [[nodiscard]] static const TableRecord* MetadataRecordAt(const MetadataPage& page, Memory::Uint64 index) noexcept;
+        [[nodiscard]] bool AllocateMetadataPage(MetadataPool& pool) noexcept;
+        [[nodiscard]] TableRecord* AllocatePermanentTableRecord(MetadataPool& pool) noexcept;
+        [[nodiscard]] bool DestroyMetadataPool(MetadataPool& pool) noexcept;
+        [[nodiscard]] bool PermanentMetadataContains(const TableRecord* record) const noexcept;
+
         [[nodiscard]] Entry* TablePointer(Memory::PhysicalAddress address) const noexcept;
         [[nodiscard]] PageMapInitializationError AllocateTable(Memory::PhysicalAddress& output) noexcept;
         [[nodiscard]] MappingError AllocateTableForMapping(Memory::PhysicalAddress& output) noexcept;
@@ -142,18 +179,20 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] TableRecord* FindTableRecord(Memory::PhysicalAddress address) noexcept;
         [[nodiscard]] const TableRecord* FindTableRecord(Memory::PhysicalAddress address) const noexcept;
         [[nodiscard]] bool ReleaseTable(Memory::PhysicalAddress address) noexcept;
-        [[nodiscard]] MappingError ResolveNextTable(Entry* table, Memory::Uint64 index, bool userMapping, TableResolution& output) noexcept;
+        [[nodiscard]] MappingError ResolveNextTable(Entry* table, Memory::Uint64 index, bool user_mapping, TableResolution& output) noexcept;
         [[nodiscard]] const Entry* ResolveExistingNextTable(const Entry* table, Memory::Uint64 index, MappingError& error) const noexcept;
         [[nodiscard]] Entry* ResolveExistingNextTable(Entry* table, Memory::Uint64 index, MappingError& error) noexcept;
         [[nodiscard]] bool RollbackResolution(TableResolution& resolution) noexcept;
         void RecycleTableRecord(TableRecord& record) noexcept;
 
         bool m_Active{};
+        bool m_MetadataPromoted{};
         Memory::PhysicalMemoryManager* m_PhysicalMemory{};
-        Memory::BootstrapMetadataArena* m_Metadata{};
+        Memory::BootstrapMetadataArena* m_BootstrapMetadata{};
         Memory::PhysicalAddress m_RootTable{};
         TableRecord* m_TableRecords{};
         TableRecord* m_RecycledTableRecords{};
+        MetadataPool m_PermanentMetadata{};
         PageMapStatistics m_Statistics{};
     };
 }

@@ -1,5 +1,7 @@
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 
+#include <Kernel/Runtime/New.hpp>
+
 extern "C" void* memset(void* dst, int v, unsigned long long n) noexcept;
 
 namespace Zos::Kernel::Architecture::AMD64 {
@@ -233,6 +235,107 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return reinterpret_cast<Entry*>(Layout::DirectMapAddress(address).Value());
     }
 
+
+    bool PageMap::MoveOwnership(PhysicalAllocation& destination, PhysicalAllocation& source) noexcept {
+        if (destination.IsValid() || !source.IsValid()) return false;
+        destination.~PhysicalAllocation();
+        new (&destination) PhysicalAllocation(static_cast<PhysicalAllocation&&>(source));
+        return destination.IsValid() && !source.IsValid();
+    }
+
+    PageMap::TableRecord* PageMap::MetadataRecordAt(MetadataPage& page, Uint64 index) noexcept {
+        if (index >= MetadataRecordsPerPage) return nullptr;
+        auto* storage = reinterpret_cast<Uint8*>(&page) + MetadataRecordsOffset;
+        return reinterpret_cast<TableRecord*>(storage) + index;
+    }
+
+    const PageMap::TableRecord* PageMap::MetadataRecordAt(const MetadataPage& page, Uint64 index) noexcept {
+        if (index >= MetadataRecordsPerPage) return nullptr;
+        const auto* storage = reinterpret_cast<const Uint8*>(&page) + MetadataRecordsOffset;
+        return reinterpret_cast<const TableRecord*>(storage) + index;
+    }
+
+    bool PageMap::AllocateMetadataPage(MetadataPool& pool) noexcept {
+        if (!m_Active || m_PhysicalMemory == nullptr || !m_PhysicalMemory->IsInitialized() || !m_PhysicalMemory->IsMetadataAccessPromoted()) return false;
+
+        PhysicalAllocation allocation{};
+        if (m_PhysicalMemory->AllocatePage(allocation) != PhysicalAllocationError::Success) return false;
+
+        if (!Layout::IsDirectMappable(allocation.Base())) {
+            (void)m_PhysicalMemory->Release(allocation);
+            return false;
+        }
+
+        const VirtualAddress direct = Layout::DirectMapAddress(allocation.Base());
+        if (direct.IsNull()) {
+            (void)m_PhysicalMemory->Release(allocation);
+            return false;
+        }
+
+        auto* page = reinterpret_cast<MetadataPage*>(direct.Value());
+        memset(static_cast<void*>(page), 0, PageSize);
+        new (page) MetadataPage{};
+
+        if (!MoveOwnership(page->Ownership, allocation)) {
+            if (allocation.IsValid()) (void)m_PhysicalMemory->Release(allocation);
+            return false;
+        }
+
+        if (pool.Tail != nullptr) pool.Tail->Next = page;
+        else pool.Head = page;
+        pool.Tail = page;
+        return true;
+    }
+
+    PageMap::TableRecord* PageMap::AllocatePermanentTableRecord(MetadataPool& pool) noexcept {
+        MetadataPage* page = pool.Tail;
+        if (page == nullptr || page->UsedRecords >= MetadataRecordsPerPage) {
+            if (!AllocateMetadataPage(pool)) return nullptr;
+            page = pool.Tail;
+        }
+
+        if (page == nullptr || page->UsedRecords >= MetadataRecordsPerPage) return nullptr;
+        TableRecord* record = MetadataRecordAt(*page, page->UsedRecords);
+        if (record == nullptr) return nullptr;
+
+        new (record) TableRecord{};
+        page->UsedRecords++;
+        return record;
+    }
+
+    bool PageMap::DestroyMetadataPool(MetadataPool& pool) noexcept {
+        for (MetadataPage* page = pool.Head; page != nullptr; page = page->Next) {
+            if (page->UsedRecords > MetadataRecordsPerPage) return false;
+            for (Uint64 i = 0; i < page->UsedRecords; i++) {
+                TableRecord* record = MetadataRecordAt(*page, i);
+                if (record == nullptr || record->Ownership.IsValid()) return false;
+            }
+        }
+
+        MetadataPage* page = pool.Head;
+        while (page != nullptr) {
+            MetadataPage* next = page->Next;
+            if (!page->Ownership.IsValid() || page->Ownership.PageCount() != 1) return false;
+
+            PhysicalAllocation ownership(static_cast<PhysicalAllocation&&>(page->Ownership));
+            if (m_PhysicalMemory->Release(ownership) != PhysicalAllocationError::Success) return false;
+            page = next;
+        }
+
+        pool = {};
+        return true;
+    }
+
+    bool PageMap::PermanentMetadataContains(const TableRecord* record) const noexcept {
+        if (record == nullptr) return false;
+        for (const MetadataPage* page = m_PermanentMetadata.Head; page != nullptr; page = page->Next) {
+            if (page->UsedRecords > MetadataRecordsPerPage) return false;
+            for (Uint64 i = 0; i < page->UsedRecords; i++)
+                if (MetadataRecordAt(*page, i) == record) return true;
+        }
+        return false;
+    }
+
     PageMap::TableRecord* PageMap::FindTableRecord(PhysicalAddress address) noexcept {
         for (TableRecord* record = m_TableRecords; record != nullptr; record = record->Next) 
             if (record->Address == address) return record;
@@ -262,30 +365,35 @@ namespace Zos::Kernel::Architecture::AMD64 {
         }
 
         memset(table, 0, PageSize);
-        const PhysicalAddress address = allocation.Base();
-
-        PhysicalAllocation* ownership = m_Metadata->Retain(static_cast<PhysicalAllocation&&>(allocation));
-        if (ownership == nullptr) {
+        TableRecord* record = AcquireTableRecord();
+        if (record == nullptr) {
             (void)m_PhysicalMemory->Release(allocation);
             return PageMapInitializationError::MetadataAllocationFailed;
         }
 
-        TableRecord* record = AcquireTableRecord();
-        if (record == nullptr) {
-            (void)m_PhysicalMemory->Release(*ownership);
+        if (record->Ownership.IsValid()) {
+            (void)m_PhysicalMemory->Release(allocation);
             return PageMapInitializationError::MetadataAllocationFailed;
         }
+
+        const PhysicalAddress address = allocation.Base();
+        if (!MoveOwnership(record->Ownership, allocation)) {
+            RecycleTableRecord(*record);
+            if (allocation.IsValid()) (void)m_PhysicalMemory->Release(allocation);
+            return PageMapInitializationError::MetadataAllocationFailed;
+        }
+
         record->Address = address;
-        record->Ownership = ownership;
         record->Previous = nullptr;
         record->Next = m_TableRecords;
+        record->NextFree = nullptr;
         if (m_TableRecords != nullptr) m_TableRecords->Previous = record;
         m_TableRecords = record;
 
         output = address;
         m_Statistics.TablePages++;
         return PageMapInitializationError::Success;
-    }    
+    }
 
     MappingError PageMap::AllocateTableForMapping(PhysicalAddress& output) noexcept {
         const PageMapInitializationError error = AllocateTable(output);
@@ -300,51 +408,56 @@ namespace Zos::Kernel::Architecture::AMD64 {
     PageMap::TableRecord* PageMap::AcquireTableRecord() noexcept {
         if (m_RecycledTableRecords != nullptr) {
             TableRecord* record = m_RecycledTableRecords;
+            if (record->Ownership.IsValid()) return nullptr;
+
             m_RecycledTableRecords = record->NextFree;
-            *record = {};
+            record->Address = {};
+            record->Previous = nullptr;
+            record->Next = nullptr;
+            record->NextFree = nullptr;
             return record;
         }
 
-        void* storage = m_Metadata->Allocate(sizeof(TableRecord), alignof(TableRecord));
-        if (storage == nullptr) return nullptr;
+        if (m_MetadataPromoted) return AllocatePermanentTableRecord(m_PermanentMetadata);
+        if (m_BootstrapMetadata == nullptr || !m_BootstrapMetadata->IsInitialized()) return nullptr;
 
-        auto* record = static_cast<TableRecord*>(storage);
-        *record = {};
-        return record;
+        void* storage = m_BootstrapMetadata->Allocate(sizeof(TableRecord), alignof(TableRecord));
+        if (storage == nullptr) return nullptr;
+        return new (storage) TableRecord{};
     }
 
     bool PageMap::ReleaseTable(PhysicalAddress address) noexcept {
         if (address == m_RootTable) return false;
 
         TableRecord* record = FindTableRecord(address);
-        if (record == nullptr || record->Ownership == nullptr || !record->Ownership->IsValid()) return false;
-        if (m_PhysicalMemory->Release(*record->Ownership) != PhysicalAllocationError::Success) return false;
+        if (record == nullptr || record->Address != address || !record->Ownership.IsValid() || record->Ownership.Base() != address || record->Ownership.PageCount() != 1)
+            return false;
+
+        if (m_PhysicalMemory->Release(record->Ownership) != PhysicalAllocationError::Success) return false;
 
         if (record->Previous != nullptr) record->Previous->Next = record->Next;
         else m_TableRecords = record->Next;
-
         if (record->Next != nullptr) record->Next->Previous = record->Previous;
 
         RecycleTableRecord(*record);
-
         if (m_Statistics.TablePages != 0) m_Statistics.TablePages--;
-
         return true;
     }
 
     PageMapInitializationError PageMap::Initialize(PhysicalMemoryManager& physical_memory, BootstrapMetadataArena& metadata) noexcept {
         if (IsInitialized()) return PageMapInitializationError::AlreadyInitialized;
-        if (!physical_memory.IsInitialized() || !metadata.IsInitialized()) 
-            return PageMapInitializationError::InvalidDependency;
+        if (!physical_memory.IsInitialized() || !metadata.IsInitialized()) return PageMapInitializationError::InvalidDependency;
 
         m_PhysicalMemory = &physical_memory;
-        m_Metadata = &metadata;
+        m_BootstrapMetadata = &metadata;
+        m_MetadataPromoted = false;
+        m_PermanentMetadata = {};
 
         PhysicalAddress root{};
         const PageMapInitializationError error = AllocateTable(root);
         if (error != PageMapInitializationError::Success) {
             m_PhysicalMemory = nullptr;
-            m_Metadata = nullptr;
+            m_BootstrapMetadata = nullptr;
             return error;
         }
 
@@ -378,8 +491,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
          * The metadata arena also changes its
          * physical-pointer conversion after CR3.
          */
-        for (Uint64 i = 0; i < m_Metadata->BackingPageCount(); i++) {
-            const PhysicalAddress physical = m_Metadata->BackingPage(i);
+        for (Uint64 i = 0; i < m_BootstrapMetadata->BackingPageCount(); i++) {
+            const PhysicalAddress physical = m_BootstrapMetadata->BackingPage(i);
             if (!Layout::IsDirectMappable(physical)) return PageMapActivationError::DirectMapUnavailable;
 
             const TranslationResult translation = Translate(Layout::DirectMapAddress(physical));
@@ -425,11 +538,74 @@ namespace Zos::Kernel::Architecture::AMD64 {
          */
         m_Active = true;
 
-        m_Metadata->EnableDirectMapAccess();
+        m_BootstrapMetadata->EnableDirectMapAccess();
 
         if (CurrentRootTable() != m_RootTable)
             return PageMapActivationError::RootTableMismatch;
         return PageMapActivationError::Success;
+    }
+
+    PageMapMetadataPromotionError PageMap::PromoteMetadata() noexcept {
+        if (!IsInitialized()) return PageMapMetadataPromotionError::NotInitialized;
+        if (m_MetadataPromoted) return PageMapMetadataPromotionError::AlreadyPromoted;
+        if (!m_Active || m_PhysicalMemory == nullptr || !m_PhysicalMemory->IsInitialized() || !m_PhysicalMemory->IsMetadataAccessPromoted() ||
+            m_BootstrapMetadata == nullptr || !m_BootstrapMetadata->IsInitialized())
+            return PageMapMetadataPromotionError::InvalidDependency;
+        if (!Validate()) return PageMapMetadataPromotionError::CorruptState;
+
+        MetadataPool candidate_pool{};
+        TableRecord* candidate_head = nullptr;
+        TableRecord* candidate_tail = nullptr;
+
+        for (const TableRecord* old = m_TableRecords; old != nullptr; old = old->Next) {
+            TableRecord* candidate = AllocatePermanentTableRecord(candidate_pool);
+            if (candidate == nullptr) {
+                if (!DestroyMetadataPool(candidate_pool)) return PageMapMetadataPromotionError::RollbackFailed;
+                return PageMapMetadataPromotionError::AllocationFailed;
+            }
+
+            candidate->Address = old->Address;
+            candidate->Previous = candidate_tail;
+            candidate->Next = nullptr;
+            candidate->NextFree = nullptr;
+            if (candidate_tail != nullptr) candidate_tail->Next = candidate;
+            else candidate_head = candidate;
+            candidate_tail = candidate;
+        }
+
+        const TableRecord* old_probe = m_TableRecords;
+        const TableRecord* candidate_probe = candidate_head;
+        while (old_probe != nullptr && candidate_probe != nullptr) {
+            if (!old_probe->Ownership.IsValid() || old_probe->Ownership.Base() != old_probe->Address || old_probe->Ownership.PageCount() != 1 || candidate_probe->Ownership.IsValid()) {
+                if (!DestroyMetadataPool(candidate_pool)) return PageMapMetadataPromotionError::RollbackFailed;
+                return PageMapMetadataPromotionError::CorruptState;
+            }
+            old_probe = old_probe->Next;
+            candidate_probe = candidate_probe->Next;
+        }
+
+        if (old_probe != nullptr || candidate_probe != nullptr) {
+            if (!DestroyMetadataPool(candidate_pool)) return PageMapMetadataPromotionError::RollbackFailed;
+            return PageMapMetadataPromotionError::CorruptState;
+        }
+
+        TableRecord* old = m_TableRecords;
+        TableRecord* candidate = candidate_head;
+        while (old != nullptr) {
+            if (!MoveOwnership(candidate->Ownership, old->Ownership)) return PageMapMetadataPromotionError::CorruptState;
+            old = old->Next;
+            candidate = candidate->Next;
+        }
+
+        m_TableRecords = candidate_head;
+        m_RecycledTableRecords = nullptr;
+        m_PermanentMetadata = candidate_pool;
+        candidate_pool = {};
+        m_BootstrapMetadata = nullptr;
+        m_MetadataPromoted = true;
+
+        if (!Validate()) return PageMapMetadataPromotionError::ValidationFailed;
+        return PageMapMetadataPromotionError::Success;
     }
 
     MappingError PageMap::ResolveNextTable(Entry* table, Uint64 index, bool user_mapping, TableResolution& output) noexcept {
@@ -549,12 +725,9 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
     void PageMap::RecycleTableRecord(TableRecord& record) noexcept {
         record.Address = {};
-        record.Ownership = nullptr;
         record.Previous = nullptr;
         record.Next = nullptr;
-
         record.NextFree = m_RecycledTableRecords;
-
         m_RecycledTableRecords = &record;
     }
 
@@ -715,6 +888,95 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return Translate(virt_addr).Mapped;
     }
 
+    bool PageMap::Validate() const noexcept {
+        if (!IsInitialized() || m_PhysicalMemory == nullptr || !m_PhysicalMemory->IsInitialized() || m_RootTable.IsNull() || !m_RootTable.IsPageAligned() ||
+            (m_RootTable.Value() & ~AddressMask) != 0)
+            return false;
+
+        if (m_Active && CurrentRootTable() != m_RootTable) return false;
+
+        if (m_MetadataPromoted) {
+            if (m_BootstrapMetadata != nullptr || m_PermanentMetadata.Head == nullptr || m_PermanentMetadata.Tail == nullptr) return false;
+        } else {
+            if (m_BootstrapMetadata == nullptr || !m_BootstrapMetadata->IsInitialized() || m_PermanentMetadata.Head != nullptr || m_PermanentMetadata.Tail != nullptr) return false;
+        }
+
+        const TableRecord* slow = m_TableRecords;
+        const TableRecord* fast = m_TableRecords;
+        while (fast != nullptr && fast->Next != nullptr) {
+            slow = slow->Next;
+            fast = fast->Next->Next;
+            if (slow == fast) return false;
+        }
+
+        slow = m_RecycledTableRecords;
+        fast = m_RecycledTableRecords;
+        while (fast != nullptr && fast->NextFree != nullptr) {
+            slow = slow->NextFree;
+            fast = fast->NextFree->NextFree;
+            if (slow == fast) return false;
+        }
+
+        Uint64 active_records = 0;
+        bool root_found = false;
+        const TableRecord* previous = nullptr;
+
+        for (const TableRecord* record = m_TableRecords; record != nullptr; record = record->Next) {
+            if (record->Previous != previous || record->Address.IsNull() || !record->Address.IsPageAligned() || (record->Address.Value() & ~AddressMask) != 0 ||
+                !record->Ownership.IsValid() || record->Ownership.Base() != record->Address || record->Ownership.PageCount() != 1)
+                return false;
+
+            if (m_MetadataPromoted && !PermanentMetadataContains(record)) return false;
+            if (record->Address == m_RootTable) root_found = true;
+
+            for (const TableRecord* other = record->Next; other != nullptr; other = other->Next)
+                if (other->Address == record->Address) return false;
+
+            previous = record;
+            if (active_records == MaximumValue) return false;
+            active_records++;
+        }
+
+        if (!root_found || active_records != m_Statistics.TablePages) return false;
+
+        Uint64 recycled_records = 0;
+        for (const TableRecord* record = m_RecycledTableRecords; record != nullptr; record = record->NextFree) {
+            if (!record->Address.IsNull() || record->Ownership.IsValid() || record->Previous != nullptr || record->Next != nullptr) return false;
+            if (m_MetadataPromoted && !PermanentMetadataContains(record)) return false;
+
+            for (const TableRecord* active = m_TableRecords; active != nullptr; active = active->Next)
+                if (active == record) return false;
+
+            if (recycled_records == MaximumValue) return false;
+            recycled_records++;
+        }
+
+        if (!m_MetadataPromoted) return true;
+
+        const MetadataPage* slow_page = m_PermanentMetadata.Head;
+        const MetadataPage* fast_page = m_PermanentMetadata.Head;
+        while (fast_page != nullptr && fast_page->Next != nullptr) {
+            slow_page = slow_page->Next;
+            fast_page = fast_page->Next->Next;
+            if (slow_page == fast_page) return false;
+        }
+
+        Uint64 used_records = 0;
+        const MetadataPage* last = nullptr;
+        for (const MetadataPage* page = m_PermanentMetadata.Head; page != nullptr; page = page->Next) {
+            if (!page->Ownership.IsValid() || page->Ownership.PageCount() != 1 || !Layout::IsDirectMappable(page->Ownership.Base()) ||
+                Layout::DirectMapAddress(page->Ownership.Base()).Value() != reinterpret_cast<Uint64>(page) || page->UsedRecords > MetadataRecordsPerPage)
+                return false;
+
+            if (used_records > MaximumValue - page->UsedRecords) return false;
+            used_records += page->UsedRecords;
+            last = page;
+        }
+
+        if (last != m_PermanentMetadata.Tail || active_records > MaximumValue - recycled_records) return false;
+        return used_records == active_records + recycled_records;
+    }
+
     const char* PageMap::Describe(PageMapInitializationError error) noexcept {
         switch (error) {
         case PageMapInitializationError::Success: return "success";
@@ -724,6 +986,20 @@ namespace Zos::Kernel::Architecture::AMD64 {
         case PageMapInitializationError::MetadataAllocationFailed: return "failed to retain page-table ownership metadata";
         case PageMapInitializationError::PhysicalAddressUnsupported: return "page-table physical address cannot be encoded";
         default: return "unknown page map initialization error";
+        }
+    }
+
+    const char* PageMap::Describe(PageMapMetadataPromotionError error) noexcept {
+        switch (error) {
+        case PageMapMetadataPromotionError::Success: return "success";
+        case PageMapMetadataPromotionError::NotInitialized: return "page map is not initialized";
+        case PageMapMetadataPromotionError::AlreadyPromoted: return "page-map metadata is already permanent";
+        case PageMapMetadataPromotionError::InvalidDependency: return "page-map metadata promotion dependency is invalid";
+        case PageMapMetadataPromotionError::CorruptState: return "page-map ownership state is corrupt";
+        case PageMapMetadataPromotionError::AllocationFailed: return "failed to allocate permanent page-map metadata";
+        case PageMapMetadataPromotionError::ValidationFailed: return "permanent page-map metadata failed validation";
+        case PageMapMetadataPromotionError::RollbackFailed: return "failed to release candidate page-map metadata";
+        default: return "unknown page-map metadata promotion error";
         }
     }
 

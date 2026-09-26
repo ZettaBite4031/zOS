@@ -14,6 +14,7 @@ namespace Zos::Kernel {
     void RunBootMemoryReclamationSelfTest(KernelRuntime& runtime) noexcept;
     void RunKernelHeapSelfTest(KernelRuntime& runtime) noexcept;
     void RunCxxAllocationSelfTest(KernelRuntime& runtime) noexcept;
+    void RunPermanentMemorySelfTest(KernelRuntime& runtime) noexcept;
 }
 
 namespace Zos::Kernel::Initialization {
@@ -642,6 +643,112 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/VMM] VAA metadata promoted to permanent kernel heap.\n");
             Diagnostics::Write("[zOS/VMM] Reservation continuity and permanent-metadata self-test passed.\n");
         }
+
+        void PromotePageMapMetadata(KernelRuntime& runtime) noexcept {
+            PageMap& page_map = runtime.KernelPageMap;
+            BootstrapMetadataArena& bootstrap_metadata = runtime.BootstrapMetadata;
+
+            if (!page_map.IsInitialized() || !page_map.IsActive() || !page_map.Validate())
+                Diagnostics::Fatal("VMM", "PageMap metadata promotion dependencies are invalid");
+            if (page_map.IsMetadataPromoted()) Diagnostics::Fatal("VMM", "PageMap metadata was promoted more than once");
+
+            const PhysicalAddress root_before = page_map.RootTable();
+            const PhysicalAddress cr3_before = PageMap::CurrentRootTable();
+            const PageMapStatistics statistics_before = page_map.Statistics();
+            const Uint64 bootstrap_bytes_before = bootstrap_metadata.Statistics().BytesRequested;
+
+            const PageMapMetadataPromotionError error = page_map.PromoteMetadata();
+            if (error != PageMapMetadataPromotionError::Success) Diagnostics::Fatal("VMM", PageMap::Describe(error));
+            if (!page_map.IsMetadataPromoted() || !page_map.Validate())
+                Diagnostics::Fatal("VMM", "PageMap did not enter valid permanent metadata state");
+
+            if (page_map.RootTable() != root_before || PageMap::CurrentRootTable() != cr3_before ||
+                page_map.Statistics().TablePages != statistics_before.TablePages || page_map.Statistics().MappedPages != statistics_before.MappedPages)
+                Diagnostics::Fatal("VMM", "PageMap topology changed during metadata promotion");
+
+            if (bootstrap_metadata.Statistics().BytesRequested != bootstrap_bytes_before)
+                Diagnostics::Fatal("VMM", "PageMap promotion allocated bootstrap metadata");
+
+            Diagnostics::Write("[zOS/VMM] PageMap metadata promoted to permanent storage.\n");
+        }
+
+        void RetireBootstrapMetadataIdentityMappings(KernelRuntime& runtime) noexcept {
+            BootstrapMetadataArena& arena = runtime.BootstrapMetadata;
+            PageMap& page_map = runtime.KernelPageMap;
+
+            if (!arena.IsInitialized() || !arena.UsesDirectMapAccess() || !page_map.IsActive() || !page_map.IsMetadataPromoted())
+                Diagnostics::Fatal("VMM", "bootstrap metadata mapping retirement dependencies are invalid");
+
+            const Uint64 page_count = arena.BackingPageCount();
+            if (page_count == 0) Diagnostics::Fatal("VMM", "bootstrap metadata arena has no backing pages");
+
+            for (Uint64 i = 0; i < page_count; i++) {
+                const PhysicalAddress physical = arena.BackingPage(i);
+                if (physical.IsNull()) Diagnostics::Fatal("VMM", "bootstrap metadata backing chain is invalid");
+
+                const VirtualAddress direct = Layout::DirectMapAddress(physical);
+                if (direct.IsNull()) Diagnostics::Fatal("VMM", "bootstrap metadata lies outside the direct map");
+
+                const TranslationResult direct_before = page_map.Translate(direct);
+                if (!direct_before.Mapped || direct_before.Physical != physical)
+                    Diagnostics::Fatal("VMM", "bootstrap metadata lost direct-map coverage");
+
+                const VirtualAddress identity{ physical.Value() };
+                const TranslationResult identity_before = page_map.Translate(identity);
+                if (identity_before.Mapped) {
+                    if (identity_before.Physical != physical)
+                        Diagnostics::Fatal("VMM", "bootstrap metadata identity alias maps the wrong physical page");
+
+                    const MappingError error = page_map.UnmapPage(identity);
+                    if (error != MappingError::Success) Diagnostics::Fatal("VMM", PageMap::Describe(error));
+                    if (page_map.IsMapped(identity)) Diagnostics::Fatal("VMM", "bootstrap metadata identity alias survived retirement");
+                }
+
+                const TranslationResult direct_after = page_map.Translate(direct);
+                if (!direct_after.Mapped || direct_after.Physical != physical)
+                    Diagnostics::Fatal("VMM", "bootstrap metadata lost direct-map coverage during identity retirement");
+            }
+
+            Diagnostics::Write("[zOS/VMM] Bootstrap metadata identity aliases retired.\n");
+        }
+
+        void RetireBootstrapMetadata(KernelRuntime& runtime) noexcept {
+            BootstrapMetadataArena& arena = runtime.BootstrapMetadata;
+            PhysicalMemoryManager& physical_memory = runtime.PhysicalMemory;
+
+            if (!runtime.KernelAddresses.IsMetadataPromoted() || !runtime.KernelPageMap.IsMetadataPromoted())
+                Diagnostics::Fatal("VMM", "bootstrap metadata still has permanent consumers");
+            if (!arena.IsInitialized() || arena.IsRetired())
+                Diagnostics::Fatal("VMM", "bootstrap metadata arena is not in a retireable state");
+
+            RetireBootstrapMetadataIdentityMappings(runtime);
+
+            const PhysicalMemoryStatistics before = physical_memory.Statistics();
+            const Uint64 expected_pages = arena.BackingPageCount();
+            if (expected_pages == 0 || before.AllocatedPages < expected_pages || before.FreePages > MaximumValue - expected_pages)
+                Diagnostics::Fatal("Memory", "bootstrap metadata retirement accounting preflight failed");
+
+            MetadataArenaRetirementResult result{};
+            const MetadataArenaRetirementError error = arena.Retire(result);
+            if (error != MetadataArenaRetirementError::Success) Diagnostics::Fatal("Memory", BootstrapMetadataArena::Describe(error));
+
+            const PhysicalMemoryStatistics after = physical_memory.Statistics();
+            if (result.ReleasedPages != expected_pages || after.FreePages != before.FreePages + expected_pages ||
+                after.AllocatedPages != before.AllocatedPages - expected_pages || after.ManagedPages != before.ManagedPages ||
+                after.ConventionalPages != before.ConventionalPages || after.DeferredBootPages != before.DeferredBootPages ||
+                after.DeferredAcpiPages != before.DeferredAcpiPages || after.MetadataBytes != before.MetadataBytes ||
+                after.ManagedRegionCount != before.ManagedRegionCount || after.ReservedPages() != before.ReservedPages())
+                Diagnostics::Fatal("Memory", "bootstrap metadata retirement accounting invariant failed");
+
+            if (!arena.IsRetired() || arena.IsInitialized() || arena.BackingPageCount() != 0)
+                Diagnostics::Fatal("Memory", "bootstrap metadata arena did not enter retired state");
+
+            Diagnostics::Write("[zOS/VMM] Bootstrap metadata arena retired: ");
+            Diagnostics::WriteDecimal(result.ReleasedPages);
+            Diagnostics::Write(" pages (");
+            Diagnostics::WriteDecimal(result.ReleasedBytes());
+            Diagnostics::Write(" bytes).\n");
+        }
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
@@ -703,8 +810,14 @@ namespace Zos::Kernel::Initialization {
         PromoteVirtualAddressMetadata(runtime);
         AdvancePhase(runtime, KernelPhase::CxxAllocationReady, KernelPhase::VirtualAddressMetadataPromoted);
 
+        PromotePageMapMetadata(runtime);
+        AdvancePhase(runtime, KernelPhase::VirtualAddressMetadataPromoted, KernelPhase::PageMapMetadataPromoted);
 
-        AdvancePhase(runtime, KernelPhase::VirtualAddressMetadataPromoted, KernelPhase::BootstrapComplete);
+        RetireBootstrapMetadata(runtime);
+        AdvancePhase(runtime, KernelPhase::PageMapMetadataPromoted, KernelPhase::BootstrapMetadataRetired);
+
+        RunPermanentMemorySelfTest(runtime);
+        AdvancePhase(runtime, KernelPhase::BootstrapMetadataRetired, KernelPhase::BootstrapComplete);
         Diagnostics::Write("[zOS/Startup] Bootstrap infrastructure complete.\n");
 
         EnterRuntime(runtime);

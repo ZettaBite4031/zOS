@@ -58,6 +58,8 @@ namespace Zos::Kernel {
         KernelHeapReady,
         CxxAllocationReady,
         VirtualAddressMetadataPromoted,
+        PageMapMetadataPromoted,
+        BootstrapMetadataRetired,
 
         BootstrapComplete,
         Runtime,

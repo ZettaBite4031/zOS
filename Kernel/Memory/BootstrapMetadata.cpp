@@ -34,12 +34,13 @@ namespace Zos::Kernel::Memory {
         page->Offset = sizeof(PageHeader);
     }
 
-    void BootstrapMetadataArena::MoveTokenInto(PhysicalAllocation& dst, PhysicalAllocation& src) noexcept {
-        dst.~PhysicalAllocation();
-        new (&dst) PhysicalAllocation(static_cast<PhysicalAllocation&&>(src));
+    void BootstrapMetadataArena::MoveTokenInto(PhysicalAllocation& destination, PhysicalAllocation& source) noexcept {
+        destination.~PhysicalAllocation();
+        new (&destination) PhysicalAllocation(static_cast<PhysicalAllocation&&>(source));
     }
 
     MetadataArenaInitializationError BootstrapMetadataArena::Initialize(PhysicalMemoryManager& physical_memory) noexcept {
+        if (m_Retired) return MetadataArenaInitializationError::Retired;
         if (IsInitialized()) return MetadataArenaInitializationError::AlreadyInitialized;
         if (!physical_memory.IsInitialized()) return MetadataArenaInitializationError::PhysicalAllocationFailed;
 
@@ -115,23 +116,18 @@ namespace Zos::Kernel::Memory {
     }
 
     void* BootstrapMetadataArena::Allocate(Uint64 size, Uint64 alignment) noexcept {
-        if (!IsInitialized() || size == 0 || !IsPowerOfTwo(alignment)) return nullptr;
-
+        if (m_Retired || !IsInitialized() || size == 0 || !IsPowerOfTwo(alignment)) return nullptr;
         if (alignment > PageSize || size > ReservedOwnershipOffset() - sizeof(PageHeader)) return nullptr;
-
         if (void* allocation = TryAllocateFromCurrent(size, alignment); allocation != nullptr) return allocation;
-
         if (!Grow()) return nullptr;
-
         return TryAllocateFromCurrent(size, alignment);
     }
 
     PhysicalAllocation* BootstrapMetadataArena::Retain(PhysicalAllocation&& allocation) noexcept {
-        if (!allocation.IsValid()) return nullptr;
-        
+        if (m_Retired || !allocation.IsValid()) return nullptr;
+
         void* storage = Allocate(sizeof(PhysicalAllocation), alignof(PhysicalAllocation));
         if (storage == nullptr) return nullptr;
-
         return new (storage) PhysicalAllocation(static_cast<PhysicalAllocation&&>(allocation));
     }
 
@@ -139,7 +135,7 @@ namespace Zos::Kernel::Memory {
         if (!IsInitialized() || index >= m_Statistics.PageCount) return {};
 
         PhysicalAddress address = m_FirstPageAllocation.Base();
-        for (Uint64 current = 0; current < index; current ++) {
+        for (Uint64 current = 0; current < index; current++) {
             const auto* header = static_cast<const PageHeader*>(PhysicalPointer(address));
             if (header == nullptr || header->Next.IsNull()) return {};
             address = header->Next;
@@ -147,13 +143,89 @@ namespace Zos::Kernel::Memory {
         return address;
     }
 
+    MetadataArenaRetirementError BootstrapMetadataArena::Retire(MetadataArenaRetirementResult& result) noexcept {
+        result = {};
+
+        if (m_Retired) return MetadataArenaRetirementError::AlreadyRetired;
+        if (!IsInitialized()) return MetadataArenaRetirementError::NotInitialized;
+        if (!m_FirstPageAllocation.IsValid() || m_FirstPageAllocation.PageCount() != 1 || m_Statistics.PageCount == 0)
+            return MetadataArenaRetirementError::CorruptState;
+
+        const Uint64 original_page_count = m_Statistics.PageCount;
+
+        /*
+         * Every page after the first is owned by a PhysicalAllocation token
+         * stored inside its predecessor, so the chain must be released from
+         * the tail backwards.
+         */
+        while (m_Statistics.PageCount > 1) {
+            PhysicalAddress current_address = m_FirstPageAllocation.Base();
+            auto* current = static_cast<PageHeader*>(PhysicalPointer(current_address));
+            if (current == nullptr) return MetadataArenaRetirementError::CorruptState;
+
+            Uint64 visited = 1;
+            for (;;) {
+                const PhysicalAddress next_address = current->Next;
+                if (next_address.IsNull()) return MetadataArenaRetirementError::CorruptState;
+
+                auto* next = static_cast<PageHeader*>(PhysicalPointer(next_address));
+                if (next == nullptr) return MetadataArenaRetirementError::CorruptState;
+
+                if (next->Next.IsNull()) {
+                    auto* ownership = reinterpret_cast<PhysicalAllocation*>(reinterpret_cast<Uint8*>(current) + ReservedOwnershipOffset());
+                    if (!ownership->IsValid() || ownership->Base() != next_address || ownership->PageCount() != 1)
+                        return MetadataArenaRetirementError::CorruptState;
+
+                    if (m_PhysicalMemory->Release(*ownership) != PhysicalAllocationError::Success)
+                        return MetadataArenaRetirementError::PhysicalReleaseFailed;
+
+                    current->Next = {};
+                    m_CurrentPage = current;
+                    m_Statistics.PageCount--;
+                    result.ReleasedPages++;
+                    break;
+                }
+
+                current_address = next_address;
+                current = next;
+                visited++;
+                if (visited >= m_Statistics.PageCount) return MetadataArenaRetirementError::CorruptState;
+            }
+        }
+
+        if (result.ReleasedPages != original_page_count - 1) return MetadataArenaRetirementError::CorruptState;
+        if (m_PhysicalMemory->Release(m_FirstPageAllocation) != PhysicalAllocationError::Success)
+            return MetadataArenaRetirementError::PhysicalReleaseFailed;
+
+        result.ReleasedPages++;
+        m_FirstPage = nullptr;
+        m_CurrentPage = nullptr;
+        m_PhysicalMemory = nullptr;
+        m_Statistics = {};
+        m_DirectMapAccess = false;
+        m_Retired = true;
+        return MetadataArenaRetirementError::Success;
+    }
+
     const char* BootstrapMetadataArena::Describe(MetadataArenaInitializationError error) noexcept {
         switch (error) {
         case MetadataArenaInitializationError::Success: return "success";
         case MetadataArenaInitializationError::AlreadyInitialized: return "metadata arena is already initialized";
+        case MetadataArenaInitializationError::Retired: return "metadata arena has already been retired";
         case MetadataArenaInitializationError::PhysicalAllocationFailed: return "failed to allocate metadata storage";
         case MetadataArenaInitializationError::AddressUnavailable: return "metadata physical address is unavailable to bootstrap code";
         default: return "unknown metadata arena initialization error";
+        }
+    }
+
+    const char* BootstrapMetadataArena::Describe(MetadataArenaRetirementError error) noexcept {
+        switch (error) {
+        case MetadataArenaRetirementError::Success: return "success";
+        case MetadataArenaRetirementError::NotInitialized: return "metadata arena is not initialized";
+        case MetadataArenaRetirementError::AlreadyRetired: return "metadata arena is already retired";
+        case MetadataArenaRetirementError::CorruptState: return "metadata arena ownership chain is corrupt";
+        case MetadataArenaRetirementError::PhysicalReleaseFailed: return "failed to release metadata arena backing memory";
+        default: return "unknown metadata arena retirement error";
         }
     }
 }
