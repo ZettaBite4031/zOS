@@ -9,6 +9,8 @@
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
 
+#include <Kernel/Platform/ACPI/ACPI.hpp>
+
 namespace Zos::Kernel {
     struct BootContext final {
         /*
@@ -17,7 +19,7 @@ namespace Zos::Kernel {
         Memory::PhysicalSpan KernelImage{};
 
         /*
-         * Loader-provided bootstrap resources. 
+         * Loader-provided bootstrap resources.
          *
          * These are copied here only so the permanent-stack transition
          * can retire them without consulting BootEnvironment again.
@@ -30,7 +32,7 @@ namespace Zos::Kernel {
         /*
          * Firmware-independent physical root for later ACPI
          * initialization
-         * 
+         *
          * The underlying ACPI memory remains DeferredAcpi until
          * the ACPI subsystem has consumed it.
          */
@@ -62,16 +64,19 @@ namespace Zos::Kernel {
         BootstrapMetadataRetired,
 
         BootstrapComplete,
+
+        AcpiReady,
+
         Runtime,
     };
 
     /*
      * Permanent ownership root for kernel-lifetime infrastructure.
-     * 
+     *
      * This is intentionally NOT a general service locator. Runtime
      * subsystems should still receive explicit dependencies rather
      * than calling GetKernelRuntime() from arbitrary code.
-     * 
+     *
      * Its primary responsibilities are:
      *  - permanent object lifetime,
      *  - explicit initialization ordering,
@@ -85,6 +90,8 @@ namespace Zos::Kernel {
         Architecture::AMD64::PageMap KernelPageMap{};
         Architecture::AMD64::InterruptManager Interrupts{};
         Memory::KernelHeap Heap{};
+
+        Platform::ACPI::TableDirectory Acpi{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads
