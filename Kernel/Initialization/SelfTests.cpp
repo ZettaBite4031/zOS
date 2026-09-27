@@ -1,3 +1,5 @@
+#include <Kernel/Initialization/SelfTests.hpp>
+
 #include <Kernel/Kernel.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
@@ -6,7 +8,7 @@
 
 #include <Kernel/Runtime/New.hpp>
 
-namespace Zos::Kernel {
+namespace Zos::Kernel::Initialization::SelfTests {
     void RunPhysicalMemorySelfTest(Memory::PhysicalMemoryManager& manager) noexcept {
         using namespace Memory;
 
