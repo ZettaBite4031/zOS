@@ -193,7 +193,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::InterruptTopologyReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::CpuCapabilitiesReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -269,9 +269,15 @@ namespace Zos::Kernel::Initialization {
 
         const auto madt_error = runtime.Madt.Initialize(runtime.Acpi);
         if (madt_error != Platform::ACPI::MadtInitializationError::Success) 
-            Diagnostics::Fatal("ACPI", Platform::ACPI::TableDirectory::Describe(acpi_error));
+            Diagnostics::Fatal("ACPI", Platform::ACPI::Madt::Describe(madt_error));
 
         AdvancePhase(runtime, KernelPhase::AcpiReady, KernelPhase::InterruptTopologyReady);
+
+        const auto cpu_error = runtime.Cpu.Initialize();
+        if (cpu_error != Architecture::AMD64::CpuInitializationError::Success)
+            Diagnostics::Fatal("CPU", Architecture::AMD64::CpuInfo::Describe(cpu_error));
+
+        AdvancePhase(runtime, KernelPhase::InterruptTopologyReady, KernelPhase::CpuCapabilitiesReady);
 
         EnterRuntime(runtime);
     }

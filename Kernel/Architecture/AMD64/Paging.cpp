@@ -1,4 +1,5 @@
 #include <Kernel/Architecture/AMD64/Paging.hpp>
+#include <Kernel/Architecture/AMD64/CPU.hpp>
 
 #include <Kernel/Runtime/New.hpp>
 
@@ -19,54 +20,12 @@ namespace Zos::Kernel::Architecture::AMD64 {
     inline constexpr Uint64 Cr4FiveLevelPaging{ 1ULL << 12 };
     inline constexpr Uint64 RflagsInterruptEnable{ 1ULL << 9 };
 
-    void Cpuid(Uint32 leaf, Uint32 subleaf, Uint32& eax, Uint32& ebx, Uint32& ecx, Uint32& edx) noexcept {
-        __asm__ volatile(
-            "cpuid"
-            : "=a"(eax),
-              "=b"(ebx),
-              "=c"(ecx),
-              "=d"(edx)
-            : "a"(leaf),
-              "c"(subleaf)
-        );
-    }
-
     bool SupportsExecuteDisable() noexcept { 
-        Uint32 eax{};
-        Uint32 ebx{};
-        Uint32 ecx{};
-        Uint32 edx{};
+        const CpuidResult extended_information = Cpuid(ExtendedCpuidBase);
+        if (extended_information.Eax < ExtendedFeaturesLeaf) return false;
 
-        Cpuid(ExtendedCpuidBase, 0, eax, ebx, ecx, edx);
-        if (eax < ExtendedFeaturesLeaf) return false;
-
-        Cpuid(ExtendedFeaturesLeaf, 0, eax, ebx, ecx, edx);
-
-        return (edx & NxFeatureBit) != 0;
-    }
-
-    Uint64 ReadMsr(Uint32 msr) noexcept {
-        Uint32 low{};
-        Uint32 high{};
-
-        __asm__ volatile(
-            "rdmsr"
-            : "=a"(low), "=d"(high)
-            : "c"(msr)
-        );
-
-        return static_cast<Uint64>(low) | (static_cast<Uint64>(high) << 32);
-    }
-
-    void WriteMsr(Uint32 msr, Uint64 value) noexcept {
-        __asm__ volatile(
-            "wrmsr"
-            :
-            : "c"(msr),
-              "a"(static_cast<Uint32>(value)),
-              "d"(static_cast<Uint32>(value >> 32))
-            : "memory"
-        );
+        const CpuidResult features = Cpuid(ExtendedFeaturesLeaf);
+        return (features.Edx & NxFeatureBit) != 0;
     }
 
     Uint64 ReadCr0() noexcept {
