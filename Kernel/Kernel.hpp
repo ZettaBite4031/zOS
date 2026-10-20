@@ -10,6 +10,7 @@
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
 
 #include <Kernel/Platform/ACPI/ACPI.hpp>
+#include <Kernel/Platform/ACPI/MADT.hpp>
 
 namespace Zos::Kernel {
     struct BootContext final {
@@ -66,6 +67,7 @@ namespace Zos::Kernel {
         BootstrapComplete,
 
         AcpiReady,
+        InterruptTopologyReady,
 
         Runtime,
     };
@@ -92,6 +94,7 @@ namespace Zos::Kernel {
         Memory::KernelHeap Heap{};
 
         Platform::ACPI::TableDirectory Acpi{};
+        Platform::ACPI::Madt Madt{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads
