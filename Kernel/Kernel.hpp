@@ -9,6 +9,7 @@
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
 #include <Kernel/Architecture/AMD64/CPU.hpp>
+#include <Kernel/Architecture/AMD64/APIC.hpp>
 
 #include <Kernel/Platform/ACPI/ACPI.hpp>
 #include <Kernel/Platform/ACPI/MADT.hpp>
@@ -70,6 +71,7 @@ namespace Zos::Kernel {
         AcpiReady,
         InterruptTopologyReady,
         CpuCapabilitiesReady,
+        LocalApicReady,
 
         Runtime,
     };
@@ -91,9 +93,11 @@ namespace Zos::Kernel {
         Memory::PhysicalMemoryManager PhysicalMemory{};
         Memory::BootstrapMetadataArena BootstrapMetadata{};
         Memory::VirtualAddressAllocator KernelAddresses{};
+        Memory::VirtualAddressAllocator KernelMmioAddresses{};
         Architecture::AMD64::PageMap KernelPageMap{};
         Architecture::AMD64::InterruptManager Interrupts{};
         Architecture::AMD64::CpuInfo Cpu{};
+        Architecture::AMD64::LocalApic Apic{};
         Memory::KernelHeap Heap{};
 
         Platform::ACPI::TableDirectory Acpi{};

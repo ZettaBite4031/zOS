@@ -193,7 +193,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::CpuCapabilitiesReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::LocalApicReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -278,6 +278,12 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Fatal("CPU", Architecture::AMD64::CpuInfo::Describe(cpu_error));
 
         AdvancePhase(runtime, KernelPhase::InterruptTopologyReady, KernelPhase::CpuCapabilitiesReady);
+
+        const auto apic_error = runtime.Apic.Initialize(runtime.Cpu, runtime.Madt, runtime.Interrupts, runtime.KernelMmioAddresses, runtime.KernelPageMap);
+        if (apic_error != Architecture::AMD64::LocalApicInitializationError::Success)
+            Diagnostics::Fatal("APIC", Architecture::AMD64::LocalApic::Describe(apic_error));
+
+        AdvancePhase(runtime, KernelPhase::CpuCapabilitiesReady, KernelPhase::LocalApicReady);
 
         EnterRuntime(runtime);
     }

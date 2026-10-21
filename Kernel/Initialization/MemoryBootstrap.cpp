@@ -139,6 +139,10 @@ namespace Zos::Kernel::Initialization::MemoryBootstrap {
         if (virtual_error != VirtualAllocationError::Success) 
             Diagnostics::Fatal("VMM", VirtualAddressAllocator::Describe(virtual_error));
 
+        const auto mmio_error = runtime.KernelMmioAddresses.Initialize(Layout::KernelMmioSpan(), runtime.BootstrapMetadata);
+        if (mmio_error != VirtualAllocationError::Success) 
+            Diagnostics::Fatal("VMM", VirtualAddressAllocator::Describe(mmio_error));
+
         const auto page_map_error = runtime.KernelPageMap.Initialize(runtime.PhysicalMemory, runtime.BootstrapMetadata);
         if (page_map_error != PageMapInitializationError::Success) 
             Diagnostics::Fatal("VMM", PageMap::Describe(page_map_error));
@@ -408,10 +412,13 @@ namespace Zos::Kernel::Initialization::MemoryBootstrap {
 
     void PromoteVirtualAddressMetadata(KernelRuntime& runtime) {
         auto& addresses = runtime.KernelAddresses;
+        auto& mmio_addresses = runtime.KernelMmioAddresses;
         auto& heap = runtime.Heap;
 
         if (!addresses.IsInitialized() || 
             !addresses.Validate() || 
+            !mmio_addresses.IsInitialized() ||
+            !mmio_addresses.Validate() ||
             !heap.IsInitialized() || 
             !heap.Validate()) 
             Diagnostics::Fatal("VMM", "VAA metadata promotion dependencies are invalid");
@@ -445,6 +452,13 @@ namespace Zos::Kernel::Initialization::MemoryBootstrap {
 
         if (!addresses.IsMetadataPromoted() || !addresses.Validate()) 
             Diagnostics::Fatal("VMM","VAA did not enter valid permanent metadata state");
+
+        const VirtualAddressMetadataPromotionError mmio_promotion_error = mmio_addresses.PromoteMetadata(heap);
+        if (mmio_promotion_error != VirtualAddressMetadataPromotionError::Success)
+            Diagnostics::Fatal("VMM", VirtualAddressAllocator::Describe(mmio_promotion_error));
+
+        if (!mmio_addresses.IsMetadataPromoted() || !mmio_addresses.Validate())
+            Diagnostics::Fatal("VMM", "MMIO VAA did not enter valid permanent metadata state");
 
         /*
         * The pre-promotion token must now resolve to its cloned
@@ -528,7 +542,9 @@ namespace Zos::Kernel::Initialization::MemoryBootstrap {
         BootstrapMetadataArena& arena = runtime.BootstrapMetadata;
         PhysicalMemoryManager& physical_memory = runtime.PhysicalMemory;
 
-        if (!runtime.KernelAddresses.IsMetadataPromoted() || !runtime.KernelPageMap.IsMetadataPromoted())
+        if (!runtime.KernelAddresses.IsMetadataPromoted() || 
+            !runtime.KernelMmioAddresses.IsMetadataPromoted() ||
+            !runtime.KernelPageMap.IsMetadataPromoted())
             Diagnostics::Fatal("VMM", "bootstrap metadata still has permanent consumers");
         if (!arena.IsInitialized() || arena.IsRetired())
             Diagnostics::Fatal("VMM", "bootstrap metadata arena is not in a retireable state");

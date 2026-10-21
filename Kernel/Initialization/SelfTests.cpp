@@ -63,18 +63,30 @@ namespace Zos::Kernel::Initialization::SelfTests {
         auto& physical_memory = runtime.PhysicalMemory;
         auto& metadata = runtime.BootstrapMetadata;
         auto& kernel_addresses = runtime.KernelAddresses;
+        auto& mmio_addresses = runtime.KernelMmioAddresses;
         auto& page_map = runtime.KernelPageMap;
 
         if (!physical_memory.IsInitialized() || !metadata.IsInitialized() ||
-            !kernel_addresses.IsInitialized() || !page_map.IsInitialized()) 
+            !kernel_addresses.IsInitialized() || !mmio_addresses.IsInitialized() ||
+            !page_map.IsInitialized()) 
             Diagnostics::Fatal("VMM", "virtual-memory self-test dependencies are not initialized");
         
-        if (!kernel_addresses.Validate())
+        if (!kernel_addresses.Validate() || !mmio_addresses.Validate())
             Diagnostics::Fatal("VMM", "virtual address allocator failed initial validation");
         if (!page_map.Validate())
             Diagnostics::Fatal("VMM", "page map failed initial ownership validation");
             
         const VirtualAddressAllocatorStatistics virtual_baseline = kernel_addresses.Statistics();
+
+        VirtualReservation mmio_probe{};
+        if (mmio_addresses.Reserve(1, mmio_probe) != VirtualAllocationError::Success)
+            Diagnostics::Fatal("VMM", "kernel MMIO virtual reservation failed");
+
+        if (mmio_probe.Base() != Layout::KernelMmioBase)
+            Diagnostics::Fatal("VMM", "kernel MMIO allocator returned an address outside its expected base");
+
+        if (mmio_addresses.Release(mmio_probe) != VirtualAllocationError::Success)
+            Diagnostics::Fatal("VMM", "kernel MMIO virtual reservation release failed");
         
         VirtualReservation lead_reservation{};
         auto virtual_error = kernel_addresses.Reserve(1, lead_reservation);
@@ -414,12 +426,14 @@ namespace Zos::Kernel::Initialization::SelfTests {
 
         PhysicalMemoryManager& physical_memory = runtime.PhysicalMemory;
         VirtualAddressAllocator& virtual_addresses = runtime.KernelAddresses;
+        VirtualAddressAllocator& mmio_addresses = runtime.KernelMmioAddresses;
         PageMap& page_map = runtime.KernelPageMap;
         KernelHeap& heap = runtime.Heap;
         BootstrapMetadataArena& bootstrap_metadata = runtime.BootstrapMetadata;
 
         if (!bootstrap_metadata.IsRetired() || bootstrap_metadata.IsInitialized() || !physical_memory.IsInitialized() ||
-            !physical_memory.IsMetadataAccessPromoted() || !virtual_addresses.IsMetadataPromoted() || !page_map.IsMetadataPromoted() ||
+            !physical_memory.IsMetadataAccessPromoted() || !virtual_addresses.IsMetadataPromoted() || 
+            !mmio_addresses.IsMetadataPromoted() || !page_map.IsMetadataPromoted() || 
             !page_map.IsActive() || !heap.IsInitialized())
             Diagnostics::Fatal("Memory", "permanent-memory self-test dependencies are invalid");
 
@@ -429,8 +443,13 @@ namespace Zos::Kernel::Initialization::SelfTests {
         if (virtual_addresses.Release(reservation) != VirtualAllocationError::Success)
             Diagnostics::Fatal("Memory", "post-retirement virtual reservation release failed");
 
-        const VirtualAddress probe_virtual = Layout::KernelMmioBase;
-        if (page_map.IsMapped(probe_virtual)) Diagnostics::Fatal("Memory", "permanent PageMap probe address is already mapped");
+        VirtualReservation mmio_reservation{};
+        if (mmio_addresses.Reserve(1, mmio_reservation) != VirtualAllocationError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement MMIO virtual reservation failed");
+
+        const VirtualAddress probe_virtual = mmio_reservation.Base();
+        if (page_map.IsMapped(probe_virtual))
+            Diagnostics::Fatal("Memory", "permanent PageMap probe address is already mapped");
 
         PhysicalAllocation backing{};
         if (physical_memory.AllocatePage(backing) != PhysicalAllocationError::Success)
@@ -462,6 +481,8 @@ namespace Zos::Kernel::Initialization::SelfTests {
 
         if (page_map.UnmapPage(probe_virtual) != MappingError::Success)
             Diagnostics::Fatal("Memory", "post-retirement PageMap unmap failed");
+        if (mmio_addresses.Release(mmio_reservation) != VirtualAllocationError::Success)
+            Diagnostics::Fatal("Memory", "post-retirement MMIO virtual reservation release failed");
         if (page_map.TablePageCount() != table_pages_before)
             Diagnostics::Fatal("Memory", "post-retirement PageMap table accounting did not return to baseline");
         if (physical_memory.Release(backing) != PhysicalAllocationError::Success)
@@ -473,10 +494,10 @@ namespace Zos::Kernel::Initialization::SelfTests {
         if (heap.Free(heap_probe) != KernelHeapError::Success)
             Diagnostics::Fatal("Memory", "post-retirement heap release failed");
 
-        if (!virtual_addresses.Validate() || !page_map.Validate() || !heap.Validate())
+        if (!virtual_addresses.Validate() || !mmio_addresses.Validate() || !page_map.Validate() || !heap.Validate())
             Diagnostics::Fatal("Memory", "permanent memory infrastructure failed final validation");
 
-        Diagnostics::Write("[zOS/Memory] Permanent PMM, VAA, PageMap, and heap self-test passed.\n");
+        Diagnostics::Write("[zOS/Memory] Permanent PMM, VAA, MMIO VAA, PageMap, and heap self-test passed.\n");
     }
 
 }
