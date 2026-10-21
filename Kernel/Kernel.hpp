@@ -71,6 +71,7 @@ namespace Zos::Kernel {
         AcpiReady,
         InterruptTopologyReady,
         CpuCapabilitiesReady,
+        LegacyInterruptsQuiesced,
         LocalApicReady,
 
         Runtime,

@@ -7,6 +7,7 @@
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 
 #include <Kernel/Architecture/AMD64/Stack.hpp>
+#include <Kernel/Architecture/AMD64/LegacyPIC.hpp>
 
 namespace Zos::Kernel::Initialization {
     namespace {
@@ -279,11 +280,17 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::InterruptTopologyReady, KernelPhase::CpuCapabilitiesReady);
 
+        const auto legacy_pic_error = LegacyPic::Quiesce(runtime.Madt);
+        if (legacy_pic_error != LegacyPic::QuiesceError::Success) 
+            Diagnostics::Fatal("Interrupt", LegacyPic::Describe(legacy_pic_error));
+
+        AdvancePhase(runtime, KernelPhase::CpuCapabilitiesReady, KernelPhase::LegacyInterruptsQuiesced);
+
         const auto apic_error = runtime.Apic.Initialize(runtime.Cpu, runtime.Madt, runtime.Interrupts, runtime.KernelMmioAddresses, runtime.KernelPageMap);
         if (apic_error != Architecture::AMD64::LocalApicInitializationError::Success)
             Diagnostics::Fatal("APIC", Architecture::AMD64::LocalApic::Describe(apic_error));
 
-        AdvancePhase(runtime, KernelPhase::CpuCapabilitiesReady, KernelPhase::LocalApicReady);
+        AdvancePhase(runtime, KernelPhase::LegacyInterruptsQuiesced, KernelPhase::LocalApicReady);
 
         EnterRuntime(runtime);
     }
