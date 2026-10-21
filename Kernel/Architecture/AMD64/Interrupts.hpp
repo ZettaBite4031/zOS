@@ -4,11 +4,27 @@
 #include <Kernel/Memory/VirtualAddressAllocator.hpp>
 
 namespace Zos::Kernel::Architecture::AMD64 {
+    class LocalApic;
+
     inline constexpr Memory::Uint16 KernelCodeSelector{ 0x08 };
     inline constexpr Memory::Uint16 KernelDataSelector{ 0x10 };
     inline constexpr Memory::Uint16 TaskStateSelector{ 0x18 };
 
     inline constexpr Memory::Uint64 InterruptVectorCount{ 256 };
+
+    inline constexpr Memory::Uint8 ExceptionVectorFirst{ 0x00 };
+    inline constexpr Memory::Uint8 ExceptionVectorLast{ 0x1F };
+
+    inline constexpr Memory::Uint8 DeviceVectorFirst{ 0x20 };
+    inline constexpr Memory::Uint8 DeviceVectorLast{ 0xDF };
+
+    inline constexpr Memory::Uint8 LocalApicVectorFirst{ 0xE0 };
+    inline constexpr Memory::Uint8 LocalApicVectorLast{ 0xEF };
+
+    inline constexpr Memory::Uint8 IpiVectorFirst{ 0xF0 };
+    inline constexpr Memory::Uint8 IpiVectorLast{ 0xFE };
+
+    inline constexpr Memory::Uint8 SpuriousInterruptVector{ 0xFF };
 
     struct InterruptContext final {
         /*
@@ -56,6 +72,19 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
     using InterruptHandler = void(*)(InterruptContext& context) noexcept;
 
+    enum class InterruptVectorClass : Memory::Uint8 {
+        Exception,
+        Device,
+        LocalApic,
+        Ipi,
+        Spurious,
+    };
+
+    enum class InterruptAcknowledgement : Memory::Uint8 {
+        None,
+        LocalApicEoi,
+    };
+
     enum class InterruptInitializationError : Memory::Uint32 {
         Success,
         AlreadyInitialized,
@@ -78,9 +107,13 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         [[nodiscard]] InterruptInitializationError Initialize(Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& virtual_addresses, PageMap& page_map) noexcept;
 
-        [[nodiscard]] bool RegisterHandler(Memory::Uint8 vector, InterruptHandler handler, const char* name = nullptr) noexcept;
+        [[nodiscard]] bool BindLocalApic(LocalApic& local_apic) noexcept;
 
-        void UnregisterHandler(Memory::Uint8 vector) noexcept;
+        [[nodiscard]] bool RegisterFixedHandler(Memory::Uint8 vector, InterruptHandler handler, const char* name = nullptr, InterruptAcknowledgement acknowledgement = InterruptAcknowledgement::None) noexcept;
+
+        [[nodiscard]] bool AllocateDeviceVector(Memory::Uint8& vector, InterruptHandler handler, const char* name = nullptr) noexcept;
+
+        [[nodiscard]] bool ReleaseDeviceVector(Memory::Uint8 vector) noexcept;
 
         void Dispatch(InterruptContext& context) noexcept;
 
@@ -90,6 +123,10 @@ namespace Zos::Kernel::Architecture::AMD64 {
          * the previous handler.
          */
         [[nodiscard]] bool RunBreakpointSelfTest() noexcept;
+        
+        [[nodiscard]] bool RunVectorPolicySelfTest() noexcept;
+
+        [[nodiscard]] static InterruptVectorClass VectorClass(Memory::Uint8 vector) noexcept;
 
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] Memory::VirtualAddress TrampolineBase() const noexcept { return m_TrampolineVirtual.Base(); }
@@ -102,6 +139,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         struct HandlerSlot final {
             InterruptHandler Handler{};
             const char* Name{};
+            InterruptAcknowledgement Acknowledgement{ InterruptAcknowledgement::None };
+            bool Claimed{};
         };
 
         struct IdtEntry final {
@@ -206,6 +245,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         Memory::PhysicalMemoryManager* m_PhysicalMemory{};
         Memory::VirtualAddressAllocator* m_VirtualAddresses{};
         PageMap* m_PageMap{};
+        LocalApic* m_LocalApic{};
         
         bool m_Initialized{};
     };

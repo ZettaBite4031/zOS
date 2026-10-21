@@ -129,7 +129,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if (!MadtContainsEnabledProcessor(madt, m_Id))
             return LocalApicInitializationError::ProcessorNotInMadt;
 
-        if (!interrupts.RegisterHandler(LocalApicSpuriousVector, &HandleSpuriousInterrupt, "Local APIC spurious interrupt"))
+        if (!interrupts.RegisterFixedHandler(SpuriousInterruptVector, &HandleSpuriousInterrupt, "Local APIC spurious interrupt", InterruptAcknowledgement::None))
             return LocalApicInitializationError::SpuriousHandlerRegistrationFailed;
 
         /*
@@ -142,13 +142,13 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         Uint32 spurious = ReadRegister(SpuriousVectorRegisterOffset);
         spurious &= ~SpuriousVectorMask;
-        spurious |= LocalApicSpuriousVector;
+        spurious |= SpuriousInterruptVector;
         spurious |= SoftwareEnableBit;
 
         WriteRegister(SpuriousVectorRegisterOffset, spurious);
 
         const Uint32 configured_spurious = ReadRegister(SpuriousVectorRegisterOffset);
-        if ((configured_spurious & SpuriousVectorMask) != LocalApicSpuriousVector ||
+        if ((configured_spurious & SpuriousVectorMask) != SpuriousInterruptVector ||
             (configured_spurious & SoftwareEnableBit) == 0)
             return LocalApicInitializationError::RegisterValidationFailed;
 
@@ -232,7 +232,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         Diagnostics::Write("\n");
 
         Diagnostics::Write("[zOS/APIC] Spurious vector: ");
-        Diagnostics::WriteHex(LocalApicSpuriousVector);
+        Diagnostics::WriteHex(SpuriousInterruptVector);
         Diagnostics::Write("\n");
 
         Diagnostics::Write("[zOS/APIC] Local APIC initialized.\n");

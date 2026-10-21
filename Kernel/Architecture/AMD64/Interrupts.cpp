@@ -1,5 +1,7 @@
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
 
+#include <Kernel/Architecture/AMD64/APIC.hpp>
+
 extern "C" void InterruptCommonEntry() noexcept;
 extern "C" void LoadDescriptorTables(const void* gdtr, const void* idtr) noexcept;
 extern "C" void InterruptDispatch(Zos::Kernel::Architecture::AMD64::InterruptContext* context) noexcept;
@@ -553,7 +555,10 @@ namespace {
 
     void BreakpointSelfTestHandler(InterruptContext&) noexcept {
         g_BreakpointObserved = true;
-    }   
+    }
+
+    void VectorPolicySelfTestHandler(InterruptContext&) noexcept {
+    }
 }
 
 extern "C" void InterruptDispatch(Zos::Kernel::Architecture::AMD64::InterruptContext* context) noexcept {
@@ -567,11 +572,21 @@ extern "C" void InterruptDispatch(Zos::Kernel::Architecture::AMD64::InterruptCon
 namespace Zos::Kernel::Architecture::AMD64 {
     using namespace Memory;
 
+    InterruptVectorClass InterruptManager::VectorClass(Uint8 vector) noexcept {
+        if (vector <= ExceptionVectorLast) return InterruptVectorClass::Exception;
+        if (vector <= DeviceVectorLast) return InterruptVectorClass::Device;
+        if (vector <= LocalApicVectorLast) return InterruptVectorClass::LocalApic;
+        if (vector <= IpiVectorLast) return InterruptVectorClass::Ipi;
+        return InterruptVectorClass::Spurious;
+    }
+
     void InterruptManager::InitializeHandlers() noexcept {
         for (Uint64 vector = 0; vector < InterruptVectorCount; vector++) {
             m_Handlers[vector] = {
                 .Handler = &GenericInterruptHandler,
                 .Name = nullptr,
+                .Acknowledgement = InterruptAcknowledgement::None,
+                .Claimed = false,
             };
         }
     }
@@ -580,36 +595,112 @@ namespace Zos::Kernel::Architecture::AMD64 {
         m_Handlers[6] = {
             .Handler = &HandleInvalidOpcode,
             .Name = "#UD Invalid Opcode",
+            .Acknowledgement = InterruptAcknowledgement::None,
+            .Claimed = true,
         };
+
         m_Handlers[8] = {
             .Handler = &HandleDoubleFault,
             .Name = "#DF Double Fault",
+            .Acknowledgement = InterruptAcknowledgement::None,
+            .Claimed = true,
         };
+
         m_Handlers[13] = {
             .Handler = &HandleGeneralProtection,
             .Name = "#GP General Protection",
+            .Acknowledgement = InterruptAcknowledgement::None,
+            .Claimed = true,
         };
+
         m_Handlers[14] = {
             .Handler = &HandlePageFault,
             .Name = "#PF Page Fault",
+            .Acknowledgement = InterruptAcknowledgement::None,
+            .Claimed = true,
         };
     }
 
-    bool InterruptManager::RegisterHandler(Uint8 vector, InterruptHandler handler, const char* name) noexcept {
-        if (!m_Initialized || handler == nullptr) return false;
-        m_Handlers[vector] = { 
-            .Handler = handler,
-            .Name = name,
-        };
+    bool InterruptManager::BindLocalApic(LocalApic& local_apic) noexcept {
+        if (!m_Initialized || m_LocalApic != nullptr || !local_apic.IsInitialized())
+            return false;
+
+        m_LocalApic = &local_apic;
         return true;
     }
 
-    void InterruptManager::UnregisterHandler(Uint8 vector) noexcept {
-        if (!m_Initialized) return;
-        m_Handlers[vector] = {
+    bool InterruptManager::RegisterFixedHandler(Uint8 vector, InterruptHandler handler, const char* name, InterruptAcknowledgement acknowledgement) noexcept {
+        if (!m_Initialized || handler == nullptr) return false;
+
+        const InterruptVectorClass vector_class = VectorClass(vector);
+
+        /*
+        * Exceptions are architecture-owned and device vectors must go
+        * through the allocator. Fixed registrations are reserved for
+        * Local APIC, IPI, and spurious vectors.
+        */
+        if (vector_class == InterruptVectorClass::Exception ||
+            vector_class == InterruptVectorClass::Device)
+            return false;
+
+        HandlerSlot& slot = m_Handlers[vector];
+        if (slot.Claimed) return false;
+
+        if (vector_class == InterruptVectorClass::Spurious &&
+            acknowledgement != InterruptAcknowledgement::None)
+            return false;
+
+        if (acknowledgement == InterruptAcknowledgement::LocalApicEoi &&
+            m_LocalApic == nullptr)
+            return false;
+
+        slot = {
+            .Handler = handler,
+            .Name = name,
+            .Acknowledgement = acknowledgement,
+            .Claimed = true,
+        };
+
+        return true;
+    }
+
+    bool InterruptManager::AllocateDeviceVector(Uint8& vector, InterruptHandler handler, const char* name) noexcept {
+        if (!m_Initialized || m_LocalApic == nullptr || handler == nullptr)
+            return false;
+
+        for (Uint32 candidate = DeviceVectorFirst; candidate <= DeviceVectorLast; candidate++) {
+            HandlerSlot& slot = m_Handlers[candidate];
+            if (slot.Claimed) continue;
+
+            slot = {
+                .Handler = handler,
+                .Name = name,
+                .Acknowledgement = InterruptAcknowledgement::LocalApicEoi,
+                .Claimed = true,
+            };
+
+            vector = static_cast<Uint8>(candidate);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool InterruptManager::ReleaseDeviceVector(Uint8 vector) noexcept {
+        if (!m_Initialized || VectorClass(vector) != InterruptVectorClass::Device)
+            return false;
+
+        HandlerSlot& slot = m_Handlers[vector];
+        if (!slot.Claimed) return false;
+
+        slot = {
             .Handler = &GenericInterruptHandler,
             .Name = nullptr,
+            .Acknowledgement = InterruptAcknowledgement::None,
+            .Claimed = false,
         };
+
+        return true;
     }
 
     const char* InterruptManager::HandlerName(Uint8 vector) const noexcept {
@@ -619,10 +710,23 @@ namespace Zos::Kernel::Architecture::AMD64 {
     }
 
     void InterruptManager::Dispatch(InterruptContext& context) noexcept {
-        if (context.Vector >= InterruptVectorCount) GenericInterruptHandler(context);
-        HandlerSlot& slot = m_Handlers[context.Vector];
-        if (slot.Handler == nullptr) GenericInterruptHandler(context);
+        if (context.Vector >= InterruptVectorCount)
+            GenericInterruptHandler(context);
+
+        const Uint8 vector = static_cast<Uint8>(context.Vector);
+        HandlerSlot& slot = m_Handlers[vector];
+
+        if (!slot.Claimed || slot.Handler == nullptr)
+            GenericInterruptHandler(context);
+
         slot.Handler(context);
+
+        if (slot.Acknowledgement == InterruptAcknowledgement::LocalApicEoi) {
+            if (m_LocalApic == nullptr || !m_LocalApic->IsInitialized())
+                GenericInterruptHandler(context);
+
+            m_LocalApic->EndOfInterrupt();
+        }
     }
 
     void InterruptManager::InitializeGdt() noexcept {
@@ -939,6 +1043,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         m_Handlers[3] = {
             .Handler = &BreakpointSelfTestHandler,
             .Name = "#BP Interrupt Self-Test",
+            .Acknowledgement = InterruptAcknowledgement::None,
+            .Claimed = true,
         };
 
         __asm__ volatile(
@@ -954,7 +1060,91 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return observed;
     }
 
-     const char* InterruptManager::Describe(InterruptInitializationError error) noexcept {
+    bool InterruptManager::RunVectorPolicySelfTest() noexcept {
+        if (!m_Initialized || m_LocalApic == nullptr || !m_LocalApic->IsInitialized())
+            return false;
+
+        if (VectorClass(ExceptionVectorFirst) != InterruptVectorClass::Exception ||
+            VectorClass(ExceptionVectorLast) != InterruptVectorClass::Exception ||
+            VectorClass(DeviceVectorFirst) != InterruptVectorClass::Device ||
+            VectorClass(DeviceVectorLast) != InterruptVectorClass::Device ||
+            VectorClass(LocalApicVectorFirst) != InterruptVectorClass::LocalApic ||
+            VectorClass(LocalApicVectorLast) != InterruptVectorClass::LocalApic ||
+            VectorClass(IpiVectorFirst) != InterruptVectorClass::Ipi ||
+            VectorClass(IpiVectorLast) != InterruptVectorClass::Ipi ||
+            VectorClass(SpuriousInterruptVector) != InterruptVectorClass::Spurious)
+            return false;
+
+        /*
+        * Architecture-owned and dynamically allocated ranges must not
+        * be claimable through the fixed-vector interface.
+        */
+        if (RegisterFixedHandler(ExceptionVectorLast, &VectorPolicySelfTestHandler, "Invalid exception registration"))
+            return false;
+
+        if (RegisterFixedHandler(DeviceVectorFirst, &VectorPolicySelfTestHandler, "Invalid device registration"))
+            return false;
+
+        /*
+        * The Local APIC already owns the spurious vector.
+        */
+        if (RegisterFixedHandler(SpuriousInterruptVector, &VectorPolicySelfTestHandler, "Duplicate spurious registration"))
+            return false;
+
+        if (ReleaseDeviceVector(LocalApicVectorFirst))
+            return false;
+
+        Uint8 first{};
+        Uint8 second{};
+        Uint8 recycled{};
+
+        if (!AllocateDeviceVector(first, &VectorPolicySelfTestHandler, "Vector policy self-test A"))
+            return false;
+
+        if (first != DeviceVectorFirst) {
+            (void)ReleaseDeviceVector(first);
+            return false;
+        }
+
+        if (!AllocateDeviceVector(second, &VectorPolicySelfTestHandler, "Vector policy self-test B")) {
+            (void)ReleaseDeviceVector(first);
+            return false;
+        }
+
+        if (second != static_cast<Uint8>(DeviceVectorFirst + 1)) {
+            (void)ReleaseDeviceVector(second);
+            (void)ReleaseDeviceVector(first);
+            return false;
+        }
+
+        if (!ReleaseDeviceVector(first)) {
+            (void)ReleaseDeviceVector(second);
+            return false;
+        }
+
+        if (!AllocateDeviceVector(recycled, &VectorPolicySelfTestHandler, "Vector policy recycled self-test")) {
+            (void)ReleaseDeviceVector(second);
+            return false;
+        }
+
+        const bool reused_first_vector = recycled == first;
+
+        const bool recycled_released = ReleaseDeviceVector(recycled);
+        const bool second_released = ReleaseDeviceVector(second);
+
+        if (!reused_first_vector || !recycled_released || !second_released)
+            return false;
+
+        /*
+        * Duplicate release protection.
+        */
+        if (ReleaseDeviceVector(recycled))
+            return false;
+
+        return true;
+    }
+
+    const char* InterruptManager::Describe(InterruptInitializationError error) noexcept {
         switch (error) {
         case InterruptInitializationError::Success: return "success";
         case InterruptInitializationError::AlreadyInitialized: return "interrupt infrastructure is already initialized";

@@ -72,6 +72,4 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         bool m_Initialized{};
     };
-
-    inline constexpr Memory::Uint8 LocalApicSpuriousVector{ 0xFF };
 }

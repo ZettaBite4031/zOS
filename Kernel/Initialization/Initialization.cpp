@@ -194,7 +194,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::LocalApicReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::InterruptPolicyReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -291,6 +291,16 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Fatal("APIC", Architecture::AMD64::LocalApic::Describe(apic_error));
 
         AdvancePhase(runtime, KernelPhase::LegacyInterruptsQuiesced, KernelPhase::LocalApicReady);
+
+        if (!runtime.Interrupts.BindLocalApic(runtime.Apic))
+            Diagnostics::Fatal("Interrupt", "failed to bind Local APIC acknowledgement");
+
+        if (!runtime.Interrupts.RunVectorPolicySelfTest())
+            Diagnostics::Fatal("Interrupt", "interrupt vector policy self-test failed");
+
+        Diagnostics::Write("[zOS/Interrupt] Vector policy and Local APIC acknowledgement established.\n");
+
+        AdvancePhase(runtime, KernelPhase::LocalApicReady, KernelPhase::InterruptPolicyReady);
 
         EnterRuntime(runtime);
     }
