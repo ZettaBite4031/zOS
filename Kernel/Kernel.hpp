@@ -14,6 +14,10 @@
 #include <Kernel/Platform/ACPI/ACPI.hpp>
 #include <Kernel/Platform/ACPI/MADT.hpp>
 
+#include <Kernel/Platform/HPET.hpp>
+
+#include <Kernel/Time/Clock.hpp>
+
 namespace Zos::Kernel {
     struct BootContext final {
         /*
@@ -74,6 +78,7 @@ namespace Zos::Kernel {
         LegacyInterruptsQuiesced,
         LocalApicReady,
         InterruptPolicyReady,
+        MonotonicClockReady,
 
         Runtime,
     };
@@ -104,6 +109,9 @@ namespace Zos::Kernel {
 
         Platform::ACPI::TableDirectory Acpi{};
         Platform::ACPI::Madt Madt{};
+        Platform::Hpet Hpet{};
+
+        Time::MonotonicClock Clock{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads

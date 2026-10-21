@@ -14,7 +14,7 @@ def CreateQemuCommand(repo_root: Path, toolchain: Toolchain, config: str, arch: 
     esp_directory = output_directory / "ESP"
     variables_path = output_directory / "Firmware" / "OVMF_VARS.fd"
 
-    processor = "host" if toolchain.QemuAccelerator == "kvm" else "max"
+    processor = ("host,migratable=no,+invtsc" if toolchain.QemuAccelerator == "kvm" else "max")
 
     command = [
         str(toolchain.Qemu),

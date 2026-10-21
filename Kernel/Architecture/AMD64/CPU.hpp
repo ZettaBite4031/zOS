@@ -18,6 +18,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
     [[nodiscard]] Uint64 ReadMsr(Uint32 index) noexcept;
     void WriteMsr(Uint32 index, Uint64 value) noexcept;
 
+    [[nodiscard]] Uint64 ReadTsc() noexcept;
+
     struct CpuFeatures final {
         bool Apic{};
         bool X2Apic{};

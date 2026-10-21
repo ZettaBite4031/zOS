@@ -194,7 +194,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::InterruptPolicyReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::MonotonicClockReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -301,6 +301,16 @@ namespace Zos::Kernel::Initialization {
         Diagnostics::Write("[zOS/Interrupt] Vector policy and Local APIC acknowledgement established.\n");
 
         AdvancePhase(runtime, KernelPhase::LocalApicReady, KernelPhase::InterruptPolicyReady);
+
+        const auto hpet_error = runtime.Hpet.Initialize(runtime.Acpi, runtime.KernelMmioAddresses, runtime.KernelPageMap);
+        if (hpet_error != Platform::HpetInitializationError::Success)
+            Diagnostics::Fatal("HPET", Platform::Hpet::Describe(hpet_error));
+
+        const auto clock_error = runtime.Clock.Initialize(runtime.Cpu, runtime.Hpet);
+        if (clock_error != Time::MonotonicClockInitializationError::Success)
+            Diagnostics::Fatal("Time", Time::MonotonicClock::Describe(clock_error));
+
+        AdvancePhase(runtime, KernelPhase::InterruptPolicyReady, KernelPhase::MonotonicClockReady);
 
         EnterRuntime(runtime);
     }

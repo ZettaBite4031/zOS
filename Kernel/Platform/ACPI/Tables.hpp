@@ -4,6 +4,7 @@
 
 namespace Zos::Kernel::Platform::ACPI {
     using Memory::Uint8;
+    using Memory::Uint16;
     using Memory::Uint32;
     using Memory::Uint64;
 
@@ -44,7 +45,16 @@ namespace Zos::Kernel::Platform::ACPI {
         Uint32 CreatorRevision;
     };
 
+    struct __attribute__((packed)) GenericAddressStructure final {
+        Uint8 AddressSpaceId;
+        Uint8 RegisterBitWidth;
+        Uint8 RegisterBitOffset;
+        Uint8 AccessSize;
+        Uint64 Address;
+    };
+
     static_assert(sizeof(RootSystemDescriptionPointer) == 36);
     static_assert(sizeof(DescriptionHeader) == 36);
+    static_assert(sizeof(GenericAddressStructure) == 12);
 
 }

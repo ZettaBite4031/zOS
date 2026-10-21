@@ -85,6 +85,20 @@ namespace Zos::Kernel::Architecture::AMD64 {
         );
     }
 
+    Uint64 ReadTsc() noexcept {
+        Uint32 low{};
+        Uint32 high{};
+
+        __asm__ volatile(
+            "rdtsc"
+            : "=a"(low), "=d"(high)
+            :
+            : "memory"
+        );
+
+        return static_cast<Uint64>(low) | (static_cast<Uint64>(high) << 32);
+    }
+
     CpuInitializationError CpuInfo::Initialize() noexcept {
         if (m_Initialized) return CpuInitializationError::AlreadyInitialized;
 
