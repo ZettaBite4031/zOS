@@ -2,6 +2,8 @@
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 
+#include <Kernel/Scheduling/Scheduler.hpp>
+
 namespace Zos::Kernel::Time {
     namespace {
         using Memory::MaximumValue;
@@ -71,7 +73,7 @@ namespace Zos::Kernel::Time {
         m_Apic->SetTimerInitialCount(0);
 
         if (!interrupts.RegisterFixedHandler(Architecture::AMD64::LocalApicTimerVector,
-                &HandleInterrupt, "Local APIC timer", Architecture::AMD64::InterruptAcknowledgement::LocalApicEoi))
+                &HandleInterrupt, "Local APIC timer", Architecture::AMD64::InterruptAcknowledgement::LocalApicEoiBeforeHandler))
             return LocalApicTimerInitializationError::HandlerRegistrationFailed;
 
         s_ActiveTimer = this;
@@ -225,12 +227,12 @@ namespace Zos::Kernel::Time {
         return true;
     }
 
-    void LocalApicTimer::HandleInterrupt(Architecture::AMD64::InterruptContext& ) noexcept {
+    void LocalApicTimer::HandleInterrupt(Architecture::AMD64::InterruptContext&) noexcept {
         LocalApicTimer* timer = s_ActiveTimer;
         if (timer == nullptr || timer->m_Clock == nullptr) return;
 
+        Architecture::AMD64::ProcessorLocal* current = Architecture::AMD64::CurrentProcessor();
         if (timer->m_Processor != nullptr) {
-            Architecture::AMD64::ProcessorLocal* current = Architecture::AMD64::CurrentProcessor();
             if (current == timer->m_Processor && current->Self == current &&
                 current->IsInitialized() && current->ApicId == timer->m_Processor->ApicId)
                 timer->m_ProcessorLocalObserved = true;
@@ -242,6 +244,16 @@ namespace Zos::Kernel::Time {
 
         timer->m_LastInterruptNanoseconds = now;
         timer->m_InterruptCount = count + 1;
+
+        /*
+        * Timer delivery verification occurs before preemption is enabled,
+        * so the same interrupt source serves both bring-up and scheduling.
+        */
+        if (current != nullptr && current->LocalScheduler != nullptr && current->LocalScheduler->PreemptionEnabled()) {
+            const auto error = current->LocalScheduler->Preempt();
+            if (error != Scheduling::SchedulerPreemptionError::Success)
+                Diagnostics::Fatal("Scheduler", Scheduling::Scheduler::Describe(error));
+        }
     }
 
     void LocalApicTimer::Print() const noexcept {

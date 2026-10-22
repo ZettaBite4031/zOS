@@ -85,6 +85,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
     enum class InterruptAcknowledgement : Memory::Uint8 {
         None,
         LocalApicEoi,
+        LocalApicEoiBeforeHandler,
     };
 
     enum class InterruptInitializationError : Memory::Uint32 {

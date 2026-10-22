@@ -59,11 +59,11 @@ namespace Zos::Kernel::Scheduling {
             Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map, Memory::Uint64 stack_page_count) noexcept;
 
         /*
-         * Low-level cooperative transfer from this Running thread to a
-         * Ready thread. IF must already be clear.
+         * Low-level transfer from this Running thread to a Ready thread.
+         * IF must already be clear.
          *
-         * Once a Scheduler is active, normal scheduling goes through
-         * Scheduler::Yield() rather than selecting threads directly.
+         * Both cooperative scheduling and interrupt-driven preemption use
+         * this primitive.
          */
         [[nodiscard]] ThreadSwitchError SwitchTo(Thread& next) noexcept;
 

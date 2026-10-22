@@ -40,11 +40,15 @@ namespace Zos::Kernel::Scheduling {
         if (!thread.IsInitialized() || thread.State() != ThreadState::Ready || !thread.HasContext())
             return SchedulerRegistrationError::InvalidThread;
 
-        if (m_Processor->CurrentThread == &thread) return SchedulerRegistrationError::CurrentThread;
+        if (m_Processor->CurrentThread == &thread)
+            return SchedulerRegistrationError::CurrentThread;
+
         if (thread.m_ReadyQueued || thread.m_ReadyNext != nullptr)
             return SchedulerRegistrationError::AlreadyQueued;
 
-        if (!EnqueueReady(thread)) return SchedulerRegistrationError::AlreadyQueued;
+        if (!EnqueueReady(thread))
+            return SchedulerRegistrationError::AlreadyQueued;
+
         return SchedulerRegistrationError::Success;
     }
 
@@ -65,35 +69,40 @@ namespace Zos::Kernel::Scheduling {
     }
 
     Thread* Scheduler::DequeueReady() noexcept {
-        Thread* thread = m_ReadyHead;
-        if (thread == nullptr) return nullptr;
+        if (m_ReadyHead == nullptr || m_ReadyTail == nullptr || m_ReadyCount == 0)
+            return nullptr;
 
+        Thread* thread = m_ReadyHead;
         m_ReadyHead = thread->m_ReadyNext;
         if (m_ReadyHead == nullptr) m_ReadyTail = nullptr;
 
         thread->m_ReadyNext = nullptr;
         thread->m_ReadyQueued = false;
-        if (m_ReadyCount == 0) return nullptr;
-
         m_ReadyCount--;
+
         return thread;
     }
 
     SchedulerYieldError Scheduler::Yield() noexcept {
-        if (!m_Initialized || m_Processor == nullptr) return SchedulerYieldError::NotInitialized;
-        if ((ReadRflags() & RflagsInterruptEnable) != 0) return SchedulerYieldError::InterruptsEnabled;
+        if (!m_Initialized || m_Processor == nullptr)
+            return SchedulerYieldError::NotInitialized;
+
+        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+            return SchedulerYieldError::InterruptsEnabled;
 
         Thread* current = m_Processor->CurrentThread;
-        if (current == nullptr || !current->IsInitialized() || current->State() != ThreadState::Running ||
-            current->m_ReadyQueued || current->m_ReadyNext != nullptr)
+
+        if (current == nullptr ||
+            !current->IsInitialized() ||
+            current->State() != ThreadState::Running ||
+            current->m_ReadyQueued ||
+            current->m_ReadyNext != nullptr)
             return SchedulerYieldError::InvalidCurrentThread;
 
-        /*
-         * A single runnable thread has nothing to yield to.
-         */
         if (m_ReadyHead == nullptr) {
             if (m_ReadyTail != nullptr || m_ReadyCount != 0)
                 return SchedulerYieldError::ReadyQueueCorrupted;
+
             return SchedulerYieldError::Success;
         }
 
@@ -101,22 +110,13 @@ namespace Zos::Kernel::Scheduling {
             return SchedulerYieldError::ReadyQueueCorrupted;
 
         Thread* next = m_ReadyHead;
+
         if (!next->IsInitialized() || next->State() != ThreadState::Ready ||
             !next->HasContext() || !next->m_ReadyQueued)
             return SchedulerYieldError::ReadyQueueCorrupted;
 
         next = DequeueReady();
-        if (next == nullptr)
-            return SchedulerYieldError::ReadyQueueCorrupted;
-
-        /*
-         * The current thread remains Running until Thread::SwitchTo commits
-         * the ownership transition, but it must already be visible in the
-         * ready queue so the incoming thread can select it immediately.
-         *
-         * IF is clear, so no asynchronous observer can see this transient
-         * queue/state mismatch.
-         */
+        if (next == nullptr) return SchedulerYieldError::ReadyQueueCorrupted;
         if (!EnqueueReady(*current))
             return SchedulerYieldError::ReadyQueueCorrupted;
 
@@ -126,15 +126,94 @@ namespace Zos::Kernel::Scheduling {
         if (switch_error != ThreadSwitchError::Success)
             return SchedulerYieldError::ContextSwitchFailed;
 
-        /*
-         * We only return here after another thread selected this thread from
-         * the ready queue and restored the suspended Yield() call frame.
-         */
         if (m_Processor->CurrentThread != current || current->State() != ThreadState::Running ||
             current->m_ReadyQueued || current->m_ReadyNext != nullptr)
             return SchedulerYieldError::ReadyQueueCorrupted;
 
         return SchedulerYieldError::Success;
+    }
+
+    bool Scheduler::EnablePreemption() noexcept {
+        if (!m_Initialized || m_Processor == nullptr || m_PreemptionEnabled)
+            return false;
+
+        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+            return false;
+
+        Thread* current = m_Processor->CurrentThread;
+        if (current == nullptr || !current->IsInitialized() || current->State() != ThreadState::Running ||
+            current->m_ReadyQueued || current->m_ReadyNext != nullptr)
+            return false;
+
+        if ((m_ReadyHead == nullptr) != (m_ReadyTail == nullptr)) return false;
+        if ((m_ReadyHead == nullptr) != (m_ReadyCount == 0)) return false;
+
+        m_PreemptionEnabled = true;
+        return true;
+    }
+
+    SchedulerPreemptionError Scheduler::Preempt() noexcept {
+        if (!m_Initialized || m_Processor == nullptr)
+            return SchedulerPreemptionError::NotInitialized;
+
+        if (!m_PreemptionEnabled)
+            return SchedulerPreemptionError::Disabled;
+
+        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+            return SchedulerPreemptionError::InterruptsEnabled;
+
+        Thread* current = m_Processor->CurrentThread;
+
+        if (current == nullptr || !current->IsInitialized() || current->State() != ThreadState::Running ||
+            current->m_ReadyQueued || current->m_ReadyNext != nullptr)
+            return SchedulerPreemptionError::InvalidCurrentThread;
+
+        /*
+         * Nothing else is runnable. The interrupted thread simply returns
+         * from the timer interrupt and keeps its CPU.
+         */
+        if (m_ReadyHead == nullptr) {
+            if (m_ReadyTail != nullptr || m_ReadyCount != 0)
+                return SchedulerPreemptionError::ReadyQueueCorrupted;
+
+            return SchedulerPreemptionError::Success;
+        }
+
+        if (m_ReadyTail == nullptr || m_ReadyCount == 0)
+            return SchedulerPreemptionError::ReadyQueueCorrupted;
+
+        Thread* next = m_ReadyHead;
+        if (!next->IsInitialized() || next->State() != ThreadState::Ready ||
+            !next->HasContext() || !next->m_ReadyQueued)
+            return SchedulerPreemptionError::ReadyQueueCorrupted;
+
+        next = DequeueReady();
+        if (next == nullptr) return SchedulerPreemptionError::ReadyQueueCorrupted;
+
+        /*
+         * Publish the interrupted thread as runnable before transferring
+         * execution. IF is already clear by architectural interrupt entry.
+         */
+        if (!EnqueueReady(*current))
+            return SchedulerPreemptionError::ReadyQueueCorrupted;
+
+        m_SwitchCount++;
+        m_PreemptionCount++;
+
+        const ThreadSwitchError switch_error = current->SwitchTo(*next);
+        if (switch_error != ThreadSwitchError::Success)
+            return SchedulerPreemptionError::ContextSwitchFailed;
+
+        /*
+         * Reaching here means a later timer tick selected this thread again.
+         * Its original interrupt stack is live once more and will unwind back
+         * through InterruptDispatch and IRETQ.
+         */
+        if (m_Processor->CurrentThread != current || current->State() != ThreadState::Running ||
+            current->m_ReadyQueued || current->m_ReadyNext != nullptr)
+            return SchedulerPreemptionError::ReadyQueueCorrupted;
+
+        return SchedulerPreemptionError::Success;
     }
 
     const char* Scheduler::Describe(SchedulerInitializationError error) noexcept {
@@ -163,11 +242,24 @@ namespace Zos::Kernel::Scheduling {
         switch (error) {
         case SchedulerYieldError::Success: return "success";
         case SchedulerYieldError::NotInitialized: return "scheduler is not initialized";
-        case SchedulerYieldError::InterruptsEnabled: return "cooperative scheduling currently requires maskable interrupts to be disabled";
+        case SchedulerYieldError::InterruptsEnabled: return "cooperative scheduling requires maskable interrupts to be disabled";
         case SchedulerYieldError::InvalidCurrentThread: return "scheduler current thread state is invalid";
         case SchedulerYieldError::ReadyQueueCorrupted: return "scheduler ready queue invariants were violated";
         case SchedulerYieldError::ContextSwitchFailed: return "scheduler context switch failed";
         default: return "unknown scheduler yield error";
+        }
+    }
+
+    const char* Scheduler::Describe(SchedulerPreemptionError error) noexcept {
+        switch (error) {
+        case SchedulerPreemptionError::Success: return "success";
+        case SchedulerPreemptionError::NotInitialized: return "scheduler is not initialized";
+        case SchedulerPreemptionError::Disabled: return "scheduler preemption is disabled";
+        case SchedulerPreemptionError::InterruptsEnabled: return "preemption path entered with maskable interrupts enabled";
+        case SchedulerPreemptionError::InvalidCurrentThread: return "preemption current thread state is invalid";
+        case SchedulerPreemptionError::ReadyQueueCorrupted: return "scheduler ready queue invariants were violated during preemption";
+        case SchedulerPreemptionError::ContextSwitchFailed: return "preemptive context switch failed";
+        default: return "unknown scheduler preemption error";
         }
     }
 }

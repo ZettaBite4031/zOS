@@ -29,6 +29,16 @@ namespace Zos::Kernel::Scheduling {
         ContextSwitchFailed,
     };
 
+    enum class SchedulerPreemptionError : Memory::Uint32 {
+        Success,
+        NotInitialized,
+        Disabled,
+        InterruptsEnabled,
+        InvalidCurrentThread,
+        ReadyQueueCorrupted,
+        ContextSwitchFailed,
+    };
+
     class Scheduler final {
     public:
         constexpr Scheduler() noexcept = default;
@@ -36,34 +46,40 @@ namespace Zos::Kernel::Scheduling {
         Scheduler(const Scheduler&) = delete;
         Scheduler& operator=(const Scheduler&) = delete;
 
-        /*
-         * Binds this scheduler to one processor. The processor must already
-         * have a valid Running CurrentThread.
-         */
         [[nodiscard]] SchedulerInitializationError Initialize(Architecture::AMD64::ProcessorLocal& processor) noexcept;
 
-        /*
-         * Adds an initialized Ready thread to the FIFO run queue.
-         */
         [[nodiscard]] SchedulerRegistrationError RegisterThread(Thread& thread) noexcept;
 
         /*
-         * Cooperatively rotate to the next Ready thread.
-         *
-         * Step 11 deliberately retains Step 10's IF=0 requirement. Step 12
-         * will integrate scheduling with interrupt/preemption state.
-         *
-         * Yield with no alternate Ready thread is a valid no-op.
+         * Cooperative scheduling path. IF must already be clear.
          */
         [[nodiscard]] SchedulerYieldError Yield() noexcept;
 
+        /*
+         * Enables timer-driven scheduling on this processor.
+         *
+         * The transition itself must occur with IF clear so the timer cannot
+         * observe partially published scheduler state.
+         */
+        [[nodiscard]] bool EnablePreemption() noexcept;
+
+        /*
+         * Timer-interrupt scheduling path. The interrupt gate has already
+         * cleared IF and the interrupt manager has already acknowledged the
+         * Local APIC timer before this can switch stacks.
+         */
+        [[nodiscard]] SchedulerPreemptionError Preempt() noexcept;
+
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
+        [[nodiscard]] bool PreemptionEnabled() const noexcept { return m_PreemptionEnabled; }
         [[nodiscard]] Memory::Uint64 ReadyCount() const noexcept { return m_ReadyCount; }
         [[nodiscard]] Memory::Uint64 SwitchCount() const noexcept { return m_SwitchCount; }
+        [[nodiscard]] Memory::Uint64 PreemptionCount() const noexcept { return m_PreemptionCount; }
 
         [[nodiscard]] static const char* Describe(SchedulerInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(SchedulerRegistrationError error) noexcept;
         [[nodiscard]] static const char* Describe(SchedulerYieldError error) noexcept;
+        [[nodiscard]] static const char* Describe(SchedulerPreemptionError error) noexcept;
 
     private:
         [[nodiscard]] bool EnqueueReady(Thread& thread) noexcept;
@@ -76,7 +92,9 @@ namespace Zos::Kernel::Scheduling {
 
         Memory::Uint64 m_ReadyCount{};
         Memory::Uint64 m_SwitchCount{};
+        Memory::Uint64 m_PreemptionCount{};
 
+        bool m_PreemptionEnabled{};
         bool m_Initialized{};
     };
 }

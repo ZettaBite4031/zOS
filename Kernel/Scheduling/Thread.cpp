@@ -2,6 +2,7 @@
 
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+#include <Kernel/Scheduling/Scheduler.hpp>
 #include <Kernel/Processes/Process.hpp>
 
 namespace Zos::Kernel::Scheduling {
@@ -127,6 +128,15 @@ namespace Zos::Kernel::Scheduling {
         Architecture::AMD64::ProcessorLocal* processor = Architecture::AMD64::CurrentProcessor();
         if (processor == nullptr || processor->CurrentThread != thread)
             Diagnostics::Fatal("Thread", "fresh kernel thread does not own the current processor");
+
+        /*
+         * Fresh threads dispatched by the preemptive scheduler begin life
+         * from an interrupt-disabled switching context. Once scheduler
+         * preemption is active, normal kernel-thread execution runs with
+         * maskable interrupts enabled.
+         */
+        if (processor->LocalScheduler != nullptr && processor->LocalScheduler->PreemptionEnabled())
+            __asm__ volatile("sti" ::: "memory");
 
         thread->m_Entry(thread->m_EntryContext);
         thread->m_State = ThreadState::Terminated;

@@ -32,6 +32,12 @@ namespace Zos::Kernel::Initialization {
 
         inline constexpr Uint64 SchedulerSelfTestRounds{ 4 };
 
+        volatile Uint64 g_PreemptionWorkerIterations{};
+        volatile bool g_PreemptionSelfTestComplete{};
+
+        inline constexpr Uint64 PreemptionSelfTestMinimumSwitches{ 6 };
+        inline constexpr Uint64 PreemptionSelfTestTimeoutNanoseconds{ 1'000'000'000ULL };
+
         [[noreturn]] void FirstWorkerThreadEntry(void* context) noexcept {
             if (context == nullptr) Diagnostics::Fatal("Thread", "first worker thread received a null context");
 
@@ -68,8 +74,33 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Scheduler] Worker thread joined scheduler rotation.\n");
 
             for (;;) {
-                g_SchedulerWorkerIterations = g_SchedulerWorkerIterations + 1;
+                processor = CurrentProcessor();
 
+                if (processor == nullptr || processor->LocalScheduler == nullptr)
+                    Diagnostics::Fatal("Scheduler", "worker thread lost its local scheduler");
+
+                /*
+                * The worker's existing saved context originated in the old
+                * cooperative scheduler with IF clear. Its first timer-driven
+                * dispatch therefore explicitly enters normal interrupt-enabled
+                * preemptive execution.
+                */
+                if (processor->LocalScheduler->PreemptionEnabled()) {
+                    __asm__ volatile("sti" ::: "memory");
+
+                    while (!g_PreemptionSelfTestComplete) {
+                        g_PreemptionWorkerIterations = g_PreemptionWorkerIterations + 1;
+                        __asm__ volatile("pause");
+                    }
+
+                    /*
+                    * The worker has finished its bring-up job. Keep it runnable but
+                    * idle so timer preemption remains active without burning a core.
+                    */
+                    for (;;) __asm__ volatile("hlt");
+                }
+
+                g_SchedulerWorkerIterations = g_SchedulerWorkerIterations + 1;
                 const auto yield_error = processor->LocalScheduler->Yield();
                 if (yield_error != Scheduling::SchedulerYieldError::Success)
                     Diagnostics::Fatal("Scheduler", Scheduling::Scheduler::Describe(yield_error));
@@ -377,6 +408,64 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("\n");
         }
 
+        void RunPreemptionSelfTest(KernelRuntime& runtime) noexcept {
+            g_PreemptionWorkerIterations = 0;
+            g_PreemptionSelfTestComplete = false;
+
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor ||
+                processor->CurrentThread != &runtime.BootstrapThread ||
+                processor->LocalScheduler != &runtime.BootstrapScheduler)
+                Diagnostics::Fatal("Scheduler", "preemption self-test began with invalid processor state");
+
+            /*
+            * The periodic timer is already running and EnableAndVerify...
+            * deliberately left IF enabled. Publish preemption atomically
+            * with respect to that timer.
+            */
+            __asm__ volatile("cli" ::: "memory");
+
+            if (!runtime.BootstrapScheduler.EnablePreemption())
+                Diagnostics::Fatal("Scheduler", "failed to enable timer-driven preemption");
+
+            __asm__ volatile("sti" ::: "memory");
+
+            Diagnostics::Write("[zOS/Scheduler] Preemptive scheduling enabled.\n");
+            Diagnostics::Write("[zOS/Scheduler] Quantum: 1 timer tick\n" );
+
+            const Uint64 start = runtime.Clock.Nanoseconds();
+            Uint64 bootstrap_iterations{};
+            while (runtime.BootstrapScheduler.PreemptionCount() < PreemptionSelfTestMinimumSwitches || g_PreemptionWorkerIterations == 0) {
+                bootstrap_iterations++;
+
+                if (runtime.Clock.Nanoseconds() - start >
+                    PreemptionSelfTestTimeoutNanoseconds)
+                    Diagnostics::Fatal("Scheduler", "timer-driven preemption self-test timed out");
+
+                __asm__ volatile("pause");
+            }
+
+            if (bootstrap_iterations == 0 || g_PreemptionWorkerIterations == 0)
+                Diagnostics::Fatal("Scheduler", "preemptive threads did not both make forward progress");
+
+            processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor ||
+                processor->CurrentThread != &runtime.BootstrapThread ||
+                processor->LocalScheduler != &runtime.BootstrapScheduler ||
+                processor->CurrentThread->OwningProcess() != &runtime.KernelProcess ||
+                runtime.BootstrapScheduler.ReadyCount() != 1)
+                Diagnostics::Fatal("Scheduler", "preemption final scheduler state is invalid");
+
+            g_PreemptionSelfTestComplete = true;
+
+            Diagnostics::Write("[zOS/Scheduler] Both runnable threads made forward progress.\n");
+            Diagnostics::Write("[zOS/Scheduler] Timer preemptions: ");
+            Diagnostics::WriteDecimal(runtime.BootstrapScheduler.PreemptionCount());
+            Diagnostics::Write("\n");
+
+            Diagnostics::Write("[zOS/Scheduler] Preemptive round-robin verified.\n");
+        }
+
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
             if (runtime.Boot.Initialized)
                 Diagnostics::Fatal("Startup", "boot context was internalized more than once");
@@ -419,13 +508,13 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::LocalApicTimerReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::PreemptionReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
         /*
-         * No scheduler exists yet. The BSP idles between Local APIC
-         * timer interrupts with maskable interrupt delivery enabled.
+         * Preemptive scheduling is active. The bootstrap thread is idle
+         * whenever it has no runtime initialization work remaining.
          */
         for (;;) __asm__ volatile("hlt");
     }
@@ -577,6 +666,10 @@ namespace Zos::Kernel::Initialization {
         Diagnostics::Write("[zOS/CPU] Processor-local interrupt access verified.\n");
 
         AdvancePhase(runtime, KernelPhase::SchedulerReady, KernelPhase::LocalApicTimerReady);
+
+        RunPreemptionSelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::LocalApicTimerReady, KernelPhase::PreemptionReady);
 
         EnterRuntime(runtime);
     }

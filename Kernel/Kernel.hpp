@@ -92,6 +92,7 @@ namespace Zos::Kernel {
         CooperativeContextSwitchReady,
         SchedulerReady,
         LocalApicTimerReady,
+        PreemptionReady,
 
         Runtime,
     };

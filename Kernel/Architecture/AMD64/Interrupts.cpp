@@ -650,7 +650,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
             acknowledgement != InterruptAcknowledgement::None)
             return false;
 
-        if (acknowledgement == InterruptAcknowledgement::LocalApicEoi &&
+        if ((acknowledgement == InterruptAcknowledgement::LocalApicEoi || acknowledgement == InterruptAcknowledgement::LocalApicEoiBeforeHandler) &&
             m_LocalApic == nullptr)
             return false;
 
@@ -718,6 +718,13 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         if (!slot.Claimed || slot.Handler == nullptr)
             GenericInterruptHandler(context);
+
+        if (slot.Acknowledgement == InterruptAcknowledgement::LocalApicEoiBeforeHandler) {
+            if (m_LocalApic == nullptr || !m_LocalApic->IsInitialized())
+                GenericInterruptHandler(context);
+
+            m_LocalApic->EndOfInterrupt();
+        }
 
         slot.Handler(context);
 
