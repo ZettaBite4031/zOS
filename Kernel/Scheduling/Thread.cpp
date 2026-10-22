@@ -1,6 +1,6 @@
 #include <Kernel/Scheduling/Thread.hpp>
 
-#include <Kernel/Architecture/AMD64/Interrupts.hpp>
+#include <Kernel/Architecture/AMD64/DescriptorTables.hpp>
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 #include <Kernel/Architecture/AMD64/UserMode.hpp>
 
@@ -93,6 +93,10 @@ namespace Zos::Kernel::Scheduling {
     }
 
     ThreadSwitchError Thread::SwitchTo(Thread& next) noexcept {
+        return TransferTo(next, TransferDisposition::Ready);
+    }
+
+    ThreadSwitchError Thread::TransferTo(Thread& next, TransferDisposition disposition) noexcept {
         if (!m_Initialized || !next.m_Initialized || &next == this)
             return ThreadSwitchError::InvalidThread;
 
@@ -109,13 +113,19 @@ namespace Zos::Kernel::Scheduling {
         if (next.m_State != ThreadState::Ready || !next.m_ContextReady)
             return ThreadSwitchError::TargetNotReady;
 
-        if (m_Stack == nullptr || next.m_Stack == nullptr || !Architecture::AMD64::SetCurrentKernelPrivilegeStack(next.m_Stack->Top()))
+        if (m_Stack == nullptr || next.m_Stack == nullptr ||
+            !Architecture::AMD64::SetCurrentKernelPrivilegeStack(next.m_Stack->Top()))
             return ThreadSwitchError::KernelPrivilegeStackUpdateFailed;
 
-        Architecture::AMD64::PageMap* current_space = m_OwningProcess != nullptr ? m_OwningProcess->AddressSpace() : nullptr;
-        Architecture::AMD64::PageMap* next_space = next.m_OwningProcess != nullptr ? next.m_OwningProcess->AddressSpace() : nullptr;
-        if (current_space == nullptr || next_space == nullptr ||!current_space->IsActive())
+        Architecture::AMD64::PageMap* current_space =
+            m_OwningProcess != nullptr ? m_OwningProcess->AddressSpace() : nullptr;
+        Architecture::AMD64::PageMap* next_space =
+            next.m_OwningProcess != nullptr ? next.m_OwningProcess->AddressSpace() : nullptr;
+
+        if (current_space == nullptr || next_space == nullptr || !current_space->IsActive()) {
+            (void)Architecture::AMD64::SetCurrentKernelPrivilegeStack(m_Stack->Top());
             return ThreadSwitchError::AddressSpaceSwitchFailed;
+        }
 
         if (current_space != next_space) {
             const auto address_space_error = next_space->SwitchTo();
@@ -125,13 +135,20 @@ namespace Zos::Kernel::Scheduling {
             }
         }
 
-        m_State = ThreadState::Ready;
+        if (disposition == TransferDisposition::Terminated)
+            MarkTerminated();
+        else {
+            m_State = ThreadState::Ready;
+            m_ContextReady = true;
+        }
+
         next.m_State = ThreadState::Running;
         processor->CurrentThread = &next;
 
-        m_ContextReady = true;
-
         Architecture::AMD64::SwitchThreadContext(&m_Context, &next.m_Context);
+
+        if (disposition == TransferDisposition::Terminated)
+            Diagnostics::Fatal("Thread", "terminated thread unexpectedly resumed");
 
         if (m_Stack == nullptr || Architecture::AMD64::CurrentKernelPrivilegeStack() != m_Stack->Top())
             return ThreadSwitchError::ResumeKernelPrivilegeStackMismatch;
@@ -140,10 +157,16 @@ namespace Zos::Kernel::Scheduling {
         if (processor == nullptr || processor->CurrentThread != this || m_State != ThreadState::Running)
             return ThreadSwitchError::ResumeStateMismatch;
 
-        if (m_OwningProcess == nullptr || m_OwningProcess->AddressSpace() == nullptr || !m_OwningProcess->AddressSpace()->IsActive())
+        if (m_OwningProcess == nullptr || m_OwningProcess->AddressSpace() == nullptr ||
+            !m_OwningProcess->AddressSpace()->IsActive())
             return ThreadSwitchError::ResumeAddressSpaceMismatch;
 
         return ThreadSwitchError::Success;
+    }
+
+    [[noreturn]] void Thread::TerminateAndSwitchTo(Thread& next) noexcept {
+        const ThreadSwitchError error = TransferTo(next, TransferDisposition::Terminated);
+        Diagnostics::Fatal("Thread", Describe(error));
     }
 
     void Thread::MarkTerminated() noexcept {
@@ -239,7 +262,7 @@ namespace Zos::Kernel::Scheduling {
         if (Architecture::AMD64::CurrentKernelPrivilegeStack() != m_Stack->Top())
             Diagnostics::Fatal("Thread", "TSS RSP0 does not match the user thread kernel stack");
 
-        Architecture::AMD64::EnterUserMode(m_UserEntry,m_UserStackTop);
+        Architecture::AMD64::EnterUserMode(m_UserEntry, m_UserStackTop);
     }
 
     void Thread::Print() const noexcept {

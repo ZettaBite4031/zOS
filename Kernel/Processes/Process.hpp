@@ -2,14 +2,12 @@
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Memory/PhysicalMemory.hpp>
+#include <Kernel/UserFault.hpp>
 
 namespace Zos::Kernel::Scheduling {
     class Thread;
 }
 
-namespace Zos::Kernel::Architecture::AMD64 {
-    struct InterruptContext;
-}
 
 namespace Zos::Kernel::Processes {
     using ProcessId = Memory::Uint64;
@@ -31,10 +29,7 @@ namespace Zos::Kernel::Processes {
     struct ProcessFaultRecord final {
         bool Valid{};
         Memory::Uint64 ThreadId{};
-        Memory::Uint64 Vector{};
-        Memory::Uint64 ErrorCode{};
-        Memory::Uint64 FaultAddress{};
-        Memory::Uint64 InstructionPointer{};
+        UserFault Fault{};
     };
 
     class Process final {
@@ -68,8 +63,7 @@ namespace Zos::Kernel::Processes {
         [[nodiscard]] bool OwnsAddressSpace() const noexcept { return m_OwnsPageMap; }
         [[nodiscard]] const ProcessFaultRecord& FaultRecord() const noexcept { return m_FaultRecord; }
 
-        [[nodiscard]] bool BeginUserFaultTermination(Memory::Uint64 thread_id, Memory::Uint64 vector,
-            Memory::Uint64 error_code, Memory::Uint64 fault_address, Memory::Uint64 instruction_pointer) noexcept;
+        [[nodiscard]] bool BeginUserFaultTermination(Memory::Uint64 thread_id, const UserFault& fault) noexcept;
 
         [[nodiscard]] bool OwnsThread(const Scheduling::Thread& thread) const noexcept;
 
@@ -99,5 +93,5 @@ namespace Zos::Kernel::Processes {
         bool m_Initialized{};
     };
 
-    [[noreturn]] void HandleCurrentUserException(Architecture::AMD64::InterruptContext& context, Memory::Uint64 fault_address) noexcept;
+    [[noreturn]] void HandleCurrentUserFault(const UserFault& fault) noexcept;
 }

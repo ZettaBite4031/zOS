@@ -1,6 +1,5 @@
 #include <Kernel/Processes/Process.hpp>
 
-#include <Kernel/Architecture/AMD64/Interrupts.hpp>
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
@@ -85,7 +84,7 @@ namespace Zos::Kernel::Processes {
 
     void Process::AttachThread(Scheduling::Thread& thread) noexcept {
         /*
-         * Thread initialization guarantees that a fresh Thread reacehs this
+         * Thread initialization guarantees that a fresh Thread reaches this
          * point exactly once and that the owning Process is already active.
          */
         thread.m_OwningProcess = this;
@@ -98,19 +97,14 @@ namespace Zos::Kernel::Processes {
         m_ThreadCount++;
     }
 
-    bool Process::BeginUserFaultTermination( Memory::Uint64 thread_id, Memory::Uint64 vector, Memory::Uint64 error_code,
-        Memory::Uint64 fault_address, Memory::Uint64 instruction_pointer) noexcept {
-
+    bool Process::BeginUserFaultTermination(Memory::Uint64 thread_id, const UserFault& fault) noexcept {
         if (!m_Initialized || !m_OwnsPageMap || m_State != ProcessState::Active || m_FaultRecord.Valid)
             return false;
 
         m_FaultRecord = {
             .Valid = true,
             .ThreadId = thread_id,
-            .Vector = vector,
-            .ErrorCode = error_code,
-            .FaultAddress = fault_address,
-            .InstructionPointer = instruction_pointer,
+            .Fault = fault,
         };
 
         m_State = ProcessState::Terminating;
@@ -169,37 +163,42 @@ namespace Zos::Kernel::Processes {
         }
     }
 
-    [[noreturn]] void HandleCurrentUserException(Architecture::AMD64::InterruptContext& context, Memory::Uint64 fault_address) noexcept {
+    [[noreturn]] void HandleCurrentUserFault(const UserFault& fault) noexcept {
         using Architecture::AMD64::CurrentProcessor;
-
-        if (!context.FromUserMode())
-            Diagnostics::Fatal("User", "user exception policy received a kernel exception");
 
         Architecture::AMD64::ProcessorLocal* processor = CurrentProcessor();
         if (processor == nullptr || processor->CurrentThread == nullptr || processor->LocalScheduler == nullptr)
-            Diagnostics::Fatal("User", "user exception arrived without scheduler ownership");
+            Diagnostics::Fatal("User", "user fault arrived without scheduler ownership");
 
         Scheduling::Thread* thread = processor->CurrentThread;
         Process* process = thread->OwningProcess();
         if (process == nullptr || !process->OwnsAddressSpace() || process->State() != ProcessState::Active)
             Diagnostics::Fatal("User", "faulting user thread has invalid process ownership");
 
-        if (!process->BeginUserFaultTermination(thread->Id(), context.Vector, context.ErrorCode, fault_address, context.Rip))
+        if (!process->BeginUserFaultTermination(thread->Id(), fault))
             Diagnostics::Fatal("User", "failed to begin user-process fault termination");
 
-        Diagnostics::Write("[zOS/User] Fatal user exception contained.\n");
+        const char* fault_name = "unknown";
+        switch (fault.Kind) {
+        case UserFaultKind::InvalidOpcode: fault_name = "invalid opcode"; break;
+        case UserFaultKind::GeneralProtection: fault_name = "general protection"; break;
+        case UserFaultKind::PageFault: fault_name = "page fault"; break;
+        }
+
+        Diagnostics::Write("[zOS/User] Fatal user fault contained.\n");
         Diagnostics::Write("[zOS/User] Process ID: ");
         Diagnostics::WriteDecimal(process->Id());
         Diagnostics::Write(", thread ID: ");
         Diagnostics::WriteDecimal(thread->Id());
-        Diagnostics::Write(", vector: ");
-        Diagnostics::WriteDecimal(context.Vector);
+        Diagnostics::Write(", fault: ");
+        Diagnostics::Write(fault_name);
         Diagnostics::Write("\n");
 
         /*
-        * Success never returns. The faulting interrupt frame is abandoned on
-        * the terminated thread's kernel stack rather than IRETQ'ing to CPL3.
-        */
+         * Success never returns. The faulting architecture frame is abandoned
+         * on the terminated thread's kernel stack rather than returning to
+         * userspace.
+         */
         processor->LocalScheduler->TerminateCurrent();
 
         __builtin_unreachable();

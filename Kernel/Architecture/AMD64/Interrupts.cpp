@@ -1,9 +1,10 @@
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
 
 #include <Kernel/Architecture/AMD64/APIC.hpp>
+#include <Kernel/Architecture/AMD64/DescriptorTables.hpp>
+#include <Kernel/Architecture/AMD64/UserFault.hpp>
 
 extern "C" void InterruptCommonEntry() noexcept;
-extern "C" void LoadDescriptorTables(const void* gdtr, const void* idtr) noexcept;
 extern "C" void InterruptDispatch(Zos::Kernel::Architecture::AMD64::InterruptContext* context) noexcept;
 
 /*
@@ -134,60 +135,14 @@ __asm__(
     ".popsection\n"
 );
 
-/*
- * Installs the zOS GDT, reloads the kernel segment selectors
- * loads TR with the zOS TSS, and isntalls the IDT.
- * 
- * RDI = GDTR*
- * RSI = IDTR*
- */
-__asm__(
-    ".pushsection .text.LoadDescriptorTables,\"ax\",@progbits\n"
-    ".global LoadDescriptorTables\n"
-    ".type LoadDescriptorTables,@function\n"
-
-    "LoadDescriptorTables:\n"
-
-    "   lgdt (%rdi)\n"
-
-    /*
-     * Reload data/stack selectors
-     */
-    "   movw $0x10, %ax\n"
-    "   movw %ax, %ds\n"
-    "   movw %ax, %es\n"
-    "   movw %ax, %ss\n"
-
-    /*
-     * Reload CS using a far return
-     *
-     * 0x08 = KernelCodeSelector
-     */
-    "   pushq $0x08\n"
-    "   leaq 1f(%rip), %rax\n"
-    "   pushq %rax\n"
-    "   lretq\n"
-
-    "1:\n"
-
-    /*
-     * 0x18 = TaskStateSelector
-     */
-    "   movw $0x18, %ax\n"
-    "   ltr %ax\n"
-
-    "   lidt (%rsi)\n"
-
-    "   ret\n"
-
-    ".size LoadDescriptorTables, .-LoadDescriptorTables\n"
-    ".popsection\n"
-);
-
 namespace {
     using namespace Zos::Kernel;
     using namespace Zos::Kernel::Memory;
     using namespace Zos::Kernel::Architecture::AMD64;
+
+    static_assert(InterruptVectorCount == InterruptDescriptorCount);
+    static_assert(KernelDataSelector == 0x10);
+    static_assert(UserDataSelector == 0x2B);
 
     inline constexpr Uint16 DebugPort{ 0xE9 };
 
@@ -577,16 +532,7 @@ namespace {
     void VectorPolicySelfTestHandler(InterruptContext&) noexcept {
     }
 
-    [[nodiscard]] bool IsContainableUserException(Uint8 vector) noexcept {
-        /*
-        * Step 16 contains the synchronous user faults for which zOS already has
-        * architectural handlers. NMI, #DF, #MC, and other system-level events
-        * remain kernel-fatal.
-        */
-        return vector == 6 ||   // #UD
-            vector == 13 ||  // #GP
-            vector == 14;    // #PF
-    }
+
 }
 
 extern "C" void InterruptDispatch(Zos::Kernel::Architecture::AMD64::InterruptContext* context) noexcept {
@@ -657,11 +603,11 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return true;
     }
 
-    bool InterruptManager::BindUserExceptionHandler(UserExceptionHandler handler) noexcept {
-        if (!m_Initialized || handler == nullptr || m_UserExceptionHandler != nullptr)
+    bool InterruptManager::BindUserFaultHandler(UserFaultHandler handler) noexcept {
+        if (!m_Initialized || handler == nullptr || m_UserFaultHandler != nullptr)
             return false;
 
-        m_UserExceptionHandler = handler;
+        m_UserFaultHandler = handler;
         return true;
     }
 
@@ -752,15 +698,17 @@ namespace Zos::Kernel::Architecture::AMD64 {
         const Uint8 vector = static_cast<Uint8>(context.Vector);
         HandlerSlot& slot = m_Handlers[vector];
 
-        if (context.FromUserMode() && IsContainableUserException(vector) && m_UserExceptionHandler != nullptr) {
-            const Uint64 fault_address = vector == 14 ? ReadCr2() : 0;
-            m_UserExceptionHandler(context, fault_address);
+        if (context.FromUserMode() && m_UserFaultHandler != nullptr) {
+            UserFault fault{};
+            if (TranslateUserFault(context, fault)) {
+                m_UserFaultHandler(fault);
 
-            /*
-            * A fatal user-exception policy must not return to the faulting user
-            * frame. If one ever does, fail closed in the kernel.
-            */
-            GenericInterruptHandler(context);
+                /*
+                 * Fatal user-fault policy must not return to the faulting frame.
+                 * If it ever does, fail closed in the architecture layer.
+                 */
+                GenericInterruptHandler(context);
+            }
         }
 
         if (!slot.Claimed || slot.Handler == nullptr)
@@ -780,112 +728,6 @@ namespace Zos::Kernel::Architecture::AMD64 {
                 GenericInterruptHandler(context);
 
             m_LocalApic->EndOfInterrupt();
-        }
-    }
-
-    void InterruptManager::InitializeGdt() noexcept {
-        /*
-         * 64-bit kernel code:
-         *
-         * Present
-         * DPL 0
-         * Executable
-         * Readable
-         * Long mode
-         * 4 KiB granularity
-         */
-        constexpr Uint64 KernelCodeDescriptor{ 0x00AF9A000000FFFFULL };
-
-        /*
-         * Kernel data segment
-         *
-         * Most segmentation semantics are ignored in long mode,
-         * but a valid data/stack selector remains useful.
-         */
-        constexpr Uint64 KernelDataDescriptor{ 0x00CF92000000FFFFULL };
-
-        constexpr Uint64 UserDataDescriptor{ 0x00CFF2000000FFFFULL };
-        constexpr Uint64 UserCodeDescriptor{ 0x00AFFA000000FFFFULL };
-
-        m_Gdt = {};
-        m_Tss = {};
-
-        m_Gdt.KernelCode = KernelCodeDescriptor;
-        m_Gdt.KernelData = KernelDataDescriptor;
-
-        m_Gdt.UserData = UserDataDescriptor;
-        m_Gdt.UserCode = UserCodeDescriptor;
-
-        /*
-         * Stack grows downward, so IST1 points immediately after
-         * the final byte of the backing array
-         */
-        m_Tss.Ist1 = reinterpret_cast<Uint64>(m_DoubleFaultStack + sizeof(m_DoubleFaultStack));
-
-        /*
-         * RSP0 becomes relevant when zOS begins transitioning
-         * from CPL3 to CPL0.
-         */
-        m_Tss.Rsp0 = 0;
-
-        /*
-         * Place the I/O permission bitmap outside the TSS limit,
-         * effectively indicating that no bitmap is present.
-         */
-        m_Tss.IoMapBase = static_cast<Uint16>(sizeof(TaskStateSegment));
-
-        const Uint64 tss_base = reinterpret_cast<Uint64>(&m_Tss);
-        constexpr Uint32 tss_limit = sizeof(TaskStateSegment) - 1;
-        TssDescriptor& descriptor = m_Gdt.Tss;
-        descriptor.LimitLow = static_cast<Uint16>(tss_limit);
-        descriptor.BaseLow = static_cast<Uint16>(tss_base);
-        descriptor.BaseMiddle = static_cast<Uint8>(tss_base >> 16);
-
-        /*
-         * Present, DPL 0, available 64-bit TSS.
-         */
-        descriptor.Access = 0x89;
-
-        descriptor.LimitHighFlags = static_cast<Uint8>((tss_limit >> 16) & 0x0F);
-        descriptor.BaseHigh = static_cast<Uint8>(tss_base >> 24);
-        descriptor.BaseUpper = static_cast<Uint32>(tss_base >> 32);
-        descriptor.Reserved = 0;
-    }
-
-    void InterruptManager::SetIdtGate(Uint8 vector, VirtualAddress handler, Uint8 ist) noexcept {
-        IdtEntry& entry = m_Idt[vector];
-        entry = {};
-
-        const Uint64 address = handler.Value();
-        entry.OffsetLow = static_cast<Uint16>(address);
-        entry.Selector = KernelCodeSelector;
-        entry.Ist = ist & 0x07;
-
-        /*
-         * 0x8E:
-         * 
-         * Present  = 1
-         * DPL      = 0
-         * Type     = 64-bit interrupt gate
-         */
-        entry.Attributes = 0x8E;
-        entry.OffsetMiddle = static_cast<Uint16>(address >> 16);
-        entry.OffsetHigh = static_cast<Uint32>(address >> 32);
-        entry.Reserved = 0;
-    }
-
-    void InterruptManager::InitializeIdt() noexcept {
-        for (Uint64 vector = 0; vector < InterruptVectorCount; vector++) {
-            const VirtualAddress stub = m_TrampolineVirtual.Base() + vector * RuntimeStubSize;
-
-            /*
-             * #DF receives IST1.
-             *
-             * Other vectors initially remain on the current kernel
-             * stack. NMI/#MC can receive dedicated IST stacks later.
-             */
-            const Uint8 ist = vector == 8 ? 1 : 0;
-            SetIdtGate(static_cast<Uint8>(vector), stub, ist);
         }
     }
 
@@ -939,7 +781,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
          * runtime-code alias executable.
          * 
          * This guarantees that at no point does the trampoline
-         * physical page have simulataneous writable and executable
+         * physical page have simultaneous writable and executable
          * aliases
          */
         if (!RemapPage(*m_PageMap, code_direct, code_physical, read_only)) return false;
@@ -1001,46 +843,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return InterruptInitializationError::Success;
     }
 
-    bool InterruptManager::ValidateDescriptorTables() const noexcept {
-        DescriptorTablePointer loaded_gdt{};
-        DescriptorTablePointer loaded_idt{};
-
-        Uint16 task_register{};
-        Uint16 code_segment{};
-        Uint16 stack_segment{};
-
-        __asm__ volatile(
-            "sgdt %0"
-            : "=m"(loaded_gdt)
-        );
-        __asm__ volatile(
-            "sidt %0"
-            : "=m"(loaded_idt)
-        );
-        __asm__ volatile(
-            "str %0"
-            : "=r"(task_register)
-        );
-        __asm__ volatile(
-            "mov %%cs, %0"
-            : "=r"(code_segment)
-        );
-        __asm__ volatile(
-            "mov %%ss, %0"
-            : "=r"(stack_segment)
-        );
-
-        const Uint64 expected_gdt = reinterpret_cast<Uint64>(&m_Gdt);
-        const Uint64 expected_idt = reinterpret_cast<Uint64>(&m_Idt[0]);
-
-        return loaded_gdt.Base == expected_gdt && loaded_gdt.Limit == sizeof(m_Gdt) - 1
-            && loaded_idt.Base == expected_idt && loaded_idt.Limit == sizeof(m_Idt) - 1
-            && task_register == TaskStateSelector
-            && code_segment == KernelCodeSelector
-            && stack_segment == KernelDataSelector;   
-    }
-
-    InterruptInitializationError InterruptManager::Initialize(PhysicalMemoryManager& physical_memory, VirtualAddressAllocator& virtual_addresses, PageMap& page_map) noexcept {
+    InterruptInitializationError InterruptManager::Initialize(PhysicalMemoryManager& physical_memory, VirtualAddressAllocator& virtual_addresses,
+        PageMap& page_map, DescriptorTables& descriptor_tables) noexcept {
         if (m_Initialized) return InterruptInitializationError::AlreadyInitialized;
         if (!physical_memory.IsInitialized() || !virtual_addresses.IsInitialized() || !page_map.IsInitialized() || !page_map.IsActive()) 
             return InterruptInitializationError::InvalidDependency;
@@ -1063,29 +867,15 @@ namespace Zos::Kernel::Architecture::AMD64 {
         const InterruptInitializationError trampoline_error = InitializeTrampolines();
         if (trampoline_error != InterruptInitializationError::Success) return trampoline_error;
 
-        InitializeGdt();
-        InitializeIdt();
-
-        const DescriptorTablePointer gdtr{ 
-            .Limit = static_cast<Uint16>(sizeof(m_Gdt) - 1),
-            .Base = reinterpret_cast<Uint64>(&m_Gdt),
-        };
-
-        const DescriptorTablePointer idtr{
-            .Limit = static_cast<Uint16>(sizeof(m_Idt) - 1),
-            .Base = reinterpret_cast<Uint64>(&m_Idt),
-        };
-
         /*
-         * The dispatcher must already know its manager before LIDT.
-         * An NMI or architectural exception can occur independently
-         * of IF.
+         * The dispatcher must already know its manager before LIDT. An NMI or
+         * architectural exception can occur independently of IF once the new
+         * descriptor tables become active.
          */
         g_InterruptManager = this;
 
-        LoadDescriptorTables(&gdtr, &idtr);
-
-        if (!ValidateDescriptorTables()) 
+        const auto descriptor_error = descriptor_tables.Initialize(m_TrampolineVirtual.Base(), RuntimeStubSize);
+        if (descriptor_error != DescriptorTableInitializationError::Success)
             return InterruptInitializationError::DescriptorLoadFailed;
 
         m_Initialized = true;
@@ -1218,24 +1008,6 @@ namespace Zos::Kernel::Architecture::AMD64 {
         case InterruptInitializationError::DescriptorLoadFailed: return "failed to activate or validate zOS descriptor tables";
         }
         return "unknown interrupt initialization error";
-    }
-
-    bool InterruptManager::SetKernelPrivilegeStack(VirtualAddress stack_top) noexcept {
-        if (!m_Initialized || stack_top.IsNull() || !PageMap::IsCanonical(stack_top) || (stack_top.Value() & 0xFULL) != 0)
-            return false;
-
-        m_Tss.Rsp0 = stack_top.Value();
-        return m_Tss.Rsp0 == stack_top.Value();
-    }
-
-    bool SetCurrentKernelPrivilegeStack(VirtualAddress stack_top) noexcept {
-        return g_InterruptManager != nullptr && g_InterruptManager->SetKernelPrivilegeStack(stack_top);
-    }
-
-    VirtualAddress CurrentKernelPrivilegeStack() noexcept {
-        if (g_InterruptManager == nullptr)
-            return {};
-        return g_InterruptManager->KernelPrivilegeStack();
     }
 
     [[noreturn]] void GenericInterruptHandler(InterruptContext& context) noexcept {

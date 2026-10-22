@@ -1,10 +1,6 @@
 #include <Kernel/Scheduling/Scheduler.hpp>
 
-#include <Kernel/Architecture/AMD64/Interrupts.hpp>
-
 #include <Kernel/Diagnostics/Diagnostics.hpp>
-
-#include <Kernel/Processes/Process.hpp>
 
 namespace Zos::Kernel::Scheduling {
     namespace {
@@ -242,51 +238,19 @@ namespace Zos::Kernel::Scheduling {
             !next->HasContext() || !next->m_ReadyQueued || next->m_Stack == nullptr)
             Diagnostics::Fatal("Scheduler", "termination target is not a valid ready thread");
 
-        Processes::Process* current_process = current->m_OwningProcess;
-        Processes::Process* next_process = next->m_OwningProcess;
-
-        Architecture::AMD64::PageMap* current_space = current_process != nullptr ? current_process->AddressSpace() : nullptr;
-        Architecture::AMD64::PageMap* next_space = next_process != nullptr ? next_process->AddressSpace() : nullptr;
-        if (current_space == nullptr || next_space == nullptr || !current_space->IsActive())
-            Diagnostics::Fatal("Scheduler", "termination address-space ownership is invalid");
-
         next = DequeueReady();
         if (next == nullptr)
             Diagnostics::Fatal("Scheduler", "failed to dequeue termination target");
 
-        if (!Architecture::AMD64::SetCurrentKernelPrivilegeStack(next->m_Stack->Top()))
-            Diagnostics::Fatal("Scheduler", "failed to update TSS RSP0 while terminating a thread");
-
-        if (current_space != next_space) {
-            const auto switch_error = next_space->SwitchTo();
-
-            if (switch_error != Architecture::AMD64::PageMapSwitchError::Success) {
-                if (current->m_Stack != nullptr)
-                    (void)Architecture::AMD64::SetCurrentKernelPrivilegeStack(current->m_Stack->Top());
-
-                Diagnostics::Fatal("Scheduler", "failed to activate address space while terminating a thread");
-            }
-        }
-
         /*
-         * This is the key difference from Preempt(): the outgoing thread is
-         * never enqueued. Its saved fault frame becomes unreachable scheduler
-         * state and can never return to userspace.
+         * Unlike Yield/Preempt, the outgoing thread is never placed back on
+         * the ready queue. Thread owns the architectural transfer itself so
+         * CR3 and TSS RSP0 handling cannot diverge between switch paths.
          */
-        current->MarkTerminated();
-
-        next->m_State = ThreadState::Running;
-        m_Processor->CurrentThread = next;
-
         m_SwitchCount++;
         m_TerminationCount++;
 
-        Architecture::AMD64::SwitchThreadContext(&current->m_Context, &next->m_Context);
-
-        /*
-         * A terminated thread must never become schedulable again.
-         */
-        Diagnostics::Fatal("Scheduler", "terminated thread unexpectedly resumed");
+        current->TerminateAndSwitchTo(*next);
     }
 
     const char* Scheduler::Describe(SchedulerInitializationError error) noexcept {

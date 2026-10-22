@@ -1,6 +1,6 @@
 #include <Kernel/Architecture/AMD64/UserMode.hpp>
 
-#include <Kernel/Architecture/AMD64/Interrupts.hpp>
+#include <Kernel/Architecture/AMD64/DescriptorTables.hpp>
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 
 extern "C" [[noreturn]] void EnterUserModeAssembly(Zos::Kernel::Memory::Uint64 entry, Zos::Kernel::Memory::Uint64 stack_top) noexcept;

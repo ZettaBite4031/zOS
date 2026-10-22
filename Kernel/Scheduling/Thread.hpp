@@ -113,6 +113,13 @@ namespace Zos::Kernel::Scheduling {
         friend class Scheduler;
         friend class ::Zos::Kernel::Processes::Process;
 
+        enum class TransferDisposition : Memory::Uint8 {
+            Ready,
+            Terminated,
+        };
+
+        [[nodiscard]] ThreadSwitchError TransferTo(Thread& next, TransferDisposition disposition) noexcept;
+        [[noreturn]] void TerminateAndSwitchTo(Thread& next) noexcept;
         void MarkTerminated() noexcept;
         static void StartContext(void* argument) noexcept;
         void Print() const noexcept;
