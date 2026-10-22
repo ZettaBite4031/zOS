@@ -12,6 +12,7 @@
 #include <Kernel/Architecture/AMD64/CPU.hpp>
 #include <Kernel/Architecture/AMD64/APIC.hpp>
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
+#include <Kernel/Architecture/AMD64/SystemCalls.hpp>
 
 #include <Kernel/Platform/ACPI/ACPI.hpp>
 #include <Kernel/Platform/ACPI/MADT.hpp>
@@ -96,6 +97,7 @@ namespace Zos::Kernel {
         PreemptionReady,
         ProcessAddressSpacesReady,
         Ring3Ready,
+        SystemCallsReady,
         UserFaultIsolationReady,
 
         Runtime,
@@ -125,6 +127,7 @@ namespace Zos::Kernel {
         Architecture::AMD64::CpuInfo Cpu{};
         Architecture::AMD64::LocalApic Apic{};
         Architecture::AMD64::ProcessorLocal BootstrapProcessor{};
+        Architecture::AMD64::SystemCallEntry SystemCallEntry{};
         Memory::KernelHeap Heap{};
 
         Platform::ACPI::TableDirectory Acpi{};

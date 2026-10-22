@@ -6,6 +6,7 @@
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+#include <Kernel/SystemCalls/SystemCalls.hpp>
 
 namespace Zos::Kernel::Initialization::ExecutionBootstrap {
     namespace {
@@ -47,10 +48,12 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
             FirstUserStackBase.Value() + FirstUserModeStackPages * PageSize
         };
         inline constexpr Uint64 FirstUserModeMarker{ 0x5A4F535553455231ULL };
+        inline constexpr Uint64 FirstUserSystemCallStackMarker{ 0x5A4F535359534331ULL };
         inline constexpr VirtualAddress FirstUserFaultAddress{ FirstUserStackGuard.Value() };
         volatile bool g_UserModeReady{};
 
         static_assert((FirstUserStackTop.Value() & 0xFULL) == 0);
+        static_assert(static_cast<Uint64>(SystemCalls::NativeSystemCall::GetProcessId) == 0);
 
         void WriteLittleEndian64(Uint8* destination, Uint64 value) noexcept {
             for (Uint64 byte = 0; byte < 8; byte++)
@@ -195,6 +198,10 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         * records that reality rather than performing a context transition.
         */
         processor->CurrentThread = &runtime.BootstrapThread;
+
+        if (!SetCurrentKernelEntryStack(runtime.PrimaryStack.Top()))
+            Diagnostics::Fatal("Thread", "failed to bind bootstrap kernel entry stack");
+
         if (processor->CurrentThread != &runtime.BootstrapThread || !runtime.BootstrapThread.IsInitialized() || runtime.BootstrapThread.Id() != BootstrapThreadId ||
             runtime.BootstrapThread.State() != Scheduling::ThreadState::Running || runtime.BootstrapThread.OwningProcess() != &runtime.KernelProcess ||
             runtime.BootstrapThread.Stack() != &runtime.PrimaryStack || runtime.BootstrapThread.OwnsStack() || runtime.BootstrapThread.HasContext())
@@ -534,13 +541,22 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         /*
          * Tiny raw AMD64 user program:
          *
-         *   movabs FirstUserDataAddress, %rax
+         *   movabs FirstUserDataAddress, %rbx
          *   movabs FirstUserModeMarker, %rdx
-         *   mov    %rdx, (%rax)
+         *   mov    %rdx, (%rbx)
+         *   incq   8(%rbx)
+         *
+         *   movabs FirstUserSystemCallStackMarker, %r12
+         *   push   %r12
+         *   xor    %eax, %eax               ; GetProcessId = 0
+         *   syscall
+         *   pop    %r12
+         *   mov    %rax, 24(%rbx)           ; syscall result
+         *   mov    %r12, 32(%rbx)           ; stack/register round trip
          *
          * loop:
-         *   incq   8(%rax)
-         *   cmpq   $0, 16(%rax)
+         *   incq   8(%rbx)
+         *   cmpq   $0, 16(%rbx)
          *   jne    fault
          *   pause
          *   jmp    loop
@@ -549,56 +565,112 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
          *   movabs FirstUserFaultAddress, %rcx
          *   mov    (%rcx), %rdx
          *   ud2
+         *
+         * The push before SYSCALL deliberately makes user RSP non-16-byte
+         * aligned. Returning through SYSRET must restore that exact value so
+         * the pop succeeds and recovers the marker.
          */
 
+        /* movabs FirstUserDataAddress, %rbx */
         code[0] = 0x48;
-        code[1] = 0xB8;
+        code[1] = 0xBB;
         WriteLittleEndian64(code + 2, FirstUserDataAddress.Value());
 
+        /* movabs FirstUserModeMarker, %rdx */
         code[10] = 0x48;
         code[11] = 0xBA;
         WriteLittleEndian64(code + 12, FirstUserModeMarker);
 
+        /* mov %rdx, (%rbx) */
         code[20] = 0x48;
         code[21] = 0x89;
-        code[22] = 0x10;
+        code[22] = 0x13;
 
+        /* incq 8(%rbx) */
         code[23] = 0x48;
         code[24] = 0xFF;
-        code[25] = 0x40;
+        code[25] = 0x43;
         code[26] = 0x08;
 
-        code[27] = 0x48;
-        code[28] = 0x83;
-        code[29] = 0x78;
-        code[30] = 0x10;
-        code[31] = 0x00;
+        /* movabs FirstUserSystemCallStackMarker, %r12 */
+        code[27] = 0x49;
+        code[28] = 0xBC;
+        WriteLittleEndian64(code + 29, FirstUserSystemCallStackMarker);
 
-        code[32] = 0x75;
-        code[33] = 0x04;
+        /* push %r12 */
+        code[37] = 0x41;
+        code[38] = 0x54;
 
-        code[34] = 0xF3;
-        code[35] = 0x90;
+        /* xor %eax, %eax ; NativeSystemCall::GetProcessId */
+        code[39] = 0x31;
+        code[40] = 0xC0;
 
-        code[36] = 0xEB;
-        code[37] = 0xF1;
+        /* syscall */
+        code[41] = 0x0F;
+        code[42] = 0x05;
 
-        code[38] = 0x48;
-        code[39] = 0xB9;
-        WriteLittleEndian64(code + 40, FirstUserFaultAddress.Value());
+        /* pop %r12 */
+        code[43] = 0x41;
+        code[44] = 0x5C;
 
-        code[48] = 0x48;
-        code[49] = 0x8B;
-        code[50] = 0x11;
+        /* mov %rax, 24(%rbx) */
+        code[45] = 0x48;
+        code[46] = 0x89;
+        code[47] = 0x43;
+        code[48] = 0x18;
 
-        code[51] = 0x0F;
-        code[52] = 0x0B;
+        /* mov %r12, 32(%rbx) */
+        code[49] = 0x4C;
+        code[50] = 0x89;
+        code[51] = 0x63;
+        code[52] = 0x20;
+
+        /* loop: incq 8(%rbx) */
+        code[53] = 0x48;
+        code[54] = 0xFF;
+        code[55] = 0x43;
+        code[56] = 0x08;
+
+        /* cmpq $0, 16(%rbx) */
+        code[57] = 0x48;
+        code[58] = 0x83;
+        code[59] = 0x7B;
+        code[60] = 0x10;
+        code[61] = 0x00;
+
+        /* jne fault */
+        code[62] = 0x75;
+        code[63] = 0x04;
+
+        /* pause */
+        code[64] = 0xF3;
+        code[65] = 0x90;
+
+        /* jmp loop */
+        code[66] = 0xEB;
+        code[67] = 0xF1;
+
+        /* fault: movabs FirstUserFaultAddress, %rcx */
+        code[68] = 0x48;
+        code[69] = 0xB9;
+        WriteLittleEndian64(code + 70, FirstUserFaultAddress.Value());
+
+        /* mov (%rcx), %rdx -- expected #PF */
+        code[78] = 0x48;
+        code[79] = 0x8B;
+        code[80] = 0x11;
+
+        /* Safety guard if the invalid load somehow succeeds. */
+        code[81] = 0x0F;
+        code[82] = 0x0B;
 
         auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
 
         user_data[0] = 0; // Step 15 marker
         user_data[1] = 0; // progress counter
         user_data[2] = 0; // Step 16 fault request
+        user_data[3] = 0; // Step 17 GetProcessId result
+        user_data[4] = 0; // Step 17 user RSP/R12 preservation marker
 
         const MappingOptions user_code{
             .Access = PageAccess::Read | PageAccess::Execute | PageAccess::User,
@@ -640,7 +712,8 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
             Diagnostics::Fatal("User", Scheduling::Thread::Describe(user_mode_error));
         }
 
-        if (!runtime.Interrupts.BindUserFaultHandler(&Processes::HandleCurrentUserFault)) {
+        if (!runtime.Interrupts.BindUserFaultHandler(&Processes::HandleCurrentUserFault) ||
+            !runtime.SystemCallEntry.BindUserFaultHandler(&Processes::HandleCurrentUserFault)) {
             __asm__ volatile("sti" ::: "memory");
             Diagnostics::Fatal("User", "failed to bind user fault containment");
         }
@@ -677,13 +750,60 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
             !runtime.KernelPageMap.IsActive() || !runtime.FirstUserThread.UserModeConfigured())
             Diagnostics::Fatal("User", "kernel state was not restored after user preemption");
 
-        if (CurrentKernelPrivilegeStack() != runtime.BootstrapThread.Stack()->Top())
-            Diagnostics::Fatal("User", "TSS RSP0 does not follow the running kernel thread");
+        if (CurrentKernelEntryStack() != runtime.BootstrapThread.Stack()->Top())
+            Diagnostics::Fatal("User", "kernel entry stack does not follow the running thread");
 
         Diagnostics::Write("[zOS/User] CPL3 execution observed.\n");
         Diagnostics::Write("[zOS/User] User-mode timer entry verified.\n");
         Diagnostics::Write("[zOS/User] Conditional SWAPGS path verified.\n");
         Diagnostics::Write("[zOS/User] Ring 3 architectural transition verified.\n");
+    }
+
+    void RunSystemCallSelfTest(KernelRuntime& runtime) noexcept {
+        const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
+        if (data_direct.IsNull())
+            Diagnostics::Fatal("Syscall", "syscall test lost the user data-page direct map");
+
+        auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
+
+        if (!runtime.SystemCallEntry.IsInitialized() ||
+            runtime.FirstUserProcess.State() != Processes::ProcessState::Active ||
+            runtime.FirstUserThread.State() != Scheduling::ThreadState::Ready)
+            Diagnostics::Fatal("Syscall", "syscall self-test began with invalid execution state");
+
+        const Uint64 start = runtime.Clock.Nanoseconds();
+        while (user_data[3] != FirstUserProcessId ||
+               user_data[4] != FirstUserSystemCallStackMarker) {
+            if (runtime.Clock.Nanoseconds() - start > 1'000'000'000ULL)
+                Diagnostics::Fatal("Syscall", "native syscall round-trip self-test timed out");
+            __asm__ volatile("pause");
+        }
+
+        if (runtime.SystemCallEntry.DispatchCount() != 1)
+            Diagnostics::Fatal("Syscall", "unexpected native syscall dispatch count");
+
+        const Uint64 progress_before = user_data[1];
+        const Uint64 continuation_start = runtime.Clock.Nanoseconds();
+        while (user_data[1] == progress_before) {
+            if (runtime.Clock.Nanoseconds() - continuation_start > 500'000'000ULL)
+                Diagnostics::Fatal("Syscall", "userspace did not continue after SYSRET");
+            __asm__ volatile("pause");
+        }
+
+        ProcessorLocal* processor = CurrentProcessor();
+        if (processor != &runtime.BootstrapProcessor ||
+            processor->CurrentThread != &runtime.BootstrapThread ||
+            !runtime.KernelPageMap.IsActive() ||
+            runtime.BootstrapProcessor.SystemCallUserStackPointer != 0 ||
+            CurrentKernelEntryStack() != runtime.BootstrapThread.Stack()->Top())
+            Diagnostics::Fatal("Syscall", "kernel state was not restored after syscall execution");
+
+        Diagnostics::Write("[zOS/Syscall] User syscall entered on the current kernel stack.\n");
+        Diagnostics::Write("[zOS/Syscall] GetProcessId returned process ");
+        Diagnostics::WriteDecimal(user_data[3]);
+        Diagnostics::Write(".\n");
+        Diagnostics::Write("[zOS/Syscall] User RSP and preserved register state restored.\n");
+        Diagnostics::Write("[zOS/Syscall] Native syscall round trip verified.\n");
     }
 
     void RunUserFaultIsolationSelfTest(KernelRuntime& runtime) noexcept {
@@ -728,7 +848,7 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         if (!record.Valid || record.ThreadId != FirstUserThreadId ||
             fault.Kind != UserFaultKind::PageFault || !fault.AddressValid ||
             fault.Address != FirstUserFaultAddress ||
-            fault.InstructionPointer != FirstUserCodeAddress + 48 ||
+            fault.InstructionPointer != FirstUserCodeAddress + 78 ||
             fault.Access != UserFaultAccess::Read ||
             fault.Reason != UserFaultReason::NonPresent ||
             fault.ReservedBitViolation)

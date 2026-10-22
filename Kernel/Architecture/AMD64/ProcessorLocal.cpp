@@ -1,4 +1,5 @@
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
+#include <Kernel/Architecture/AMD64/DescriptorTables.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 
@@ -28,6 +29,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         ProcessorIndex = processor_index;
         ApicId = apic.Id();
         BootstrapProcessor = bootstrap_processor;
+        KernelEntryStackTop = 0;
+        SystemCallUserStackPointer = 0;
 
         /*
          * While zOS is kernel-only, GS points directly at processor-local
@@ -53,6 +56,16 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return ProcessorLocalInitializationError::Success;
     }
 
+
+    bool ProcessorLocal::SetKernelEntryStack(Memory::VirtualAddress stack_top) noexcept {
+        if (!Initialized || stack_top.IsNull() || !PageMap::IsCanonical(stack_top) ||
+            (stack_top.Value() & 0xFULL) != 0)
+            return false;
+
+        KernelEntryStackTop = stack_top.Value();
+        return KernelEntryStackTop == stack_top.Value();
+    }
+
     ProcessorLocal* CurrentProcessor() noexcept {
         ProcessorLocal* processor{};
 
@@ -64,6 +77,35 @@ namespace Zos::Kernel::Architecture::AMD64 {
         );
 
         return processor;
+    }
+
+    bool SetCurrentKernelEntryStack(Memory::VirtualAddress stack_top) noexcept {
+        ProcessorLocal* processor = CurrentProcessor();
+        if (processor == nullptr || !processor->IsInitialized()) return false;
+
+        const Memory::VirtualAddress previous = processor->KernelEntryStack();
+
+        if (!SetCurrentKernelPrivilegeStack(stack_top))
+            return false;
+
+        if (!processor->SetKernelEntryStack(stack_top)) {
+            if (!previous.IsNull())
+                (void)SetCurrentKernelPrivilegeStack(previous);
+            return false;
+        }
+
+        return true;
+    }
+
+    Memory::VirtualAddress CurrentKernelEntryStack() noexcept {
+        ProcessorLocal* processor = CurrentProcessor();
+        if (processor == nullptr || !processor->IsInitialized()) return {};
+
+        const Memory::VirtualAddress stack_top = processor->KernelEntryStack();
+        if (stack_top.IsNull() || CurrentKernelPrivilegeStack() != stack_top)
+            return {};
+
+        return stack_top;
     }
 
     void ProcessorLocal::Print() const noexcept {

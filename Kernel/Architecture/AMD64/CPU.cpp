@@ -132,6 +132,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         if (m_MaximumExtendedLeaf >= 0x80000001u) {
             const CpuidResult extended_features = Cpuid(0x80000001u);
+            m_Features.Syscall = (extended_features.Edx & Bit(11)) != 0;
             m_Features.Nx = (extended_features.Edx & Bit(20)) != 0;
         }
 
@@ -214,6 +215,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         WriteFeature("TSC", m_Features.Tsc);
         WriteFeature("Invariant TSC", m_Features.InvariantTsc);
         WriteFeature("NX", m_Features.Nx);
+        WriteFeature("SYSCALL/SYSRET", m_Features.Syscall);
         WriteFeature("SMEP", m_Features.Smep);
         WriteFeature("SMAP", m_Features.Smap);
         WriteFeature("PCID", m_Features.Pcid);

@@ -18,5 +18,6 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
 
     void InitializeRing3State(KernelRuntime& runtime) noexcept;
     void RunRing3SelfTest(KernelRuntime& runtime) noexcept;
+    void RunSystemCallSelfTest(KernelRuntime& runtime) noexcept;
     void RunUserFaultIsolationSelfTest(KernelRuntime& runtime) noexcept;
 }

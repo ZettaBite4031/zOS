@@ -363,14 +363,22 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::PreemptionReady, KernelPhase::ProcessAddressSpacesReady);
 
+        const auto syscall_error = runtime.SystemCallEntry.Initialize(runtime.Cpu, runtime.Descriptors);
+        if (syscall_error != SystemCallInitializationError::Success)
+            Diagnostics::Fatal("Syscall", SystemCallEntry::Describe(syscall_error));
+
         ExecutionBootstrap::InitializeRing3State(runtime);
         ExecutionBootstrap::RunRing3SelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::Ring3Ready);
 
+        ExecutionBootstrap::RunSystemCallSelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::SystemCallsReady);
+
         ExecutionBootstrap::RunUserFaultIsolationSelfTest(runtime);
 
-        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::UserFaultIsolationReady);
+        AdvancePhase(runtime, KernelPhase::SystemCallsReady, KernelPhase::UserFaultIsolationReady);
 
         EnterRuntime(runtime);
     }

@@ -7,6 +7,7 @@ namespace Zos::Kernel {
         InvalidOpcode,
         GeneralProtection,
         PageFault,
+        InvalidSystemCallState,
     };
 
     enum class UserFaultAccess : Memory::Uint8 {
@@ -41,4 +42,6 @@ namespace Zos::Kernel {
         bool AddressValid{};
         bool ReservedBitViolation{};
     };
+
+    using UserFaultHandler = void(*)(const UserFault& fault) noexcept;
 }

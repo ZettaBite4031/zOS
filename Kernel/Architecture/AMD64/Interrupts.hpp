@@ -2,10 +2,7 @@
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Memory/VirtualAddressAllocator.hpp>
-
-namespace Zos::Kernel {
-    struct UserFault;
-}
+#include <Kernel/UserFault.hpp>
 
 namespace Zos::Kernel::Architecture::AMD64 {
     class LocalApic;
@@ -69,7 +66,6 @@ namespace Zos::Kernel::Architecture::AMD64 {
     static_assert(sizeof(InterruptContext) == 20 * sizeof(Memory::Uint64));
 
     using InterruptHandler = void(*)(InterruptContext& context) noexcept;
-    using UserFaultHandler = void(*)(const ::Zos::Kernel::UserFault& fault) noexcept;
 
     enum class InterruptVectorClass : Memory::Uint8 {
         Exception,

@@ -1,6 +1,5 @@
 #include <Kernel/Scheduling/Thread.hpp>
 
-#include <Kernel/Architecture/AMD64/DescriptorTables.hpp>
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 #include <Kernel/Architecture/AMD64/UserMode.hpp>
 
@@ -114,7 +113,7 @@ namespace Zos::Kernel::Scheduling {
             return ThreadSwitchError::TargetNotReady;
 
         if (m_Stack == nullptr || next.m_Stack == nullptr ||
-            !Architecture::AMD64::SetCurrentKernelPrivilegeStack(next.m_Stack->Top()))
+            !Architecture::AMD64::SetCurrentKernelEntryStack(next.m_Stack->Top()))
             return ThreadSwitchError::KernelPrivilegeStackUpdateFailed;
 
         Architecture::AMD64::PageMap* current_space =
@@ -123,14 +122,14 @@ namespace Zos::Kernel::Scheduling {
             next.m_OwningProcess != nullptr ? next.m_OwningProcess->AddressSpace() : nullptr;
 
         if (current_space == nullptr || next_space == nullptr || !current_space->IsActive()) {
-            (void)Architecture::AMD64::SetCurrentKernelPrivilegeStack(m_Stack->Top());
+            (void)Architecture::AMD64::SetCurrentKernelEntryStack(m_Stack->Top());
             return ThreadSwitchError::AddressSpaceSwitchFailed;
         }
 
         if (current_space != next_space) {
             const auto address_space_error = next_space->SwitchTo();
             if (address_space_error != Architecture::AMD64::PageMapSwitchError::Success) {
-                (void)Architecture::AMD64::SetCurrentKernelPrivilegeStack(m_Stack->Top());
+                (void)Architecture::AMD64::SetCurrentKernelEntryStack(m_Stack->Top());
                 return ThreadSwitchError::AddressSpaceSwitchFailed;
             }
         }
@@ -150,7 +149,7 @@ namespace Zos::Kernel::Scheduling {
         if (disposition == TransferDisposition::Terminated)
             Diagnostics::Fatal("Thread", "terminated thread unexpectedly resumed");
 
-        if (m_Stack == nullptr || Architecture::AMD64::CurrentKernelPrivilegeStack() != m_Stack->Top())
+        if (m_Stack == nullptr || Architecture::AMD64::CurrentKernelEntryStack() != m_Stack->Top())
             return ThreadSwitchError::ResumeKernelPrivilegeStackMismatch;
 
         processor = Architecture::AMD64::CurrentProcessor();
@@ -259,8 +258,8 @@ namespace Zos::Kernel::Scheduling {
         if (processor == nullptr || processor->CurrentThread != this)
             Diagnostics::Fatal("Thread", "user-mode transition thread does not own the processor");
 
-        if (Architecture::AMD64::CurrentKernelPrivilegeStack() != m_Stack->Top())
-            Diagnostics::Fatal("Thread", "TSS RSP0 does not match the user thread kernel stack");
+        if (Architecture::AMD64::CurrentKernelEntryStack() != m_Stack->Top())
+            Diagnostics::Fatal("Thread", "kernel entry stack does not match the user thread kernel stack");
 
         Architecture::AMD64::EnterUserMode(m_UserEntry, m_UserStackTop);
     }
@@ -328,8 +327,8 @@ namespace Zos::Kernel::Scheduling {
         case ThreadSwitchError::ResumeStateMismatch: return "resumed thread state does not match processor ownership";
         case ThreadSwitchError::AddressSpaceSwitchFailed: return "failed to activate the target thread process address space";
         case ThreadSwitchError::ResumeAddressSpaceMismatch: return "resumed thread address space does not match process ownership";
-        case ThreadSwitchError::KernelPrivilegeStackUpdateFailed: return "failed to update TSS RSP0 for the target thread";
-        case ThreadSwitchError::ResumeKernelPrivilegeStackMismatch: return "resumed thread does not own the active TSS RSP0";
+        case ThreadSwitchError::KernelPrivilegeStackUpdateFailed: return "failed to update the target thread kernel-entry stack";
+        case ThreadSwitchError::ResumeKernelPrivilegeStackMismatch: return "resumed thread does not own the active kernel-entry stack";
         default: return "unknown cooperative thread switch error";
         }
     }

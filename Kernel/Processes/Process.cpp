@@ -183,6 +183,7 @@ namespace Zos::Kernel::Processes {
         case UserFaultKind::InvalidOpcode: fault_name = "invalid opcode"; break;
         case UserFaultKind::GeneralProtection: fault_name = "general protection"; break;
         case UserFaultKind::PageFault: fault_name = "page fault"; break;
+        case UserFaultKind::InvalidSystemCallState: fault_name = "invalid syscall return state"; break;
         }
 
         Diagnostics::Write("[zOS/User] Fatal user fault contained.\n");

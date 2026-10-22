@@ -26,6 +26,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         bool Tsc{};
         bool InvariantTsc{};
         bool Nx{};
+        bool Syscall{};
         bool Smep{};
         bool Smap{};
         bool Pcid{};
