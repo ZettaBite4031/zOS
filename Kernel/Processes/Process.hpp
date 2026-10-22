@@ -32,6 +32,12 @@ namespace Zos::Kernel::Processes {
         UserFault Fault{};
     };
 
+    struct ProcessExitRecord final {
+        bool Valid{};
+        Memory::Uint64 ThreadId{};
+        Memory::Uint32 Status{};
+    };
+
     class Process final {
     public:
         constexpr Process() noexcept = default;
@@ -62,8 +68,10 @@ namespace Zos::Kernel::Processes {
         [[nodiscard]] const Architecture::AMD64::PageMap* AddressSpace() const noexcept { return m_PageMap; }
         [[nodiscard]] bool OwnsAddressSpace() const noexcept { return m_OwnsPageMap; }
         [[nodiscard]] const ProcessFaultRecord& FaultRecord() const noexcept { return m_FaultRecord; }
+        [[nodiscard]] const ProcessExitRecord& ExitRecord() const noexcept { return m_ExitRecord; }
 
         [[nodiscard]] bool BeginUserFaultTermination(Memory::Uint64 thread_id, const UserFault& fault) noexcept;
+        [[nodiscard]] bool BeginNormalExit(Memory::Uint64 thread_id, Memory::Uint32 status) noexcept;
 
         [[nodiscard]] bool OwnsThread(const Scheduling::Thread& thread) const noexcept;
 
@@ -88,10 +96,12 @@ namespace Zos::Kernel::Processes {
         Scheduling::Thread* m_ThreadTail{};
         Memory::Uint64 m_ThreadCount{};
         ProcessFaultRecord m_FaultRecord{};
+        ProcessExitRecord m_ExitRecord{};
 
         bool m_OwnsPageMap{};
         bool m_Initialized{};
     };
 
     [[noreturn]] void HandleCurrentUserFault(const UserFault& fault) noexcept;
+    [[noreturn]] void ExitCurrentUserProcess(Memory::Uint64 status) noexcept;
 }

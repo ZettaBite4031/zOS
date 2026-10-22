@@ -19,5 +19,5 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
     void LoadFirstUserExecutable(KernelRuntime& runtime) noexcept;
     void RunRing3SelfTest(KernelRuntime& runtime) noexcept;
     void RunSystemCallSelfTest(KernelRuntime& runtime) noexcept;
-    void RunUserFaultIsolationSelfTest(KernelRuntime& runtime) noexcept;
+    void RunUserRuntimeExitSelfTest(KernelRuntime& runtime) noexcept;
 }

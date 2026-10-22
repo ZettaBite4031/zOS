@@ -6,6 +6,7 @@ namespace Zos::ABI {
 
     enum class NativeSystemCall : SystemCallNumber {
         GetProcessId = 0,
+        ExitProcess = 1,
     };
 
     inline constexpr SystemCallNumber InvalidSystemCallResult{ ~SystemCallNumber{ 0 } };

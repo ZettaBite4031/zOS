@@ -126,6 +126,7 @@ def CreateUserEnvironment(repo_root: Path, toolchain: Toolchain, config: str):
             "--target=x86_64-unknown-none-elf",
             "-std=c++23",
             "-ffreestanding",
+            "-fno-builtin",
             "-fno-exceptions",
             "-fno-rtti",
             "-fno-stack-protector",

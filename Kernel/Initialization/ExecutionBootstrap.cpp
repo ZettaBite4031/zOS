@@ -563,10 +563,11 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         if (state == nullptr)
             Diagnostics::Fatal("ELF", "first user program state mapping is unavailable");
 
-        if (state->Marker != 0 || state->Progress != 0 || state->FaultRequest != 0 ||
+        if (state->Marker != 0 || state->Progress != 0 || state->ExitRequest != 0 ||
             state->ProcessId != 0 || state->PreservedRegister != 0 ||
             state->StackBeforeSystemCall != 0 || state->StackAfterSystemCall != 0 ||
-            state->BssZeroVerified != 0)
+            state->BssZeroVerified != 0 || state->ConstructorRan != 0 ||
+            state->DestructorRan != 0)
             Diagnostics::Fatal("ELF", "first user program data was not initialized to zero");
 
         /*
@@ -617,8 +618,8 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
             Diagnostics::Fatal("User", "first user program state mapping is unavailable");
 
         const Uint64 start = runtime.Clock.Nanoseconds();
-        while (state->Marker != EntryMarker || state->Progress == 0 || state->BssZeroVerified != 1 ||
-               !runtime.Timer.UserModeObservedInInterrupt()) {
+        while (state->Marker != EntryMarker || state->Progress == 0 || state->BssZeroVerified != 1 || state->ConstructorRan != 1 ||
+            !runtime.Timer.UserModeObservedInInterrupt()) {
             if (runtime.Clock.Nanoseconds() - start > 1'000'000'000ULL)
                 Diagnostics::Fatal("User", "ELF Ring 3 execution self-test timed out");
             __asm__ volatile("pause");
@@ -695,73 +696,77 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         Diagnostics::Write("[zOS/Syscall] Native syscall round trip verified.\n");
     }
 
-    void RunUserFaultIsolationSelfTest(KernelRuntime& runtime) noexcept {
+    void RunUserRuntimeExitSelfTest(KernelRuntime& runtime) noexcept {
         using namespace ::Zos::User::FirstProgram;
 
         volatile State* state = FirstProgramState(runtime);
         if (state == nullptr)
-            Diagnostics::Fatal("User", "user fault test lost the first user program state mapping");
+            Diagnostics::Fatal("Runtime", "native user runtime state mapping is unavailable");
 
-        if (runtime.FirstUserProcess.State() != Processes::ProcessState::Active ||
-            runtime.FirstUserThread.State() != Scheduling::ThreadState::Ready ||
-            !runtime.FirstUserThread.UserModeConfigured())
-            Diagnostics::Fatal("User", "fault-isolation test began with invalid user state");
+        if (runtime.FirstUserProcess.State() != Processes::ProcessState::Active || runtime.FirstUserThread.State() != Scheduling::ThreadState::Ready ||
+            !runtime.FirstUserThread.UserModeConfigured() || runtime.FirstUserProcess.ExitRecord().Valid || runtime.FirstUserProcess.FaultRecord().Valid ||
+            state->ConstructorRan != 1 || state->DestructorRan != 0)
+            Diagnostics::Fatal("Runtime", "normal-exit test began with invalid state");
 
         const Uint64 initial_terminations = runtime.BootstrapScheduler.TerminationCount();
+        const Uint64 initial_syscalls = runtime.SystemCallEntry.DispatchCount();
+
+        if (initial_syscalls != 1)
+            Diagnostics::Fatal("Runtime", "unexpected syscall count before process exit");
 
         /*
-         * The ELF program polls this field. On its next timeslice it reads from
-         * the intentionally unmapped stack guard page and should receive #PF.
-         */
-        state->FaultRequest = 1;
+        * The native application polls this field. Once it observes the
+        * request, main() returns TestExitStatus. The user runtime runs
+        * termination callbacks before invoking ExitProcess.
+        */
+        state->ExitRequest = 1;
 
         const Uint64 timeout_start = runtime.Clock.Nanoseconds();
         while (runtime.FirstUserProcess.State() != Processes::ProcessState::Terminated) {
             __asm__ volatile("" ::: "memory");
+
             if (runtime.Clock.Nanoseconds() - timeout_start > 1'000'000'000ULL)
-                Diagnostics::Fatal("User", "user fault isolation self-test timed out");
+                Diagnostics::Fatal("Runtime", "normal process exit timed out");
 
             __asm__ volatile("pause");
         }
 
-        if (runtime.FirstUserThread.State() != Scheduling::ThreadState::Terminated ||
-            runtime.BootstrapScheduler.TerminationCount() != initial_terminations + 1)
-            Diagnostics::Fatal("User", "faulting user thread was not removed from scheduling");
+        const Processes::ProcessExitRecord& record = runtime.FirstUserProcess.ExitRecord();
 
-        const Processes::ProcessFaultRecord& record = runtime.FirstUserProcess.FaultRecord();
-        const UserFault& fault = record.Fault;
+        if (!record.Valid || record.ThreadId != FirstUserThreadId || record.Status != static_cast<Memory::Uint32>(TestExitStatus) ||
+            runtime.FirstUserProcess.FaultRecord().Valid || state->DestructorRan != 1)
+            Diagnostics::Fatal("Runtime", "normal process exit record is invalid");
 
-        if (!record.Valid || record.ThreadId != FirstUserThreadId ||
-            fault.Kind != UserFaultKind::PageFault || !fault.AddressValid ||
-            fault.Address != runtime.FirstUserImage.StackGuard() ||
-            !runtime.FirstUserImage.ContainsExecutableAddress(fault.InstructionPointer) ||
-            fault.Access != UserFaultAccess::Read ||
-            fault.Reason != UserFaultReason::NonPresent ||
-            fault.ReservedBitViolation)
-            Diagnostics::Fatal("User", "contained ELF page-fault record is invalid");
+        if (runtime.FirstUserThread.State() != Scheduling::ThreadState::Terminated || runtime.BootstrapScheduler.TerminationCount() != initial_terminations + 1 ||
+            runtime.SystemCallEntry.DispatchCount() != initial_syscalls + 1)
+            Diagnostics::Fatal("Runtime", "native process termination did not complete");
 
-        if (!runtime.KernelPageMap.IsActive() ||
-            CurrentProcessor() != &runtime.BootstrapProcessor ||
-            CurrentProcessor()->CurrentThread != &runtime.BootstrapThread)
-            Diagnostics::Fatal("User", "kernel execution was not restored after user fault");
+        if (!runtime.KernelPageMap.IsActive() || CurrentProcessor() != &runtime.BootstrapProcessor || CurrentProcessor()->CurrentThread != &runtime.BootstrapThread || 
+            CurrentKernelEntryStack() != runtime.BootstrapThread.Stack()->Top() || runtime.BootstrapProcessor.SystemCallUserStackPointer != 0)
+            Diagnostics::Fatal("Runtime", "kernel execution was not restored after process exit");
 
         const Uint64 stopped_counter = state->Progress;
         const Uint64 initial_interrupts = runtime.Timer.InterruptCount();
         const Uint64 continuation_start = runtime.Clock.Nanoseconds();
+
         while (runtime.Timer.InterruptCount() < initial_interrupts + 6) {
             if (runtime.Clock.Nanoseconds() - continuation_start > 500'000'000ULL)
-                Diagnostics::Fatal("User", "kernel scheduling stopped after user fault");
+                Diagnostics::Fatal("Runtime", "kernel scheduling stopped after process exit");
+
             __asm__ volatile("pause");
         }
 
-        if (state->Progress != stopped_counter ||
-            runtime.FirstUserThread.State() != Scheduling::ThreadState::Terminated ||
+        if (state->Progress != stopped_counter || runtime.FirstUserThread.State() != Scheduling::ThreadState::Terminated ||
             runtime.FirstUserProcess.State() != Processes::ProcessState::Terminated)
-            Diagnostics::Fatal("User", "terminated user execution resumed");
+            Diagnostics::Fatal("Runtime", "terminated user process resumed execution");
 
-        Diagnostics::Write("[zOS/User] User page fault contained.\n");
-        Diagnostics::Write("[zOS/User] Faulting process terminated.\n");
-        Diagnostics::Write("[zOS/User] Kernel scheduling continued after user fault.\n");
-        Diagnostics::Write("[zOS/User] User fault isolation verified.\n");
+        Diagnostics::Write("[zOS/Runtime] Native main() returned successfully.\n");
+        Diagnostics::Write("[zOS/Runtime] Static constructor and destructor verified.\n");
+        Diagnostics::Write("[zOS/Runtime] Exit status: ");
+        Diagnostics::WriteDecimal(record.Status);
+        Diagnostics::Write("\n");
+        Diagnostics::Write("[zOS/Runtime] Normal process termination verified.\n");
+        Diagnostics::Write("[zOS/Runtime] Kernel scheduling continued after exit.\n");
+        Diagnostics::Write("[zOS/Runtime] Native zOS user runtime verified.\n");
     }
 }

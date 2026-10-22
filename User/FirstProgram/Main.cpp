@@ -1,5 +1,7 @@
-#include <ABI/SystemCalls.hpp>
 #include <User/FirstProgram/Contract.hpp>
+
+#include <User/Runtime/Process.hpp>
+#include <User/Runtime/Memory.hpp>
 
 namespace {
     using Zos::User::FirstProgram::Uint64;
@@ -9,57 +11,58 @@ namespace {
 
     volatile Uint64 g_BssProbe;
 
+    struct LifetimeProbe final {
+        LifetimeProbe() noexcept { g_State.ConstructorRan = 1; }
+        ~LifetimeProbe() noexcept { g_State.DestructorRan = 1; }
+    };
+
+    LifetimeProbe g_LifetimeProbe{};
+
     [[nodiscard]] Uint64 ReadStackPointer() noexcept {
         Uint64 value{};
         __asm__ volatile("movq %%rsp, %0" : "=r"(value));
         return value;
     }
-
-    [[nodiscard]] Uint64 GetProcessId(Uint64& preserved_register) noexcept {
-        register Uint64 result __asm__("rax") = static_cast<Uint64>(Zos::ABI::NativeSystemCall::GetProcessId);
-        register Uint64 preserved __asm__("r12") = preserved_register;
-
-        __asm__ volatile(
-            "syscall"
-            : "+a"(result), "+r"(preserved)
-            :
-            : "rcx", "r11", "memory"
-        );
-
-        preserved_register = preserved;
-        return result;
-    }
 }
 
-extern "C" [[noreturn]] void _start() noexcept {
+int main() noexcept {
     using namespace Zos::User::FirstProgram;
 
-    if (g_BssProbe != 0)
-        __builtin_trap();
+    if (g_State.ConstructorRan != 1) return 10;
+    if (g_BssProbe != 0) return 11;
+
+    unsigned char expected[8]{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    unsigned char copied[8]{};
+    if (memset(copied, 0xA5, sizeof(copied)) != copied || copied[7] != 0xA5)
+        return 12;
+    if (memcpy(copied, expected, sizeof(copied)) != copied ||
+        memcmp(copied, expected, sizeof(copied)) != 0)
+        return 13;
+    if (memmove(copied + 1, copied, 7) != copied + 1 ||
+        copied[0] != 0 || copied[1] != 0 || copied[7] != 6)
+        return 14;
+    if (memmove(copied, copied + 1, 7) != copied ||
+        copied[0] != 0 || copied[6] != 6)
+        return 15;
 
     g_BssProbe = 1;
     g_State.BssZeroVerified = 1;
     g_State.Marker = EntryMarker;
     g_State.Progress = g_State.Progress + 1;
 
-    Uint64 preserved_register = PreservedRegisterMarker;
+    register Uint64 preserved __asm__("r12") = PreservedRegisterMarker;
+    __asm__ volatile("" : "+r"(preserved));
+
     g_State.StackBeforeSystemCall = ReadStackPointer();
-    g_State.ProcessId = GetProcessId(preserved_register);
+    g_State.ProcessId = Zos::User::Runtime::GetProcessId();
     g_State.StackAfterSystemCall = ReadStackPointer();
-    g_State.PreservedRegister = preserved_register;
+
+    __asm__ volatile("" : "+r"(preserved));
+    g_State.PreservedRegister = preserved;
 
     for (;;) {
         g_State.Progress = g_State.Progress + 1;
-
-        if (g_State.FaultRequest != 0) {
-            const auto* fault = reinterpret_cast<volatile const Uint64*>(StackGuardAddress);
-            const Uint64 value = *fault;
-            (void)value;
-
-            /* The guard-page read must never succeed. */
-            __builtin_trap();
-        }
-
+        if (g_State.ExitRequest != 0) return TestExitStatus;
         __asm__ volatile("pause");
     }
 }

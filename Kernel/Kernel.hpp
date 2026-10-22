@@ -100,7 +100,7 @@ namespace Zos::Kernel {
         SystemCallsReady,
         UserExecutableReady,
         Ring3Ready,
-        UserFaultIsolationReady,
+        UserRuntimeReady,
 
         Runtime,
     };

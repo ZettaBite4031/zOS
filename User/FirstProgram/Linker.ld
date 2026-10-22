@@ -24,6 +24,18 @@ SECTIONS
     {
         KEEP(*(.zos_state))
         *(.data .data.*)
+
+        . = ALIGN(8);
+        __init_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+        KEEP(*(.init_array))
+        __init_array_end = .;
+
+        . = ALIGN(8);
+        __fini_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+        KEEP(*(.fini_array))
+        __fini_array_end = .;
     } :data
 
     .bss (NOLOAD) :

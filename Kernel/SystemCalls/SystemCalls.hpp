@@ -33,6 +33,6 @@ namespace Zos::Kernel::SystemCalls {
 
     [[nodiscard]] Memory::Uint64 DispatchNative(
         const Request& request,
-        const Processes::Process& process
+        Processes::Process& process
     ) noexcept;
 }

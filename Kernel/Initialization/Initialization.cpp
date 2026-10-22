@@ -195,7 +195,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::UserFaultIsolationReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::UserRuntimeReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -378,9 +378,9 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::UserExecutableReady, KernelPhase::Ring3Ready);
 
-        ExecutionBootstrap::RunUserFaultIsolationSelfTest(runtime);
+        ExecutionBootstrap::RunUserRuntimeExitSelfTest(runtime);
 
-        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::UserFaultIsolationReady);
+        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::UserRuntimeReady);
 
         EnterRuntime(runtime);
     }

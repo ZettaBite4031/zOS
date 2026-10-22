@@ -25,6 +25,9 @@ namespace Zos::Kernel::Processes {
 
         m_Initialized = true;
 
+        m_FaultRecord = {};
+        m_ExitRecord = {};
+
         Print();
         return ProcessInitializationError::Success;
     }
@@ -60,6 +63,9 @@ namespace Zos::Kernel::Processes {
         m_ThreadCount = 0;
 
         m_Initialized = true;
+
+        m_FaultRecord = {};
+        m_ExitRecord = {};
 
         Print();
         return ProcessInitializationError::Success;
@@ -98,13 +104,28 @@ namespace Zos::Kernel::Processes {
     }
 
     bool Process::BeginUserFaultTermination(Memory::Uint64 thread_id, const UserFault& fault) noexcept {
-        if (!m_Initialized || !m_OwnsPageMap || m_State != ProcessState::Active || m_FaultRecord.Valid)
+        if (!m_Initialized || !m_OwnsPageMap || m_State != ProcessState::Active || m_FaultRecord.Valid || m_ExitRecord.Valid)
             return false;
 
         m_FaultRecord = {
             .Valid = true,
             .ThreadId = thread_id,
             .Fault = fault,
+        };
+
+        m_State = ProcessState::Terminating;
+        return true;
+    }
+
+    bool Process::BeginNormalExit(Memory::Uint64 thread_id, Memory::Uint32 status) noexcept {
+        if (!m_Initialized || !m_OwnsPageMap || m_State != ProcessState::Active ||
+            m_ThreadCount != 1 || m_ExitRecord.Valid || m_FaultRecord.Valid)
+            return false;
+
+        m_ExitRecord = {
+            .Valid = true,
+            .ThreadId = thread_id,
+            .Status = status,
         };
 
         m_State = ProcessState::Terminating;
@@ -161,6 +182,34 @@ namespace Zos::Kernel::Processes {
         case ProcessInitializationError::KernelMappingInstallFailed: return "failed to install permanent kernel mappings into the process";
         default: return "unknown process initialization error";
         }
+    }
+
+    [[noreturn]] void ExitCurrentUserProcess(Memory::Uint64 status) noexcept {
+        using Architecture::AMD64::CurrentProcessor;
+
+        Architecture::AMD64::ProcessorLocal* processor = CurrentProcessor();
+        if (processor == nullptr || processor->CurrentThread == nullptr || processor->LocalScheduler == nullptr)
+            Diagnostics::Fatal("Process", "process exit arrived without scheduler ownership");
+
+        Scheduling::Thread* thread = processor->CurrentThread;
+        Process* process = thread->OwningProcess();
+
+        if (process == nullptr || !process->IsInitialized() || !process->OwnsAddressSpace() || 
+            !process->OwnsThread(*thread) || !thread->UserModeConfigured() || process->State() != ProcessState::Active)
+            Diagnostics::Fatal("Process", "invalid user process exit context");
+
+        if (!process->BeginNormalExit(thread->Id(), static_cast<Memory::Uint32>(status)))
+            Diagnostics::Fatal("Process", "failed to begin normal process termination");
+
+        Diagnostics::Write("[zOS/Process] Native process exited. PID: ");
+        Diagnostics::WriteDecimal(process->Id());
+        Diagnostics::Write(", status: ");
+        Diagnostics::WriteDecimal(process->ExitRecord().Status);
+        Diagnostics::Write("\n");
+
+        processor->LocalScheduler->TerminateCurrent();
+        
+        __builtin_unreachable();
     }
 
     [[noreturn]] void HandleCurrentUserFault(const UserFault& fault) noexcept {

@@ -14,17 +14,21 @@ namespace Zos::User::FirstProgram {
 
     inline constexpr Uint64 EntryMarker{ 0x5A4F53454C463031ULL };       // "zOSELF01"
     inline constexpr Uint64 PreservedRegisterMarker{ 0x5A4F535359535231ULL };
+    
+    inline constexpr int TestExitStatus{ 37 };
 
     struct State final {
         Uint64 Marker{};
         Uint64 Progress{};
-        Uint64 FaultRequest{};
+        Uint64 ExitRequest{};
         Uint64 ProcessId{};
         Uint64 PreservedRegister{};
         Uint64 StackBeforeSystemCall{};
         Uint64 StackAfterSystemCall{};
         Uint64 BssZeroVerified{};
+        Uint64 ConstructorRan{};
+        Uint64 DestructorRan{};
     };
 
-    static_assert(sizeof(State) == 8 * sizeof(Uint64));
+    static_assert(sizeof(State) == 10 * sizeof(Uint64));
 }
