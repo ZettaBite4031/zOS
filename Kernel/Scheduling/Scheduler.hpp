@@ -70,11 +70,19 @@ namespace Zos::Kernel::Scheduling {
          */
         [[nodiscard]] SchedulerPreemptionError Preempt() noexcept;
 
+        /*
+         * Permanently removes the current Running thread and transfers execution
+         * to the next Ready thread. This is the non-returning path used for fatal
+         * user exceptions and later for ordinary thread exit.
+         */
+        [[noreturn]] void TerminateCurrent() noexcept;
+
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] bool PreemptionEnabled() const noexcept { return m_PreemptionEnabled; }
         [[nodiscard]] Memory::Uint64 ReadyCount() const noexcept { return m_ReadyCount; }
         [[nodiscard]] Memory::Uint64 SwitchCount() const noexcept { return m_SwitchCount; }
         [[nodiscard]] Memory::Uint64 PreemptionCount() const noexcept { return m_PreemptionCount; }
+        [[nodiscard]] Memory::Uint64 TerminationCount() const noexcept { return m_TerminationCount; }
 
         [[nodiscard]] static const char* Describe(SchedulerInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(SchedulerRegistrationError error) noexcept;
@@ -93,6 +101,7 @@ namespace Zos::Kernel::Scheduling {
         Memory::Uint64 m_ReadyCount{};
         Memory::Uint64 m_SwitchCount{};
         Memory::Uint64 m_PreemptionCount{};
+        Memory::Uint64 m_TerminationCount{};
 
         bool m_PreemptionEnabled{};
         bool m_Initialized{};

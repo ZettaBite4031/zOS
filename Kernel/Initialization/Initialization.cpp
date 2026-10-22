@@ -60,9 +60,11 @@ namespace Zos::Kernel::Initialization {
          */
         inline constexpr VirtualAddress FirstUserStackGuard{ 0x0000000070000000ULL };
         inline constexpr VirtualAddress FirstUserStackBase{ 0x0000000070001000ULL };
-
+        
         inline constexpr VirtualAddress FirstUserStackTop{ FirstUserStackBase.Value() + FirstUserModeStackPages * PageSize };
         inline constexpr Uint64 FirstUserModeMarker{ 0x5A4F535553455231ULL };
+
+        inline constexpr VirtualAddress FirstUserFaultAddress{ FirstUserStackGuard.Value() };
 
         volatile bool g_UserModeReady{};
 
@@ -687,40 +689,108 @@ namespace Zos::Kernel::Initialization {
              *   movabs FirstUserDataAddress, %rax
              *   movabs FirstUserModeMarker, %rdx
              *   mov    %rdx, (%rax)
+             *
              * loop:
              *   incq   8(%rax)
+             *   cmpq   $0, 16(%rax)
+             *   jne    fault
              *   pause
              *   jmp    loop
              *
-             * It deliberately contains no syscall and no privileged instruction.
+             * fault:
+             *   movabs FirstUserFaultAddress, %rcx
+             *   mov    (%rcx), %rdx
+             *   ud2
+             */
+
+            /*
+             * movabs FirstUserDataAddress, %rax
              */
             code[0] = 0x48;
             code[1] = 0xB8;
             WriteLittleEndian64(code + 2, FirstUserDataAddress.Value());
 
+            /*
+             * movabs FirstUserModeMarker, %rdx
+             */
             code[10] = 0x48;
             code[11] = 0xBA;
             WriteLittleEndian64(code + 12, FirstUserModeMarker);
 
+            /*
+             * mov %rdx, (%rax)
+             */
             code[20] = 0x48;
             code[21] = 0x89;
             code[22] = 0x10;
 
+            /*
+             * loop:
+             *     incq 8(%rax)
+             */
             code[23] = 0x48;
             code[24] = 0xFF;
             code[25] = 0x40;
             code[26] = 0x08;
 
-            code[27] = 0xF3;
-            code[28] = 0x90;
+            /*
+             * cmpq $0, 16(%rax)
+             */
+            code[27] = 0x48;
+            code[28] = 0x83;
+            code[29] = 0x78;
+            code[30] = 0x10;
+            code[31] = 0x00;
 
-            code[29] = 0xEB;
-            code[30] = 0xF8;
+            /*
+             * jne fault
+             */
+            code[32] = 0x75;
+            code[33] = 0x04;
+
+            /*
+             * pause
+             */
+            code[34] = 0xF3;
+            code[35] = 0x90;
+
+            /*
+             * jmp loop
+             */
+            code[36] = 0xEB;
+            code[37] = 0xF1;
+
+            /*
+             * fault:
+             *     movabs FirstUserFaultAddress, %rcx
+             */
+            code[38] = 0x48;
+            code[39] = 0xB9;
+            WriteLittleEndian64(code + 40, FirstUserFaultAddress.Value());
+
+            /*
+             * mov (%rcx), %rdx
+             *
+             * This should #PF because FirstUserFaultAddress is the
+             * intentionally unmapped user stack guard page.
+             */
+            code[48] = 0x48;
+            code[49] = 0x8B;
+            code[50] = 0x11;
+
+            /*
+             * Safety guard. If the deliberately invalid load somehow
+             * succeeds, executing UD2 still produces a containable
+             * userspace exception.
+             */
+            code[51] = 0x0F;
+            code[52] = 0x0B;
 
             auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
 
-            user_data[0] = 0;
-            user_data[1] = 0;
+            user_data[0] = 0; // Step 15 marker
+            user_data[1] = 0; // progress counter
+            user_data[2] = 0; // Step 16 fault request
 
             const MappingOptions user_code{
                 .Access = PageAccess::Read | PageAccess::Execute | PageAccess::User,
@@ -762,6 +832,11 @@ namespace Zos::Kernel::Initialization {
                 Diagnostics::Fatal("User", Scheduling::Thread::Describe(user_mode_error));
             }
 
+            if (!runtime.Interrupts.BindUserExceptionHandler(&Processes::HandleCurrentUserException)) {
+                __asm__ volatile("sti" ::: "memory");
+                Diagnostics::Fatal("User", "failed to bind user exception containment");
+            }
+
             g_UserModeReady = true;
 
             __asm__ volatile("sti" ::: "memory");
@@ -801,6 +876,80 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/User] User-mode timer entry verified.\n");
             Diagnostics::Write("[zOS/User] Conditional SWAPGS path verified.\n");
             Diagnostics::Write("[zOS/User] Ring 3 architectural transition verified.\n");
+        }
+
+        void RunUserFaultIsolationSelfTest(KernelRuntime& runtime) noexcept {
+            const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
+            if (data_direct.IsNull())
+                Diagnostics::Fatal("User", "user fault test lost the data-page direct map");
+
+            auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
+            if (runtime.FirstUserProcess.State() != Processes::ProcessState::Active ||
+                runtime.FirstUserThread.State() != Scheduling::ThreadState::Ready ||
+                !runtime.FirstUserThread.UserModeConfigured())
+                Diagnostics::Fatal("User", "fault-isolation test began with invalid user state");
+
+            const Uint64 initial_terminations = runtime.BootstrapScheduler.TerminationCount();
+
+            /*
+            * The CPL3 loop polls this third qword. On its next timeslice it performs
+            * a read from the intentionally unmapped stack-guard page.
+            */
+            user_data[2] = 1;
+
+            const Uint64 timeout_start = runtime.Clock.Nanoseconds();
+            while (runtime.FirstUserProcess.State() != Processes::ProcessState::Terminated) {
+                /*
+                * The process state changes on this same CPU from interrupt context.
+                * Prevent the compiler from treating it as loop-invariant.
+                */
+                __asm__ volatile("" ::: "memory");
+                if (runtime.Clock.Nanoseconds() - timeout_start > 1'000'000'000ULL)
+                    Diagnostics::Fatal("User", "user fault isolation self-test timed out");
+
+                __asm__ volatile("pause");
+            }
+
+            if (runtime.FirstUserThread.State() != Scheduling::ThreadState::Terminated ||
+                runtime.BootstrapScheduler.TerminationCount() != initial_terminations + 1)
+                Diagnostics::Fatal("User", "faulting user thread was not removed from scheduling");
+
+            const Processes::ProcessFaultRecord& fault = runtime.FirstUserProcess.FaultRecord();
+
+            if (!fault.Valid || fault.ThreadId != FirstUserThreadId ||
+                fault.Vector != 14 || fault.FaultAddress != FirstUserFaultAddress.Value() ||
+                fault.InstructionPointer != FirstUserCodeAddress.Value() + 48 ||
+                (fault.ErrorCode & (1ULL << 2)) == 0 || (fault.ErrorCode & (1ULL << 0)) != 0)
+                Diagnostics::Fatal("User", "contained page-fault record is invalid");
+
+            if (!runtime.KernelPageMap.IsActive() ||
+                CurrentProcessor() != &runtime.BootstrapProcessor ||
+                CurrentProcessor()->CurrentThread != &runtime.BootstrapThread)
+                Diagnostics::Fatal("User", "kernel execution was not restored after user fault");
+
+            /*
+             * Prove that the kernel timer and remaining runnable kernel threads keep
+             * moving after the user process is dead, while the dead user's progress
+             * counter never advances again.
+             */
+            const Uint64 stopped_counter = user_data[1];
+            const Uint64 initial_interrupts = runtime.Timer.InterruptCount();
+            const Uint64 continuation_start = runtime.Clock.Nanoseconds();
+            while (runtime.Timer.InterruptCount() < initial_interrupts + 6) {
+                if (runtime.Clock.Nanoseconds() - continuation_start > 500'000'000ULL)
+                    Diagnostics::Fatal("User", "kernel scheduling stopped after user fault");
+                __asm__ volatile("pause");
+            }
+
+            if (user_data[1] != stopped_counter ||
+                runtime.FirstUserThread.State() != Scheduling::ThreadState::Terminated ||
+                runtime.FirstUserProcess.State() != Processes::ProcessState::Terminated)
+                Diagnostics::Fatal("User", "terminated user execution resumed");
+
+            Diagnostics::Write("[zOS/User] User page fault contained.\n");
+            Diagnostics::Write("[zOS/User] Faulting process terminated.\n");
+            Diagnostics::Write("[zOS/User] Kernel scheduling continued after user fault.\n");
+            Diagnostics::Write("[zOS/User] User fault isolation verified.\n");
         }
 
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
@@ -845,7 +994,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::UserFaultIsolationReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -1017,6 +1166,10 @@ namespace Zos::Kernel::Initialization {
         RunRing3SelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::Ring3Ready);
+
+        RunUserFaultIsolationSelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::UserFaultIsolationReady);
 
         EnterRuntime(runtime);
     }

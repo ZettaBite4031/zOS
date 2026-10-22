@@ -79,6 +79,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
     using InterruptHandler = void(*)(InterruptContext& context) noexcept;
 
+    using UserExceptionHandler = void(*)(InterruptContext& context, Memory::Uint64 fault_address) noexcept;
+
     enum class InterruptVectorClass : Memory::Uint8 {
         Exception,
         Device,
@@ -116,6 +118,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] InterruptInitializationError Initialize(Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& virtual_addresses, PageMap& page_map) noexcept;
 
         [[nodiscard]] bool BindLocalApic(LocalApic& local_apic) noexcept;
+
+        [[nodiscard]] bool BindUserExceptionHandler(UserExceptionHandler handler) noexcept;
 
         [[nodiscard]] bool RegisterFixedHandler(Memory::Uint8 vector, InterruptHandler handler, const char* name = nullptr, InterruptAcknowledgement acknowledgement = InterruptAcknowledgement::None) noexcept;
 
@@ -263,12 +267,13 @@ namespace Zos::Kernel::Architecture::AMD64 {
         Memory::VirtualAddressAllocator* m_VirtualAddresses{};
         PageMap* m_PageMap{};
         LocalApic* m_LocalApic{};
+        UserExceptionHandler m_UserExceptionHandler{};
         
         bool m_Initialized{};
     };
 
     [[noreturn]] void GenericInterruptHandler(InterruptContext& context) noexcept;
 
-    [[nodiscard]] bool SetCurrentKernelPrivilegeStack(Memory::VirtualAddress stack_topc ) noexcept;
+    [[nodiscard]] bool SetCurrentKernelPrivilegeStack(Memory::VirtualAddress stack_top) noexcept;
     [[nodiscard]] Memory::VirtualAddress CurrentKernelPrivilegeStack() noexcept;
 }

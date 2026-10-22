@@ -576,6 +576,17 @@ namespace {
 
     void VectorPolicySelfTestHandler(InterruptContext&) noexcept {
     }
+
+    [[nodiscard]] bool IsContainableUserException(Uint8 vector) noexcept {
+        /*
+        * Step 16 contains the synchronous user faults for which zOS already has
+        * architectural handlers. NMI, #DF, #MC, and other system-level events
+        * remain kernel-fatal.
+        */
+        return vector == 6 ||   // #UD
+            vector == 13 ||  // #GP
+            vector == 14;    // #PF
+    }
 }
 
 extern "C" void InterruptDispatch(Zos::Kernel::Architecture::AMD64::InterruptContext* context) noexcept {
@@ -643,6 +654,14 @@ namespace Zos::Kernel::Architecture::AMD64 {
             return false;
 
         m_LocalApic = &local_apic;
+        return true;
+    }
+
+    bool InterruptManager::BindUserExceptionHandler(UserExceptionHandler handler) noexcept {
+        if (!m_Initialized || handler == nullptr || m_UserExceptionHandler != nullptr)
+            return false;
+
+        m_UserExceptionHandler = handler;
         return true;
     }
 
@@ -732,6 +751,17 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         const Uint8 vector = static_cast<Uint8>(context.Vector);
         HandlerSlot& slot = m_Handlers[vector];
+
+        if (context.FromUserMode() && IsContainableUserException(vector) && m_UserExceptionHandler != nullptr) {
+            const Uint64 fault_address = vector == 14 ? ReadCr2() : 0;
+            m_UserExceptionHandler(context, fault_address);
+
+            /*
+            * A fatal user-exception policy must not return to the faulting user
+            * frame. If one ever does, fail closed in the kernel.
+            */
+            GenericInterruptHandler(context);
+        }
 
         if (!slot.Claimed || slot.Handler == nullptr)
             GenericInterruptHandler(context);

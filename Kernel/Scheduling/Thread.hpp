@@ -113,6 +113,7 @@ namespace Zos::Kernel::Scheduling {
         friend class Scheduler;
         friend class ::Zos::Kernel::Processes::Process;
 
+        void MarkTerminated() noexcept;
         static void StartContext(void* argument) noexcept;
         void Print() const noexcept;
 

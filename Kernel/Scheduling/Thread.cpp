@@ -146,6 +146,24 @@ namespace Zos::Kernel::Scheduling {
         return ThreadSwitchError::Success;
     }
 
+    void Thread::MarkTerminated() noexcept {
+        if (!m_Initialized || m_State != ThreadState::Running || m_OwningProcess == nullptr)
+            Diagnostics::Fatal("Thread", "invalid thread termination transition");
+
+        m_State = ThreadState::Terminated;
+
+        /*
+        * The low-level switch will still write the abandoned CPU context into
+        * m_Context, but ContextReady stays false so the scheduler can never
+        * legally dispatch this thread again.
+        */
+        m_ContextReady = false;
+        m_ReadyNext = nullptr;
+        m_ReadyQueued = false;
+
+        m_OwningProcess->NotifyThreadTerminated(*this);
+    }
+
     void Thread::StartContext(void* argument) noexcept {
         Thread* thread = static_cast<Thread*>(argument);
 

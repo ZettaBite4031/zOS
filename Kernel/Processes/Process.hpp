@@ -7,6 +7,10 @@ namespace Zos::Kernel::Scheduling {
     class Thread;
 }
 
+namespace Zos::Kernel::Architecture::AMD64 {
+    struct InterruptContext;
+}
+
 namespace Zos::Kernel::Processes {
     using ProcessId = Memory::Uint64;
 
@@ -22,6 +26,15 @@ namespace Zos::Kernel::Processes {
         InvalidDependency,
         AddressSpaceInitializationFailed,
         KernelMappingInstallFailed,
+    };
+
+    struct ProcessFaultRecord final {
+        bool Valid{};
+        Memory::Uint64 ThreadId{};
+        Memory::Uint64 Vector{};
+        Memory::Uint64 ErrorCode{};
+        Memory::Uint64 FaultAddress{};
+        Memory::Uint64 InstructionPointer{};
     };
 
     class Process final {
@@ -53,6 +66,10 @@ namespace Zos::Kernel::Processes {
         [[nodiscard]] Architecture::AMD64::PageMap* AddressSpace() noexcept { return m_PageMap; }
         [[nodiscard]] const Architecture::AMD64::PageMap* AddressSpace() const noexcept { return m_PageMap; }
         [[nodiscard]] bool OwnsAddressSpace() const noexcept { return m_OwnsPageMap; }
+        [[nodiscard]] const ProcessFaultRecord& FaultRecord() const noexcept { return m_FaultRecord; }
+
+        [[nodiscard]] bool BeginUserFaultTermination(Memory::Uint64 thread_id, Memory::Uint64 vector,
+            Memory::Uint64 error_code, Memory::Uint64 fault_address, Memory::Uint64 instruction_pointer) noexcept;
 
         [[nodiscard]] bool OwnsThread(const Scheduling::Thread& thread) const noexcept;
 
@@ -63,6 +80,7 @@ namespace Zos::Kernel::Processes {
     private:
         friend class ::Zos::Kernel::Scheduling::Thread;
 
+        void NotifyThreadTerminated(Scheduling::Thread& thread) noexcept;
         void AttachThread(Scheduling::Thread& thread) noexcept;
         void Print() const noexcept;
 
@@ -75,8 +93,11 @@ namespace Zos::Kernel::Processes {
         Scheduling::Thread* m_ThreadHead{};
         Scheduling::Thread* m_ThreadTail{};
         Memory::Uint64 m_ThreadCount{};
+        ProcessFaultRecord m_FaultRecord{};
 
         bool m_OwnsPageMap{};
         bool m_Initialized{};
     };
+
+    [[noreturn]] void HandleCurrentUserException(Architecture::AMD64::InterruptContext& context, Memory::Uint64 fault_address) noexcept;
 }

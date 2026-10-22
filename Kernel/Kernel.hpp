@@ -95,6 +95,7 @@ namespace Zos::Kernel {
         PreemptionReady,
         ProcessAddressSpacesReady,
         Ring3Ready,
+        UserFaultIsolationReady,
 
         Runtime,
     };
