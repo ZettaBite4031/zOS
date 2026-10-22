@@ -2,6 +2,10 @@
 
 #include <Kernel/Architecture/AMD64/APIC.hpp>
 
+namespace Zos::Kernel::Scheduling {
+    class Thread;
+}
+
 namespace Zos::Kernel::Architecture::AMD64 {
     enum class ProcessorLocalInitializationError : Memory::Uint32 {
         Success,
@@ -18,6 +22,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         Memory::Uint32 ProcessorIndex{};
         Memory::Uint32 ApicId{};
+
+        ::Zos::Kernel::Scheduling::Thread* CurrentThread{};
 
         bool BootstrapProcessor{};
         bool Initialized{};

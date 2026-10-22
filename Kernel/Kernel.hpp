@@ -20,6 +20,9 @@
 #include <Kernel/Time/Clock.hpp>
 #include <Kernel/Time/LocalApicTimer.hpp>
 
+#include <Kernel/Scheduling/Thread.hpp>
+
+
 namespace Zos::Kernel {
     struct BootContext final {
         /*
@@ -82,6 +85,7 @@ namespace Zos::Kernel {
         InterruptPolicyReady,
         MonotonicClockReady,
         ProcessorLocalReady,
+        KernelThreadsReady,
         LocalApicTimerReady,
 
         Runtime,
@@ -124,6 +128,9 @@ namespace Zos::Kernel {
          * introduce per-thread kernel stacks.
          */
         Memory::KernelStack PrimaryStack{};
+
+        Scheduling::Thread BootstrapThread{};
+        Scheduling::Thread FirstWorkerThread{};
 
         KernelPhase Phase{ KernelPhase::Entry };
     };

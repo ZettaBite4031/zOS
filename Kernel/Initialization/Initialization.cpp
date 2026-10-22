@@ -15,7 +15,22 @@ namespace Zos::Kernel::Initialization {
         using namespace Architecture::AMD64;
 
         inline constexpr Uint64 PrimaryKernelStackPages{ 16 };
+        inline constexpr Uint64 FirstKernelThreadStackPages{ 8 };
+
         static_assert(PrimaryKernelStackPages * PageSize == 64 * 1024);
+        static_assert(FirstKernelThreadStackPages * PageSize == 32 * 1024);
+
+        inline constexpr Scheduling::ThreadId BootstrapThreadId{ 0 };
+        inline constexpr Scheduling::ThreadId FirstWorkerThreadId{ 1 };
+
+        [[noreturn]] void FirstWorkerThreadEntry(void*) noexcept {
+            /*
+            * Step 9 only records this entry contract.
+            * Step 10 will actually construct a context that enters it.
+            */
+            for (;;)
+                __asm__ volatile("pause");
+        }
 
         void AdvancePhase(KernelRuntime& runtime, KernelPhase expected, KernelPhase next) noexcept {
             if (runtime.Phase != expected)
@@ -150,6 +165,50 @@ namespace Zos::Kernel::Initialization {
             if (runtime.KernelPageMap.IsMapped(runtime.PrimaryStack.LowerGuard()) ||
                 runtime.KernelPageMap.IsMapped(runtime.PrimaryStack.UpperGuard()))
                 Diagnostics::Fatal("Stack", "permanent kernel stack guard page is mapped");
+        }
+
+        void InitializeKernelThreads(KernelRuntime& runtime) noexcept {
+            const auto bootstrap_error = runtime.BootstrapThread.InitializeBootstrap(BootstrapThreadId, runtime.PrimaryStack);
+            if (bootstrap_error != Scheduling::ThreadInitializationError::Success)
+                Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(bootstrap_error));
+
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || !processor->IsInitialized())
+                Diagnostics::Fatal("Thread", "current processor is invalid during bootstrap-thread binding");
+
+            /*
+            * The BSP is already executing this context. Binding the Thread object
+            * records that reality rather than performing a context transition.
+            */
+            processor->CurrentThread = &runtime.BootstrapThread;
+            if (processor->CurrentThread != &runtime.BootstrapThread || !runtime.BootstrapThread.IsInitialized() ||
+                runtime.BootstrapThread.Id() != BootstrapThreadId || runtime.BootstrapThread.State() != Scheduling::ThreadState::Running ||
+                runtime.BootstrapThread.Stack() != &runtime.PrimaryStack || runtime.BootstrapThread.OwnsStack())
+                Diagnostics::Fatal("Thread", "bootstrap-thread state or processor binding is invalid");
+
+            Diagnostics::Write("[zOS/Thread] Current processor binding verified.\n");
+
+            const auto worker_error = runtime.FirstWorkerThread.InitializeKernel(FirstWorkerThreadId, &FirstWorkerThreadEntry, nullptr,
+                runtime.PhysicalMemory, runtime.KernelAddresses, runtime.KernelPageMap, FirstKernelThreadStackPages);
+
+            if (worker_error != Scheduling::ThreadInitializationError::Success)
+                Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(worker_error));
+
+            const Memory::KernelStack* worker_stack = runtime.FirstWorkerThread.Stack();
+            if (!runtime.FirstWorkerThread.IsInitialized() || runtime.FirstWorkerThread.Id() != FirstWorkerThreadId ||
+                runtime.FirstWorkerThread.State() != Scheduling::ThreadState::Ready || runtime.FirstWorkerThread.Entry() != &FirstWorkerThreadEntry ||
+                runtime.FirstWorkerThread.EntryContext() != nullptr || !runtime.FirstWorkerThread.OwnsStack() ||
+                worker_stack == nullptr || worker_stack == &runtime.PrimaryStack)
+                Diagnostics::Fatal("Thread", "first kernel thread state is invalid");
+
+            if (!worker_stack->IsInitialized() || worker_stack->UsableSpan().PageCount != FirstKernelThreadStackPages ||
+                runtime.KernelPageMap.IsMapped(worker_stack->LowerGuard()) || runtime.KernelPageMap.IsMapped(worker_stack->UpperGuard()))
+                Diagnostics::Fatal("Thread", "first kernel thread stack validation failed");
+
+            if (runtime.PrimaryStack.Contains(worker_stack->Bottom()) || worker_stack->Contains(runtime.PrimaryStack.Bottom()))
+                Diagnostics::Fatal("Thread", "kernel thread stacks overlap");
+
+            Diagnostics::Write("[zOS/Thread] Kernel thread foundation established.\n");
         }
 
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
@@ -315,6 +374,10 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::MonotonicClockReady, KernelPhase::ProcessorLocalReady);
 
+        InitializeKernelThreads(runtime);
+
+        AdvancePhase(runtime, KernelPhase::ProcessorLocalReady, KernelPhase::KernelThreadsReady);
+
         const auto timer_error = runtime.Timer.Initialize(runtime.Apic, runtime.Interrupts, runtime.Clock, runtime.BootstrapProcessor);
         if (timer_error != Time::LocalApicTimerInitializationError::Success)
             Diagnostics::Fatal("Timer", Time::LocalApicTimer::Describe(timer_error));
@@ -325,9 +388,12 @@ namespace Zos::Kernel::Initialization {
         if (!runtime.Timer.ProcessorLocalObservedInInterrupt())
             Diagnostics::Fatal("CPU", "processor-local state was not observed in interrupt context");
 
+        if (CurrentProcessor()->CurrentThread != &runtime.BootstrapThread)
+            Diagnostics::Fatal("Thread", "current thread changed unexpectedly during interrupt delivery");
+
         Diagnostics::Write("[zOS/CPU] Processor-local interrupt access verified.\n");
 
-        AdvancePhase(runtime, KernelPhase::ProcessorLocalReady, KernelPhase::LocalApicTimerReady);
+        AdvancePhase(runtime, KernelPhase::KernelThreadsReady, KernelPhase::LocalApicTimerReady);
 
         EnterRuntime(runtime);
     }
