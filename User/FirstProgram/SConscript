@@ -1,63 +1,17 @@
 from pathlib import Path
+from SCons.Script import File
 
-Import("user_environment", "output_root")
+from UserImages import BuildNativeElf
 
-component_output = f"{output_root}/User/FirstProgram"
-component_directory = Path(Dir(".").srcnode().abspath)
-linker_script = File("Linker.ld")
+Import("user_environment", "user_runtime_objects", "output_root")
 
-source_exts = [ ".c", ".cc", ".cpp", ".cxx" ]
-source_files = sorted(
-    path for path in component_directory.rglob("*")
-    if path.is_file() and path.suffix.lower() in source_exts
-)
-
+source_directory = Path(Dir(".").srcnode().abspath)
+source_files = sorted(path for path in source_directory.iterdir() if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx"})
 if not source_files:
     raise RuntimeError("FirstProgram contains no translation units.")
 
-objects = []
-for source_path in source_files:
-    relative_path = source_path.relative_to(component_directory)
-    object_path = relative_path.with_suffix(user_environment["OBJSUFFIX"])
-    objects.append(
-        user_environment.Object(
-            target=f"{component_output}/{object_path.as_posix()}",
-            source=File(str(source_path)),
-        )
-    )
-
-runtime_directory = component_directory.parent / "Runtime"
-runtime_sources = sorted(
-    path for path in runtime_directory.rglob("*")
-    if path.is_file() and path.suffix.lower() in source_exts
+program = BuildNativeElf(
+    user_environment, output_root, "FirstProgram", source_files,
+    user_runtime_objects, File("Linker.ld"),
 )
-
-if not runtime_sources:
-    raise RuntimeError("Native user runtime contains no translation units.")
-
-for source_path in runtime_sources:
-    relative_path = source_path.relative_to(runtime_directory)
-    object_path = relative_path.with_suffix(user_environment["OBJSUFFIX"])
-    objects.append(
-        user_environment.Object(
-            target=f"{output_root}/User/Runtime/{object_path.as_posix()}",
-            source=File(str(source_path)),
-        )
-    )
-
-program = user_environment.Command(
-    target=f"{component_output}/FirstProgram.elf",
-    source=objects,
-    action=(
-        "$LINK $USER_LINKFLAGS "
-        "--script=$USER_LINKER_SCRIPT "
-        "--entry=_start "
-        "-o $TARGET "
-        "$SOURCES"
-    ),
-    USER_LINKER_SCRIPT=linker_script.abspath,
-)
-
-user_environment.Depends(program, linker_script)
-
 Return("program")

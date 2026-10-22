@@ -1,6 +1,7 @@
 #include <Kernel/Time/LocalApicTimer.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+#include <Kernel/Architecture/AMD64/Instructions.hpp>
 
 #include <Kernel/Scheduling/Scheduler.hpp>
 
@@ -19,22 +20,6 @@ namespace Zos::Kernel::Time {
         inline constexpr Uint64 TargetInterruptRateHz{ 100 };
         inline constexpr Uint64 DeliveryTestInterruptCount{ 8 };
         inline constexpr Uint64 DeliveryTestTimeoutNanoseconds{ 500'000'000ULL };
-
-        [[nodiscard]] Uint64 ReadRflags() noexcept {
-            Uint64 flags{};
-
-            __asm__ volatile(
-                "pushfq\n\t"
-                "popq %0"
-                : "=r"(flags)
-                :
-                : "memory"
-            );
-
-            return flags;
-        }
-
-        inline constexpr Uint64 RflagsInterruptEnable{ 1ULL << 9 };
     }
 
     LocalApicTimer* LocalApicTimer::s_ActiveTimer{};
@@ -47,7 +32,7 @@ namespace Zos::Kernel::Time {
             return LocalApicTimerInitializationError::InvalidDependency;
 
         if (s_ActiveTimer != nullptr) return LocalApicTimerInitializationError::ActiveInstanceExists;
-        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+        if (Architecture::AMD64::InterruptsEnabled())
             return LocalApicTimerInitializationError::InvalidDependency;
 
         m_Apic = &apic;
@@ -144,7 +129,7 @@ namespace Zos::Kernel::Time {
 
     bool LocalApicTimer::EnableAndVerifyInterruptDelivery() noexcept {
         if (!m_Initialized || m_Apic == nullptr || m_Clock == nullptr) return false;
-        if ((ReadRflags() & RflagsInterruptEnable) != 0) return false;
+        if (Architecture::AMD64::InterruptsEnabled()) return false;
 
         m_InterruptCount = 0;
         m_FirstInterruptNanoseconds = 0;

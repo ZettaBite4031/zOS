@@ -2,62 +2,71 @@
 
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+#include <Kernel/Architecture/AMD64/Instructions.hpp>
 
 namespace Zos::Kernel::Processes {
     namespace {
-        [[nodiscard]] Memory::Uint64 ReadRflags() noexcept {
-            Memory::Uint64 flags{};
-            __asm__ volatile("pushfq\n\tpopq %0" : "=r"(flags) :: "memory");
-            return flags;
-        }
+
     }
 
-    UserProcessLaunchError UserProcessInstance::Launch( ProcessId process_id, Scheduling::ThreadId thread_id, const Executables::EmbeddedImage& executable, const Executables::UserExecutableLoadOptions& load_options,
+    UserProcessLaunchError UserProcessInstance::Launch( ProcessId process_id, Scheduling::ThreadId thread_id, const Executables::ExecutableImageView& executable, const Executables::UserExecutableLoadOptions& load_options,
         Memory::Uint64 kernel_stack_pages, Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& kernel_addresses, Architecture::AMD64::PageMap& kernel_page_map, Scheduling::Scheduler& scheduler) noexcept {
         
-        if (m_Launched || m_Process.IsInitialized() || m_Thread.IsInitialized() || m_Image.IsLoaded()) 
+        if (m_State != UserProcessLaunchState::Empty || m_Process.IsInitialized() || m_Thread.IsInitialized() || m_Image.IsLoaded()) 
             return UserProcessLaunchError::AlreadyLaunched;
 
         if (process_id == 0 || thread_id == 0 || !executable.IsValid() || kernel_stack_pages == 0 || !physical_memory.IsInitialized() || !kernel_addresses.IsInitialized() ||
             !kernel_page_map.IsInitialized() || !kernel_page_map.IsActive() || !scheduler.IsInitialized() || !scheduler.PreemptionEnabled() ||
-            (ReadRflags() & (1ULL << 9)) == 0)
+            !Architecture::AMD64::InterruptsEnabled())
             return UserProcessLaunchError::InvalidDependency;
 
+        m_State = UserProcessLaunchState::Preparing;
+
         const auto process_error = m_Process.InitializeIsolated(process_id, physical_memory, kernel_page_map);
-        if (process_error != ProcessInitializationError::Success)
-            return UserProcessLaunchError::ProcessInitializationFailed;
+        if (process_error != ProcessInitializationError::Success) {
+            m_State = UserProcessLaunchState::Failed;
+            return m_LastError = UserProcessLaunchError::ProcessInitializationFailed;
+        }
 
         const auto image_error = Executables::UserExecutableLoader::LoadStaticElf(
             executable.Data, executable.Size, m_Process, physical_memory, load_options, m_Image
         );
-        if (image_error != Executables::UserExecutableLoadError::Success)
-            return UserProcessLaunchError::ImageLoadFailed;
+        if (image_error != Executables::UserExecutableLoadError::Success) {
+            m_State = UserProcessLaunchState::Failed;
+            return m_LastError = UserProcessLaunchError::ImageLoadFailed;
+        }
 
         const auto thread_error = m_Thread.InitializeKernel(thread_id, m_Process, &ThreadEntry, this, physical_memory, kernel_addresses, kernel_page_map, kernel_stack_pages);
-        if (thread_error != Scheduling::ThreadInitializationError::Success)
-            return UserProcessLaunchError::ThreadInitializationFailed;
+        if (thread_error != Scheduling::ThreadInitializationError::Success) {
+            m_State = UserProcessLaunchState::Failed;
+            return m_LastError = UserProcessLaunchError::ThreadInitializationFailed;
+        }
 
         const auto user_mode_error = m_Thread.ConfigureUserMode(m_Image.EntryPoint(), m_Image.StackTop());
-        if (user_mode_error != Scheduling::ThreadUserModeError::Success)
-            return UserProcessLaunchError::UserModeConfigurationFailed;
+        if (user_mode_error != Scheduling::ThreadUserModeError::Success) {
+            m_State = UserProcessLaunchState::Failed;
+            return m_LastError = UserProcessLaunchError::UserModeConfigurationFailed;
+        }
 
         /* Publish all execution state before the first runnable registration. */
-        __asm__ volatile("cli" ::: "memory");
-        m_Launched = true;
-        const auto registration_error = scheduler.RegisterThread(m_Thread);
-        if (registration_error != Scheduling::SchedulerRegistrationError::Success)
-            m_Launched = false;
-        __asm__ volatile("sti" ::: "memory");
+        Scheduling::SchedulerRegistrationError registration_error{};
+        {
+            Architecture::AMD64::ScopedInterruptDisable guard{};
+            m_State = UserProcessLaunchState::Runnable;
+            registration_error = scheduler.RegisterThread(m_Thread);
+            if (registration_error != Scheduling::SchedulerRegistrationError::Success)
+                m_State = UserProcessLaunchState::Failed;
+        }
 
         if (registration_error != Scheduling::SchedulerRegistrationError::Success)
-            return UserProcessLaunchError::SchedulerRegistrationFailed;
+            return m_LastError = UserProcessLaunchError::SchedulerRegistrationFailed;
 
         return UserProcessLaunchError::Success;
     }
 
     void UserProcessInstance::ThreadEntry(void* context) noexcept {
         auto* instance = static_cast<UserProcessInstance*>(context);
-        if (instance == nullptr || !instance->m_Launched || !instance->m_Image.IsLoaded() ||
+        if (instance == nullptr || !instance->IsLaunched() || !instance->m_Image.IsLoaded() ||
             !instance->m_Thread.UserModeConfigured() ||
             instance->m_Process.State() != ProcessState::Active)
             Diagnostics::Fatal("City", "invalid user launch context");

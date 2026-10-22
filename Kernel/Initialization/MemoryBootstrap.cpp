@@ -1,5 +1,5 @@
 #include <Kernel/Initialization/MemoryBootstrap.hpp>
-#include <Kernel/Initialization/SelfTests.hpp>
+#include <Kernel/Tests/MemoryTests.hpp>
 
 #include <Kernel/Kernel.hpp>
 
@@ -125,7 +125,7 @@ namespace Zos::Kernel::Initialization::MemoryBootstrap {
         Diagnostics::WriteDecimal(metadata.SizeBytes());
         Diagnostics::Write(" bytes\n");
 
-        SelfTests::RunPhysicalMemorySelfTest(runtime.PhysicalMemory);
+        Tests::MemoryTests::RunPhysicalMemorySelfTest(runtime.PhysicalMemory);
 
         Diagnostics::Write("[zOS/Startup] Physical memory ownership established.\n");
     }

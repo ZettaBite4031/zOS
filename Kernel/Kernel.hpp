@@ -142,12 +142,6 @@ namespace Zos::Kernel {
         Time::MonotonicClock Clock{};
         Time::LocalApicTimer Timer{};
 
-        Executables::LoadedUserImage FirstUserImage{};
-
-        Processes::UserProcessInstance CityExit{};
-        Processes::UserProcessInstance CityFault{};
-        Processes::UserProcessInstance CitySurvivor{};
-
         /*
          * Permanent bootstrap/runtime stack until kernel threads
          * introduce per-thread kernel stacks.
@@ -155,11 +149,8 @@ namespace Zos::Kernel {
         Memory::KernelStack PrimaryStack{};
 
         Processes::Process KernelProcess{};
-        Processes::Process FirstUserProcess{};
 
         Scheduling::Thread BootstrapThread{};
-        Scheduling::Thread FirstWorkerThread{};
-        Scheduling::Thread FirstUserThread{};
 
         Scheduling::Scheduler BootstrapScheduler{};
 

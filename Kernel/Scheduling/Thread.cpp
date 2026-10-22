@@ -4,6 +4,7 @@
 #include <Kernel/Architecture/AMD64/UserMode.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+#include <Kernel/Architecture/AMD64/Instructions.hpp>
 
 #include <Kernel/Scheduling/Scheduler.hpp>
 
@@ -12,21 +13,6 @@
 
 namespace Zos::Kernel::Scheduling {
     namespace {
-        [[nodiscard]] Memory::Uint64 ReadRflags() noexcept {
-            Memory::Uint64 flags{};
-
-            __asm__ volatile(
-                "pushfq\n\t"
-                "popq %0"
-                : "=r"(flags)
-                :
-                : "memory"
-            );
-
-            return flags;
-        }
-
-        inline constexpr Memory::Uint64 RflagsInterruptEnable{ 1ULL << 9 };
     }
     
     ThreadInitializationError Thread::InitializeBootstrap(ThreadId id, Processes::Process& owning_process, Memory::KernelStack& current_stack) noexcept {
@@ -99,7 +85,7 @@ namespace Zos::Kernel::Scheduling {
         if (!m_Initialized || !next.m_Initialized || &next == this)
             return ThreadSwitchError::InvalidThread;
 
-        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+        if (Architecture::AMD64::InterruptsEnabled())
             return ThreadSwitchError::InterruptsEnabled;
 
         Architecture::AMD64::ProcessorLocal* processor = Architecture::AMD64::CurrentProcessor();

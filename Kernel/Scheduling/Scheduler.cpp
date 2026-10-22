@@ -1,24 +1,10 @@
 #include <Kernel/Scheduling/Scheduler.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+#include <Kernel/Architecture/AMD64/Instructions.hpp>
 
 namespace Zos::Kernel::Scheduling {
     namespace {
-        [[nodiscard]] Memory::Uint64 ReadRflags() noexcept {
-            Memory::Uint64 flags{};
-
-            __asm__ volatile(
-                "pushfq\n\t"
-                "popq %0"
-                : "=r"(flags)
-                :
-                : "memory"
-            );
-
-            return flags;
-        }
-
-        inline constexpr Memory::Uint64 RflagsInterruptEnable{ 1ULL << 9 };
     }
 
     SchedulerInitializationError Scheduler::Initialize(Architecture::AMD64::ProcessorLocal& processor) noexcept {
@@ -89,7 +75,7 @@ namespace Zos::Kernel::Scheduling {
         if (!m_Initialized || m_Processor == nullptr)
             return SchedulerYieldError::NotInitialized;
 
-        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+        if (Architecture::AMD64::InterruptsEnabled())
             return SchedulerYieldError::InterruptsEnabled;
 
         Thread* current = m_Processor->CurrentThread;
@@ -139,7 +125,7 @@ namespace Zos::Kernel::Scheduling {
         if (!m_Initialized || m_Processor == nullptr || m_PreemptionEnabled)
             return false;
 
-        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+        if (Architecture::AMD64::InterruptsEnabled())
             return false;
 
         Thread* current = m_Processor->CurrentThread;
@@ -161,7 +147,7 @@ namespace Zos::Kernel::Scheduling {
         if (!m_PreemptionEnabled)
             return SchedulerPreemptionError::Disabled;
 
-        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+        if (Architecture::AMD64::InterruptsEnabled())
             return SchedulerPreemptionError::InterruptsEnabled;
 
         Thread* current = m_Processor->CurrentThread;
@@ -222,7 +208,7 @@ namespace Zos::Kernel::Scheduling {
         if (!m_Initialized || m_Processor == nullptr)
             Diagnostics::Fatal("Scheduler", "thread termination requested before scheduler initialization");
 
-        if ((ReadRflags() & RflagsInterruptEnable) != 0)
+        if (Architecture::AMD64::InterruptsEnabled())
             Diagnostics::Fatal("Scheduler", "thread termination requires interrupts disabled");
 
         Thread* current = m_Processor->CurrentThread;

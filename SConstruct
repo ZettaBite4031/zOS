@@ -15,6 +15,7 @@ sys.path.insert(0, str(repo_root / "BuildSystem"))
 from Environments import CreateKernelEnvironment, CreateUefiEnvironment, CreateUserEnvironment
 from Execution import CreateQemuCommand
 from Toolchain import Toolchain
+from UserImages import BuildRuntimeObjects
 
 configuration = ARGUMENTS.get("Configuration", "Debug")
 if configuration not in {"Debug", "Release"}:
@@ -27,6 +28,7 @@ toolchain = Toolchain.Load(repo_root)
 uefi_environment = CreateUefiEnvironment(repo_root, toolchain, configuration)
 kernel_environment = CreateKernelEnvironment(repo_root, toolchain, configuration)
 user_environment = CreateUserEnvironment(repo_root, toolchain, configuration)
+user_runtime_objects = BuildRuntimeObjects(user_environment, output_root, repo_root)
 
 loader = SConscript(
     "Boot/UEFI/SConscript",
@@ -34,11 +36,11 @@ loader = SConscript(
 )
 first_user_program = SConscript(
     "User/FirstProgram/SConscript",
-    exports={"user_environment": user_environment, "output_root": output_root},
+    exports={"user_environment": user_environment, "output_root": output_root, "user_runtime_objects": user_runtime_objects},
 )
 city_user_programs = SConscript(
     "User/CityPrograms/SConscript",
-    exports={"user_environment": user_environment, "output_root": output_root},
+    exports={"user_environment": user_environment, "output_root": output_root, "user_runtime_objects": user_runtime_objects},
 )
 kernel = SConscript(
     "Kernel/SConscript",

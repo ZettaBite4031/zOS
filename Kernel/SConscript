@@ -1,150 +1,57 @@
 from pathlib import Path
-
-from SCons.Script import Action
+from SCons.Script import Action, File
 
 Import("kernel_environment", "output_root", "first_user_program", "city_user_programs")
 
 component_output = f"{output_root}/Kernel"
 component_directory = Path(Dir(".").srcnode().abspath)
 linker_script = File("Linker.ld")
-
-source_exts = [ ".c", ".cc", ".cpp", ".cxx" ]
-source_files = sorted(
-    path for path in component_directory.rglob("*")
-    if path.is_file() and path.suffix.lower() in source_exts
-)
-
+source_exts = {".c", ".cc", ".cpp", ".cxx"}
+source_files = sorted(path for path in component_directory.rglob("*") if path.is_file() and path.suffix.lower() in source_exts)
 if not source_files:
     raise RuntimeError("Kernel contains no translation units.")
 
-kernel_objects = []
+kernel_objects = [kernel_environment.Object(
+    target=f"{component_output}/{path.relative_to(component_directory).with_suffix(kernel_environment['OBJSUFFIX']).as_posix()}",
+    source=File(str(path)),
+) for path in source_files]
 
-for source_path in source_files:
-    relative_path = source_path.relative_to(component_directory)
-    object_path = relative_path.with_suffix(kernel_environment["OBJSUFFIX"])
+IMAGE_NAMES = ("FirstUserProgram", "CityExit", "CityFault", "CitySurvivor")
 
-    kernel_objects.append(
-        kernel_environment.Object(
-            target=f"{component_output}/{object_path.as_posix()}",
-            source=File(str(source_path)),
-        )
-    )
-
-
-def EmbedFirstUserProgram(target, source, env):
-    destination = Path(str(target[0]))
-    image_path = Path(str(source[0]))
-    image = image_path.read_bytes()
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = []
-    for offset in range(0, len(image), 16):
-        chunk = image[offset:offset + 16]
-        lines.append("        " + ", ".join(f"0x{byte:02X}" for byte in chunk) + ",")
-
-    content = "\n".join([
-        "#include <Kernel/Executables/EmbeddedUserImages.hpp>",
-        "",
-        "namespace Zos::Kernel::Executables {",
-        "    namespace {",
-        "        alignas(16) const Memory::Uint8 g_FirstUserProgramImage[]{",
-        *lines,
-        "        };",
-        "    }",
-        "",
-        "    EmbeddedImage FirstUserProgramImage() noexcept {",
-        "        return EmbeddedImage{",
-        "            .Data = g_FirstUserProgramImage,",
-        "            .Size = sizeof(g_FirstUserProgramImage),",
-        "        };",
-        "    }",
-        "}",
-        "",
-    ])
-
-    destination.write_text(content, encoding="utf-8")
-    return 0
-
-
-def EmbedCityPrograms(target, source, env):
+def EmbedUserImages(target, source, env):
     destination = Path(str(target[0]))
     destination.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = [
-        "#include <Kernel/Executables/EmbeddedUserImages.hpp>",
-        "",
-        "namespace Zos::Kernel::Executables {",
-        "    namespace {",
-    ]
-
-    roles = ("Exit", "Fault", "Survivor")
-    for role, source_node in zip(roles, source):
-        image = Path(str(source_node)).read_bytes()
-
-        lines.append(f"        alignas(16) const Memory::Uint8 g_City{role}Image[]{{")
-
+    lines = ["#include <Kernel/Executables/EmbeddedUserImages.hpp>", "", "namespace Zos::Kernel::Executables {", "    namespace {"]
+    for name, image_node in zip(IMAGE_NAMES, source):
+        image = Path(str(image_node)).read_bytes()
+        lines.append(f"        alignas(16) const Memory::Uint8 g_{name}Image[]{{")
         for offset in range(0, len(image), 16):
-            chunk = image[offset:offset + 16]
-            lines.append("            " + ", ".join(f"0x{byte:02X}" for byte in chunk) + ",")
-
+            lines.append("            " + ", ".join(f"0x{value:02X}" for value in image[offset:offset+16]) + ",")
         lines.append("        };")
-
     lines.extend(["    }", ""])
-
-    for role in roles:
+    for name in IMAGE_NAMES:
         lines.extend([
-            f"    EmbeddedImage City{role}Image() noexcept {{",
-            "        return EmbeddedImage{",
-            f"            .Data = g_City{role}Image,",
-            f"            .Size = sizeof(g_City{role}Image),",
-            "        };",
-            "    }",
-            "",
+            f"    EmbeddedImage {name}Image() noexcept {{",
+            f"        return EmbeddedImage{{ g_{name}Image, sizeof(g_{name}Image) }};",
+            "    }", "",
         ])
-
     lines.append("}")
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0
 
-
-embedded_user_source = kernel_environment.Command(
-    target=f"{component_output}/Generated/FirstUserProgramImage.cpp",
-    source=first_user_program,
-    action=Action(EmbedFirstUserProgram, "Embedding native user image $SOURCE"),
+images = [first_user_program[0], *(city_user_programs[name][0] for name in ("Exit", "Fault", "Survivor"))]
+embedded_source = kernel_environment.Command(
+    target=f"{component_output}/Generated/UserImages.cpp", source=images,
+    action=Action(EmbedUserImages, "Embedding native user ELF images"),
 )
-
-embedded_user_object = kernel_environment.Object(
-    target=f"{component_output}/Generated/FirstUserProgramImage{kernel_environment['OBJSUFFIX']}",
-    source=embedded_user_source,
-)
-kernel_objects.append(embedded_user_object)
-
-city_embedded_source = kernel_environment.Command(
-    target=f"{component_output}/Generated/CityProgramImages.cpp",
-    source=[city_user_programs[role][0] for role in ("Exit", "Fault", "Survivor")],
-    action=Action(EmbedCityPrograms, "Embedding First City native executables"),
-)
-
-city_embedded_object = kernel_environment.Object(
-    target=f"{component_output}/Generated/CityProgramImages{kernel_environment['OBJSUFFIX']}",
-    source=city_embedded_source,
-)
-kernel_objects.append(city_embedded_object)
+kernel_objects.append(kernel_environment.Object(
+    target=f"{component_output}/Generated/UserImages{kernel_environment['OBJSUFFIX']}", source=embedded_source,
+))
 
 kernel = kernel_environment.Command(
-    target=f"{component_output}/Kernel.elf",
-    source=kernel_objects,
-    action=(
-        "$LINK $KERNEL_LINKFLAGS "
-        "--script=$KERNEL_LINKER_SCRIPT "
-        "--entry=KernelEntry "
-        "-o $TARGET "
-        "$SOURCES"
-    ),
+    target=f"{component_output}/Kernel.elf", source=kernel_objects,
+    action="$LINK $KERNEL_LINKFLAGS --script=$KERNEL_LINKER_SCRIPT --entry=KernelEntry -o $TARGET $SOURCES",
     KERNEL_LINKER_SCRIPT=linker_script.abspath,
 )
-
 kernel_environment.Depends(kernel, linker_script)
-
 Return("kernel")

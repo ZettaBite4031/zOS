@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Kernel/Executables/EmbeddedUserImages.hpp>
+#include <Kernel/Executables/ExecutableImageView.hpp>
 #include <Kernel/Executables/UserExecutableLoader.hpp>
 #include <Kernel/Processes/Process.hpp>
 #include <Kernel/Scheduling/Scheduler.hpp>
@@ -8,6 +8,13 @@
 #include <Kernel/Memory/VirtualAddressAllocator.hpp>
 
 namespace Zos::Kernel::Processes {
+    enum class UserProcessLaunchState : Memory::Uint32 {
+        Empty,
+        Preparing,
+        Runnable,
+        Failed,
+    };
+
     enum class UserProcessLaunchError : Memory::Uint32 {
         Success,
         AlreadyLaunched,
@@ -34,7 +41,7 @@ namespace Zos::Kernel::Processes {
         [[nodiscard]] UserProcessLaunchError Launch(
             ProcessId process_id,
             Scheduling::ThreadId thread_id,
-            const Executables::EmbeddedImage& executable,
+            const Executables::ExecutableImageView& executable,
             const Executables::UserExecutableLoadOptions& load_options,
             Memory::Uint64 kernel_stack_pages,
             Memory::PhysicalMemoryManager& physical_memory,
@@ -43,7 +50,9 @@ namespace Zos::Kernel::Processes {
             Scheduling::Scheduler& scheduler
         ) noexcept;
 
-        [[nodiscard]] bool IsLaunched() const noexcept { return m_Launched; }
+        [[nodiscard]] bool IsLaunched() const noexcept { return m_State == UserProcessLaunchState::Runnable; }
+        [[nodiscard]] UserProcessLaunchState LaunchState() const noexcept { return m_State; }
+        [[nodiscard]] UserProcessLaunchError LastLaunchError() const noexcept { return m_LastError; }
         [[nodiscard]] Process& ProcessObject() noexcept { return m_Process; }
         [[nodiscard]] const Process& ProcessObject() const noexcept { return m_Process; }
         [[nodiscard]] Scheduling::Thread& MainThread() noexcept { return m_Thread; }
@@ -58,6 +67,7 @@ namespace Zos::Kernel::Processes {
         Process m_Process{};
         Scheduling::Thread m_Thread{};
         Executables::LoadedUserImage m_Image{};
-        bool m_Launched{};
+        UserProcessLaunchState m_State{ UserProcessLaunchState::Empty };
+        UserProcessLaunchError m_LastError{ UserProcessLaunchError::Success };
     };
 }

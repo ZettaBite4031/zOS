@@ -1,9 +1,11 @@
 #include <Kernel/Initialization/Initialization.hpp>
 
 #include <Kernel/Initialization/CityBootstrap.hpp>
+#include <Kernel/Tests/CityTests.hpp>
+#include <Kernel/Tests/ExecutionTests.hpp>
 #include <Kernel/Initialization/ExecutionBootstrap.hpp>
 #include <Kernel/Initialization/MemoryBootstrap.hpp>
-#include <Kernel/Initialization/SelfTests.hpp>
+#include <Kernel/Tests/MemoryTests.hpp>
 
 #include <Kernel/Kernel.hpp>
 
@@ -238,7 +240,7 @@ namespace Zos::Kernel::Initialization {
         AdvancePhase(runtime, KernelPhase::PermanentStackActive, KernelPhase::BootstrapResourcesReleased);
 
         MemoryBootstrap::InitializeKernelHeap(runtime);
-        SelfTests::RunKernelHeapSelfTest(runtime);
+        Tests::MemoryTests::RunKernelHeapSelfTest(runtime);
         AdvancePhase(runtime, KernelPhase::BootstrapResourcesReleased, KernelPhase::KernelHeapReady);
 
         /*
@@ -246,7 +248,7 @@ namespace Zos::Kernel::Initialization {
          * allowed to depend on it.
          */
         MemoryBootstrap::BindCxxAllocationRuntime(runtime);
-        SelfTests::RunCxxAllocationSelfTest(runtime);
+        Tests::MemoryTests::RunCxxAllocationSelfTest(runtime);
         AdvancePhase(runtime, KernelPhase::KernelHeapReady, KernelPhase::CxxAllocationReady);
 
         MemoryBootstrap::PromoteVirtualAddressMetadata(runtime);
@@ -258,7 +260,7 @@ namespace Zos::Kernel::Initialization {
         MemoryBootstrap::RetireBootstrapMetadata(runtime);
         AdvancePhase(runtime, KernelPhase::PageMapMetadataPromoted, KernelPhase::BootstrapMetadataRetired);
 
-        SelfTests::RunPermanentMemorySelfTest(runtime);
+        Tests::MemoryTests::RunPermanentMemorySelfTest(runtime);
         AdvancePhase(runtime, KernelPhase::BootstrapMetadataRetired, KernelPhase::BootstrapComplete);
         Diagnostics::Write("[zOS/Startup] Bootstrap infrastructure complete.\n");
 
@@ -326,12 +328,12 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::KernelProcessReady, KernelPhase::KernelThreadsReady);
 
-        ExecutionBootstrap::RunCooperativeContextSwitchSelfTest(runtime);
+        Tests::Execution::RunCooperativeContextSwitchSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::KernelThreadsReady, KernelPhase::CooperativeContextSwitchReady);
 
         ExecutionBootstrap::InitializeScheduler(runtime);
-        ExecutionBootstrap::RunSchedulerSelfTest(runtime);
+        Tests::Execution::RunSchedulerSelfTest(runtime);
 
         ProcessorLocal* processor = CurrentProcessor();
         if (processor == nullptr || processor->CurrentThread == nullptr || processor->CurrentThread->OwningProcess() != &runtime.KernelProcess)
@@ -356,12 +358,12 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::SchedulerReady, KernelPhase::LocalApicTimerReady);
 
-        ExecutionBootstrap::RunPreemptionSelfTest(runtime);
+        Tests::Execution::RunPreemptionSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::LocalApicTimerReady, KernelPhase::PreemptionReady);
 
         ExecutionBootstrap::InitializeProcessAddressSpaces(runtime);
-        ExecutionBootstrap::RunProcessAddressSpaceSelfTest(runtime);
+        Tests::Execution::RunProcessAddressSpaceSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::PreemptionReady, KernelPhase::ProcessAddressSpacesReady);
 
@@ -371,21 +373,21 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::SystemCallsReady);
 
-        ExecutionBootstrap::LoadFirstUserExecutable(runtime);
+        Tests::Execution::LoadFirstUserExecutable(runtime);
 
         AdvancePhase(runtime, KernelPhase::SystemCallsReady, KernelPhase::UserExecutableReady);
 
-        ExecutionBootstrap::RunRing3SelfTest(runtime);
-        ExecutionBootstrap::RunSystemCallSelfTest(runtime);
+        Tests::Execution::RunRing3SelfTest(runtime);
+        Tests::Execution::RunSystemCallSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::UserExecutableReady, KernelPhase::Ring3Ready);
 
-        ExecutionBootstrap::RunUserRuntimeExitSelfTest(runtime);
+        Tests::Execution::RunUserRuntimeExitSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::UserRuntimeReady);
 
         CityBootstrap::LaunchCity(runtime);
-        CityBootstrap::RunCitySelfTest(runtime);
+        Tests::City::RunCitySelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::UserRuntimeReady, KernelPhase::FirstCityReady);
 
@@ -406,7 +408,7 @@ namespace Zos::Kernel::Initialization {
         AdvancePhase(runtime, KernelPhase::BootEnvironmentValidated, KernelPhase::PhysicalMemoryReady);
 
         MemoryBootstrap::InitializeVirtualMemory(runtime);
-        SelfTests::RunVirtualMemorySelfTest(runtime);
+        Tests::MemoryTests::RunVirtualMemorySelfTest(runtime);
         AdvancePhase(runtime, KernelPhase::PhysicalMemoryReady, KernelPhase::VirtualMemoryReady);
         Diagnostics::Write("[zOS/Startup] Virtual-memory infrastructure established.\n");
 
@@ -434,7 +436,7 @@ namespace Zos::Kernel::Initialization {
          * ranges remain Reserved and are therefore unaffected.
          */
         MemoryBootstrap::ReclaimBootMemory(runtime);
-        SelfTests::RunBootMemoryReclamationSelfTest(runtime);
+        Tests::MemoryTests::RunBootMemoryReclamationSelfTest(runtime);
         AdvancePhase(runtime, KernelPhase::InterruptsReady, KernelPhase::BootMemoryReclaimed);
 
         /*

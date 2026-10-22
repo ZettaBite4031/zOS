@@ -1,50 +1,17 @@
 from pathlib import Path
+from SCons.Script import File
 
-Import("user_environment", "output_root")
+from UserImages import BuildNativeElf
 
-component_output = f"{output_root}/User/CityPrograms"
-component_directory = Path(Dir(".").srcnode().abspath)
-runtime_directory = component_directory.parent / "Runtime"
-linker_script = File("Linker.ld")
-source_exts = {".c", ".cc", ".cpp", ".cxx"}
-
-runtime_sources = sorted(
-    path for path in runtime_directory.rglob("*")
-    if path.is_file() and path.suffix.lower() in source_exts
-)
-if not runtime_sources:
-    raise RuntimeError("Native user runtime contains no translation units.")
-
-runtime_objects = []
-for source_path in runtime_sources:
-    relative = source_path.relative_to(runtime_directory)
-    runtime_objects.append(user_environment.Object(
-        target=f"{component_output}/Runtime/{relative.with_suffix(user_environment['OBJSUFFIX']).as_posix()}",
-        source=File(str(source_path)),
-    ))
+Import("user_environment", "user_runtime_objects", "output_root")
 
 programs = {}
 for role, number in (("Exit", 1), ("Fault", 2), ("Survivor", 3)):
-    role_environment = user_environment.Clone()
-    role_environment.Append(CPPDEFINES=[("ZOS_CITY_ROLE", number)])
-
-    entry_object = role_environment.Object(
-        target=f"{component_output}/{role}/Main{user_environment['OBJSUFFIX']}",
-        source=File("Main.cpp"),
+    environment = user_environment.Clone()
+    environment.Append(CPPDEFINES=[("ZOS_CITY_ROLE", number)])
+    programs[role] = BuildNativeElf(
+        environment, output_root, f"City{role}", [Path(Dir(".").srcnode().abspath) / "Main.cpp"],
+        user_runtime_objects, File("Linker.ld"),
     )
-
-    program = role_environment.Command(
-        target=f"{component_output}/{role}/{role}.elf",
-        source=[entry_object, *runtime_objects],
-        action=(
-            "$LINK $USER_LINKFLAGS "
-            "--script=$USER_LINKER_SCRIPT "
-            "--entry=_start "
-            "-o $TARGET $SOURCES"
-        ),
-        USER_LINKER_SCRIPT=linker_script.abspath,
-    )
-    role_environment.Depends(program, linker_script)
-    programs[role] = program
 
 Return("programs")
