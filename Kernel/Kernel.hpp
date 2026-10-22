@@ -26,6 +26,7 @@
 #include <Kernel/Scheduling/Scheduler.hpp>
 
 #include <Kernel/Processes/Process.hpp>
+#include <Kernel/Executables/UserExecutableLoader.hpp>
 
 namespace Zos::Kernel {
     struct BootContext final {
@@ -96,8 +97,9 @@ namespace Zos::Kernel {
         LocalApicTimerReady,
         PreemptionReady,
         ProcessAddressSpacesReady,
-        Ring3Ready,
         SystemCallsReady,
+        UserExecutableReady,
+        Ring3Ready,
         UserFaultIsolationReady,
 
         Runtime,
@@ -137,9 +139,7 @@ namespace Zos::Kernel {
         Time::MonotonicClock Clock{};
         Time::LocalApicTimer Timer{};
 
-        Memory::PhysicalAllocation FirstUserCodePage{};
-        Memory::PhysicalAllocation FirstUserDataPage{};
-        Memory::PhysicalAllocation FirstUserStackBacking{};
+        Executables::LoadedUserImage FirstUserImage{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads

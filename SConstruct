@@ -12,7 +12,7 @@ from SCons.Script import ARGUMENTS, Action, Alias, AlwaysBuild, Default, Dir, En
 repo_root = Path(Dir("#").abspath)
 sys.path.insert(0, str(repo_root / "BuildSystem"))
 
-from Environments import CreateKernelEnvironment, CreateUefiEnvironment
+from Environments import CreateKernelEnvironment, CreateUefiEnvironment, CreateUserEnvironment
 from Execution import CreateQemuCommand
 from Toolchain import Toolchain
 
@@ -26,9 +26,24 @@ toolchain = Toolchain.Load(repo_root)
 
 uefi_environment = CreateUefiEnvironment(repo_root, toolchain, configuration)
 kernel_environment = CreateKernelEnvironment(repo_root, toolchain, configuration)
+user_environment = CreateUserEnvironment(repo_root, toolchain, configuration)
 
-loader = SConscript("Boot/UEFI/SConscript", exports={ "uefi_environment": uefi_environment, "output_root": output_root })
-kernel = SConscript("Kernel/SConscript", exports={ "kernel_environment": kernel_environment, "output_root": output_root })
+loader = SConscript(
+    "Boot/UEFI/SConscript",
+    exports={"uefi_environment": uefi_environment, "output_root": output_root},
+)
+first_user_program = SConscript(
+    "User/FirstProgram/SConscript",
+    exports={"user_environment": user_environment, "output_root": output_root},
+)
+kernel = SConscript(
+    "Kernel/SConscript",
+    exports={
+        "kernel_environment": kernel_environment,
+        "output_root": output_root,
+        "first_user_program": first_user_program,
+    },
+)
 
 host_execution_environment = os.environ.copy()
 host_execution_environment["PATH"] = f"{toolchain.Bin}{os.pathsep}{host_execution_environment.get('PATH', '')}"
@@ -48,7 +63,11 @@ def CopyFile(target, source, env):
 
 def VerifyUefi(target, source, env):
     image = Path(str(source[0]))
-    output = subprocess.check_output([env["LLVM_READOBJ"], "--file-headers", str(image)], text=True, stderr=subprocess.STDOUT)
+    output = subprocess.check_output(
+        [env["LLVM_READOBJ"], "--file-headers", str(image)],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
 
     required = ("Format: COFF-x86-64", "IMAGE_SUBSYSTEM_EFI_APPLICATION")
     missing = [value for value in required if value not in output]
@@ -64,20 +83,55 @@ def VerifyUefi(target, source, env):
 
 def VerifyKernel(target, source, env):
     image = Path(str(source[0]))
-    headers = subprocess.check_output([env["LLVM_READOBJ"], "--file-headers", str(image)], text=True, stderr=subprocess.STDOUT)
-    symbols = subprocess.check_output([env["LLVM_NM"], "--defined-only", str(image)], text=True, stderr=subprocess.STDOUT)
+    headers = subprocess.check_output(
+        [env["LLVM_READOBJ"], "--file-headers", str(image)],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+    symbols = subprocess.check_output(
+        [env["LLVM_NM"], "--defined-only", str(image)],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
 
     required_headers = ("Format: elf64-x86-64", "Arch: x86_64")
-    missing = [ value for value in required_headers if value not in headers ]
+    missing = [value for value in required_headers if value not in headers]
 
     if missing or "KernelEntry" not in symbols:
         print(headers)
         print(symbols)
-        raise RuntimeError("Invalid kernel ELF image or missing KernelMain entry.")
+        raise RuntimeError("Invalid kernel ELF image or missing KernelEntry symbol.")
 
     stamp = Path(str(target[0]))
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.write_text("Kernel ELF image verified.\n", encoding="utf-8")
+    return 0
+
+
+def VerifyUserProgram(target, source, env):
+    image = Path(str(source[0]))
+    headers = subprocess.check_output(
+        [env["LLVM_READOBJ"], "--file-headers", "--program-headers", str(image)],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+    symbols = subprocess.check_output(
+        [env["LLVM_NM"], "--defined-only", str(image)],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+
+    required_headers = ("Format: elf64-x86-64", "Arch: x86_64")
+    missing = [value for value in required_headers if value not in headers]
+
+    if missing or "_start" not in symbols:
+        print(headers)
+        print(symbols)
+        raise RuntimeError("Invalid native user ELF image or missing _start entry.")
+
+    stamp = Path(str(target[0]))
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text("Native user ELF image verified.\n", encoding="utf-8")
     return 0
 
 
@@ -141,6 +195,11 @@ kernel_verification = host_environment.Command(
     source=kernel,
     action=Action(VerifyKernel, "Verifying kernel image $SOURCE"),
 )
+user_program_verification = host_environment.Command(
+    target=f"{output_root}/Verification/FirstProgram.stamp",
+    source=first_user_program,
+    action=Action(VerifyUserProgram, "Verifying native user image $SOURCE"),
+)
 
 staged_loader = host_environment.Command(
     target=f"{output_root}/ESP/EFI/BOOT/BOOTX64.EFI",
@@ -158,16 +217,26 @@ ovmf_variables = host_environment.Command(
     action=Action(CopyFile, "Preparing OVMF variable store $TARGET"),
 )
 
-build_products = [ loader_verification, kernel_verification, staged_loader, staged_kernel ]
+build_products = [
+    loader_verification,
+    kernel_verification,
+    user_program_verification,
+    staged_loader,
+    staged_kernel,
+]
 
 Default(build_products)
 Alias("build", build_products)
-Alias("verify", [loader_verification, kernel_verification])
+Alias("verify", [loader_verification, kernel_verification, user_program_verification])
 
 # Build.py uses this non-interactive alias before starting a debug session.
 # Keeping preparation inside SCons preserves the same dependency graph used by
 # normal runs without placing an interactive GDB process inside an SCons action.
 Alias("debug-build", [*build_products, ovmf_variables])
 
-run = host_environment.Alias("run", [*build_products, ovmf_variables], Action( RunQemu, "Running zOS under QEMU"))
+run = host_environment.Alias(
+    "run",
+    [*build_products, ovmf_variables],
+    Action(RunQemu, "Running zOS under QEMU"),
+)
 AlwaysBuild(run)

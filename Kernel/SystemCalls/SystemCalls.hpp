@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ABI/SystemCalls.hpp>
 #include <Kernel/Memory/Memory.hpp>
 
 namespace Zos::Kernel::Processes {
@@ -7,13 +8,10 @@ namespace Zos::Kernel::Processes {
 }
 
 namespace Zos::Kernel::SystemCalls {
-    using Number = Memory::Uint64;
+    using Number = ABI::SystemCallNumber;
+    using NativeSystemCall = ABI::NativeSystemCall;
 
-    enum class NativeSystemCall : Number {
-        GetProcessId = 0,
-    };
-
-    inline constexpr Memory::Uint64 InvalidSystemCallResult{ Memory::MaximumValue };
+    inline constexpr Memory::Uint64 InvalidSystemCallResult{ ABI::InvalidSystemCallResult };
 
     /*
      * Architecture-neutral request presented to the native zOS syscall layer.
@@ -33,5 +31,8 @@ namespace Zos::Kernel::SystemCalls {
         Memory::Uint64 Arguments[6]{};
     };
 
-    [[nodiscard]] Memory::Uint64 DispatchNative(const Request& request, const Processes::Process& process) noexcept;
+    [[nodiscard]] Memory::Uint64 DispatchNative(
+        const Request& request,
+        const Processes::Process& process
+    ) noexcept;
 }

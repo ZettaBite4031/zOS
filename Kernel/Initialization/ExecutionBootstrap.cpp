@@ -6,7 +6,10 @@
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
-#include <Kernel/SystemCalls/SystemCalls.hpp>
+#include <Kernel/Executables/EmbeddedUserImages.hpp>
+#include <Kernel/Executables/UserExecutableLoader.hpp>
+
+#include <User/FirstProgram/Contract.hpp>
 
 namespace Zos::Kernel::Initialization::ExecutionBootstrap {
     namespace {
@@ -39,38 +42,27 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         inline constexpr Uint64 ProcessPrivateWorkerMarker{ 0x5A4F535041434532ULL };
         volatile bool g_ProcessAddressSpaceWorkerObserved{};
 
-        inline constexpr Uint64 FirstUserModeStackPages{ 4 };
-        inline constexpr VirtualAddress FirstUserCodeAddress{ 0x0000000040000000ULL };
-        inline constexpr VirtualAddress FirstUserDataAddress{ 0x0000000040001000ULL };
-        inline constexpr VirtualAddress FirstUserStackGuard{ 0x0000000070000000ULL };
-        inline constexpr VirtualAddress FirstUserStackBase{ 0x0000000070001000ULL };
-        inline constexpr VirtualAddress FirstUserStackTop{
-            FirstUserStackBase.Value() + FirstUserModeStackPages * PageSize
-        };
-        inline constexpr Uint64 FirstUserModeMarker{ 0x5A4F535553455231ULL };
-        inline constexpr Uint64 FirstUserSystemCallStackMarker{ 0x5A4F535359534331ULL };
-        inline constexpr VirtualAddress FirstUserFaultAddress{ FirstUserStackGuard.Value() };
         volatile bool g_UserModeReady{};
 
-        static_assert((FirstUserStackTop.Value() & 0xFULL) == 0);
-        static_assert(static_cast<Uint64>(SystemCalls::NativeSystemCall::GetProcessId) == 0);
+        [[nodiscard]] volatile ::Zos::User::FirstProgram::State* FirstProgramState(KernelRuntime& runtime) noexcept {
+            const auto* address_space = runtime.FirstUserProcess.AddressSpace();
+            if (address_space == nullptr) return nullptr;
 
-        void WriteLittleEndian64(Uint8* destination, Uint64 value) noexcept {
-            for (Uint64 byte = 0; byte < 8; byte++)
-                destination[byte] = static_cast<Uint8>(value >> (byte * 8));
-        }
+            const auto translation = address_space->Translate(
+                VirtualAddress(::Zos::User::FirstProgram::StateAddress)
+            );
+            if (!translation.Mapped ||
+                !HasAccess(translation.Options.Access, PageAccess::Read) ||
+                !HasAccess(translation.Options.Access, PageAccess::Write) ||
+                !HasAccess(translation.Options.Access, PageAccess::User) ||
+                HasAccess(translation.Options.Access, PageAccess::Execute) ||
+                HasAccess(translation.Options.Access, PageAccess::Global))
+                return nullptr;
 
-        [[nodiscard]] bool ZeroDirectMappedAllocation(const PhysicalAllocation& allocation) noexcept {
-            if (!allocation.IsValid()) return false;
+            const VirtualAddress direct = Layout::DirectMapAddress(translation.Physical);
+            if (direct.IsNull()) return nullptr;
 
-            const VirtualAddress direct = Layout::DirectMapAddress(allocation.Base());
-            if (direct.IsNull()) return false;
-
-            auto* bytes = reinterpret_cast<volatile Uint8*>(direct.Value());
-            for (Uint64 index = 0; index < allocation.SizeBytes(); index++)
-                bytes[index] = 0;
-
-            return true;
+            return reinterpret_cast<volatile ::Zos::User::FirstProgram::State*>(direct.Value());
         }
 
         [[noreturn]] void FirstWorkerThreadEntry(void* context) noexcept {
@@ -501,258 +493,148 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         Diagnostics::Write("[zOS/Process] Cross-process CR3 scheduling verified.\n");
     }
 
-    void InitializeRing3State(KernelRuntime& runtime) noexcept {
+    void LoadFirstUserExecutable(KernelRuntime& runtime) noexcept {
+        using namespace ::Zos::User::FirstProgram;
+
         g_UserModeReady = false;
 
-        PageMap* address_space = runtime.FirstUserProcess.AddressSpace();
-        if (address_space == nullptr || !runtime.KernelPageMap.IsActive() || address_space->IsActive())
-            Diagnostics::Fatal("User", "Ring 3 setup began with invalid address-space state");
+        const Executables::EmbeddedImage embedded = Executables::FirstUserProgramImage();
+        if (!embedded.IsValid())
+            Diagnostics::Fatal("ELF", "embedded first user executable is unavailable");
 
-        if (runtime.KernelPageMap.IsMapped(FirstUserCodeAddress) ||
-            runtime.KernelPageMap.IsMapped(FirstUserDataAddress) ||
-            runtime.KernelPageMap.IsMapped(FirstUserStackBase) ||
-            address_space->IsMapped(FirstUserCodeAddress) ||
-            address_space->IsMapped(FirstUserDataAddress) ||
-            address_space->IsMapped(FirstUserStackGuard) ||
-            address_space->IsMapped(FirstUserStackBase))
-            Diagnostics::Fatal("User", "Ring 3 virtual addresses are already occupied");
-
-        if (runtime.PhysicalMemory.AllocatePage(runtime.FirstUserCodePage) != PhysicalAllocationError::Success)
-            Diagnostics::Fatal("User", "failed to allocate the first user code page");
-
-        if (runtime.PhysicalMemory.AllocatePage(runtime.FirstUserDataPage) != PhysicalAllocationError::Success)
-            Diagnostics::Fatal("User", "failed to allocate the first user data page");
-
-        if (runtime.PhysicalMemory.AllocateContiguous(FirstUserModeStackPages, runtime.FirstUserStackBacking) != PhysicalAllocationError::Success)
-            Diagnostics::Fatal("User", "failed to allocate the first user stack");
-
-        if (!ZeroDirectMappedAllocation(runtime.FirstUserCodePage) ||
-            !ZeroDirectMappedAllocation(runtime.FirstUserDataPage) ||
-            !ZeroDirectMappedAllocation(runtime.FirstUserStackBacking))
-            Diagnostics::Fatal("User", "failed to initialize user physical backing");
-
-        const VirtualAddress code_direct = Layout::DirectMapAddress(runtime.FirstUserCodePage.Base());
-        const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
-        if (code_direct.IsNull() || data_direct.IsNull())
-            Diagnostics::Fatal("User", "user backing is outside the direct map");
-
-        auto* code = reinterpret_cast<Uint8*>(code_direct.Value());
-
-        /*
-         * Tiny raw AMD64 user program:
-         *
-         *   movabs FirstUserDataAddress, %rbx
-         *   movabs FirstUserModeMarker, %rdx
-         *   mov    %rdx, (%rbx)
-         *   incq   8(%rbx)
-         *
-         *   movabs FirstUserSystemCallStackMarker, %r12
-         *   push   %r12
-         *   xor    %eax, %eax               ; GetProcessId = 0
-         *   syscall
-         *   pop    %r12
-         *   mov    %rax, 24(%rbx)           ; syscall result
-         *   mov    %r12, 32(%rbx)           ; stack/register round trip
-         *
-         * loop:
-         *   incq   8(%rbx)
-         *   cmpq   $0, 16(%rbx)
-         *   jne    fault
-         *   pause
-         *   jmp    loop
-         *
-         * fault:
-         *   movabs FirstUserFaultAddress, %rcx
-         *   mov    (%rcx), %rdx
-         *   ud2
-         *
-         * The push before SYSCALL deliberately makes user RSP non-16-byte
-         * aligned. Returning through SYSRET must restore that exact value so
-         * the pop succeeds and recovers the marker.
-         */
-
-        /* movabs FirstUserDataAddress, %rbx */
-        code[0] = 0x48;
-        code[1] = 0xBB;
-        WriteLittleEndian64(code + 2, FirstUserDataAddress.Value());
-
-        /* movabs FirstUserModeMarker, %rdx */
-        code[10] = 0x48;
-        code[11] = 0xBA;
-        WriteLittleEndian64(code + 12, FirstUserModeMarker);
-
-        /* mov %rdx, (%rbx) */
-        code[20] = 0x48;
-        code[21] = 0x89;
-        code[22] = 0x13;
-
-        /* incq 8(%rbx) */
-        code[23] = 0x48;
-        code[24] = 0xFF;
-        code[25] = 0x43;
-        code[26] = 0x08;
-
-        /* movabs FirstUserSystemCallStackMarker, %r12 */
-        code[27] = 0x49;
-        code[28] = 0xBC;
-        WriteLittleEndian64(code + 29, FirstUserSystemCallStackMarker);
-
-        /* push %r12 */
-        code[37] = 0x41;
-        code[38] = 0x54;
-
-        /* xor %eax, %eax ; NativeSystemCall::GetProcessId */
-        code[39] = 0x31;
-        code[40] = 0xC0;
-
-        /* syscall */
-        code[41] = 0x0F;
-        code[42] = 0x05;
-
-        /* pop %r12 */
-        code[43] = 0x41;
-        code[44] = 0x5C;
-
-        /* mov %rax, 24(%rbx) */
-        code[45] = 0x48;
-        code[46] = 0x89;
-        code[47] = 0x43;
-        code[48] = 0x18;
-
-        /* mov %r12, 32(%rbx) */
-        code[49] = 0x4C;
-        code[50] = 0x89;
-        code[51] = 0x63;
-        code[52] = 0x20;
-
-        /* loop: incq 8(%rbx) */
-        code[53] = 0x48;
-        code[54] = 0xFF;
-        code[55] = 0x43;
-        code[56] = 0x08;
-
-        /* cmpq $0, 16(%rbx) */
-        code[57] = 0x48;
-        code[58] = 0x83;
-        code[59] = 0x7B;
-        code[60] = 0x10;
-        code[61] = 0x00;
-
-        /* jne fault */
-        code[62] = 0x75;
-        code[63] = 0x04;
-
-        /* pause */
-        code[64] = 0xF3;
-        code[65] = 0x90;
-
-        /* jmp loop */
-        code[66] = 0xEB;
-        code[67] = 0xF1;
-
-        /* fault: movabs FirstUserFaultAddress, %rcx */
-        code[68] = 0x48;
-        code[69] = 0xB9;
-        WriteLittleEndian64(code + 70, FirstUserFaultAddress.Value());
-
-        /* mov (%rcx), %rdx -- expected #PF */
-        code[78] = 0x48;
-        code[79] = 0x8B;
-        code[80] = 0x11;
-
-        /* Safety guard if the invalid load somehow succeeds. */
-        code[81] = 0x0F;
-        code[82] = 0x0B;
-
-        auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
-
-        user_data[0] = 0; // Step 15 marker
-        user_data[1] = 0; // progress counter
-        user_data[2] = 0; // Step 16 fault request
-        user_data[3] = 0; // Step 17 GetProcessId result
-        user_data[4] = 0; // Step 17 user RSP/R12 preservation marker
-
-        const MappingOptions user_code{
-            .Access = PageAccess::Read | PageAccess::Execute | PageAccess::User,
-            .Cache = CachePolicy::WriteBack,
+        const Executables::UserExecutableLoadOptions load_options{
+            .StackBase = VirtualAddress(StackBaseAddress),
+            .StackPageCount = StackPageCount,
         };
 
-        const MappingOptions user_data_options{
-            .Access = PageAccess::Read | PageAccess::Write | PageAccess::User,
-            .Cache = CachePolicy::WriteBack,
-        };
+        const auto load_error = Executables::UserExecutableLoader::LoadStaticElf(
+            embedded.Data,
+            embedded.Size,
+            runtime.FirstUserProcess,
+            runtime.PhysicalMemory,
+            load_options,
+            runtime.FirstUserImage
+        );
+        if (load_error != Executables::UserExecutableLoadError::Success)
+            Diagnostics::Fatal("ELF", Executables::UserExecutableLoader::Describe(load_error));
 
-        if (address_space->MapPage(FirstUserCodeAddress, runtime.FirstUserCodePage.Base(), user_code) != MappingError::Success)
-            Diagnostics::Fatal("User", "failed to map the first user code page");
+        if (!runtime.FirstUserImage.IsLoaded() ||
+            runtime.FirstUserImage.EntryPoint().IsNull() ||
+            runtime.FirstUserImage.StackGuard() != VirtualAddress(StackGuardAddress) ||
+            runtime.FirstUserImage.Stack().Base != VirtualAddress(StackBaseAddress) ||
+            runtime.FirstUserImage.Stack().PageCount != StackPageCount ||
+            runtime.FirstUserImage.StackTop() != VirtualAddress(StackTopAddress) ||
+            runtime.FirstUserImage.SegmentCount() < 2)
+            Diagnostics::Fatal("ELF", "loaded first user image state is invalid");
 
-        if (address_space->MapPage(FirstUserDataAddress, runtime.FirstUserDataPage.Base(), user_data_options) != MappingError::Success)
-            Diagnostics::Fatal("User", "failed to map the first user data page");
+        bool bss_tail_observed = false;
+        for (Uint64 index = 0; index < runtime.FirstUserImage.SegmentCount(); index++) {
+            const auto& segment = runtime.FirstUserImage.Segment(index);
+            const PageAccess access = segment.Mapping.Access;
 
-        if (address_space->MapRange(FirstUserStackBase, runtime.FirstUserStackBacking.Base(), FirstUserModeStackPages, user_data_options) != MappingError::Success)
-            Diagnostics::Fatal("User", "failed to map the first user stack");
+            if (segment.MemorySize > segment.FileSize)
+                bss_tail_observed = true;
 
-        if (address_space->IsMapped(FirstUserStackGuard))
-            Diagnostics::Fatal("User", "first user stack guard page is mapped");
+            if (!HasAccess(access, PageAccess::Read) ||
+                !HasAccess(access, PageAccess::User) ||
+                HasAccess(access, PageAccess::Global) ||
+                (HasAccess(access, PageAccess::Write) && HasAccess(access, PageAccess::Execute)))
+                Diagnostics::Fatal("ELF", "loaded user segment permissions violate zOS policy");
+
+            for (Uint64 page = 0; page < segment.Virtual.PageCount; page++) {
+                if (runtime.KernelPageMap.IsMapped(segment.Virtual.Base + page * PageSize))
+                    Diagnostics::Fatal("ELF", "user executable mapping leaked into the kernel address space");
+            }
+        }
+
+        if (!bss_tail_observed)
+            Diagnostics::Fatal("ELF", "first user executable does not exercise ELF zero-fill memory");
+
+        for (Uint64 page = 0; page < runtime.FirstUserImage.Stack().PageCount; page++) {
+            if (runtime.KernelPageMap.IsMapped(runtime.FirstUserImage.Stack().Base + page * PageSize))
+                Diagnostics::Fatal("ELF", "user stack mapping leaked into the kernel address space");
+        }
+
+        if (runtime.FirstUserProcess.AddressSpace()->IsMapped(runtime.FirstUserImage.StackGuard()) ||
+            runtime.KernelPageMap.IsMapped(runtime.FirstUserImage.StackGuard()))
+            Diagnostics::Fatal("ELF", "user stack guard page is mapped");
+
+        volatile State* state = FirstProgramState(runtime);
+        if (state == nullptr)
+            Diagnostics::Fatal("ELF", "first user program state mapping is unavailable");
+
+        if (state->Marker != 0 || state->Progress != 0 || state->FaultRequest != 0 ||
+            state->ProcessId != 0 || state->PreservedRegister != 0 ||
+            state->StackBeforeSystemCall != 0 || state->StackAfterSystemCall != 0 ||
+            state->BssZeroVerified != 0)
+            Diagnostics::Fatal("ELF", "first user program data was not initialized to zero");
 
         /*
-         * Configuration must become visible atomically with respect to the
-         * already-running preemptive scheduler.
+         * Configure the already-created isolated thread while it is quiescent.
+         * The worker entry remains in kernel mode until g_UserModeReady becomes
+         * visible, so the image and fault/syscall policy become live atomically.
          */
         __asm__ volatile("cli" ::: "memory");
 
         if (runtime.BootstrapProcessor.CurrentThread != &runtime.BootstrapThread ||
             runtime.FirstUserThread.State() != Scheduling::ThreadState::Ready) {
             __asm__ volatile("sti" ::: "memory");
-            Diagnostics::Fatal("User", "user thread was not quiescent during Ring 3 configuration");
+            Diagnostics::Fatal("ELF", "user thread was not quiescent during executable installation");
         }
 
-        const auto user_mode_error = runtime.FirstUserThread.ConfigureUserMode(FirstUserCodeAddress, FirstUserStackTop);
+        const auto user_mode_error = runtime.FirstUserThread.ConfigureUserMode(
+            runtime.FirstUserImage.EntryPoint(),
+            runtime.FirstUserImage.StackTop()
+        );
         if (user_mode_error != Scheduling::ThreadUserModeError::Success) {
             __asm__ volatile("sti" ::: "memory");
-            Diagnostics::Fatal("User", Scheduling::Thread::Describe(user_mode_error));
+            Diagnostics::Fatal("ELF", Scheduling::Thread::Describe(user_mode_error));
         }
 
         if (!runtime.Interrupts.BindUserFaultHandler(&Processes::HandleCurrentUserFault) ||
             !runtime.SystemCallEntry.BindUserFaultHandler(&Processes::HandleCurrentUserFault)) {
             __asm__ volatile("sti" ::: "memory");
-            Diagnostics::Fatal("User", "failed to bind user fault containment");
+            Diagnostics::Fatal("ELF", "failed to bind user fault containment");
         }
 
         g_UserModeReady = true;
-
         __asm__ volatile("sti" ::: "memory");
 
-        Diagnostics::Write("[zOS/User] Ring 3 execution state prepared.\n");
-        Diagnostics::Write("[zOS/User] Entry: ");
-        Diagnostics::WriteHex(FirstUserCodeAddress.Value());
+        Diagnostics::Write("[zOS/Process] Native user executable loaded.\n");
+        Diagnostics::Write("[zOS/User] ELF entry: ");
+        Diagnostics::WriteHex(runtime.FirstUserImage.EntryPoint().Value());
         Diagnostics::Write("\n");
-
         Diagnostics::Write("[zOS/User] Stack top: ");
-        Diagnostics::WriteHex(FirstUserStackTop.Value());
+        Diagnostics::WriteHex(runtime.FirstUserImage.StackTop().Value());
         Diagnostics::Write("\n");
     }
 
     void RunRing3SelfTest(KernelRuntime& runtime) noexcept {
-        const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
-        if (data_direct.IsNull())
-            Diagnostics::Fatal("User", "first user data page lost its direct-map alias");
+        using namespace ::Zos::User::FirstProgram;
 
-        auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
+        volatile State* state = FirstProgramState(runtime);
+        if (state == nullptr)
+            Diagnostics::Fatal("User", "first user program state mapping is unavailable");
+
         const Uint64 start = runtime.Clock.Nanoseconds();
-        while (user_data[0] != FirstUserModeMarker || user_data[1] == 0 || !runtime.Timer.UserModeObservedInInterrupt()) {
+        while (state->Marker != EntryMarker || state->Progress == 0 || state->BssZeroVerified != 1 ||
+               !runtime.Timer.UserModeObservedInInterrupt()) {
             if (runtime.Clock.Nanoseconds() - start > 1'000'000'000ULL)
-                Diagnostics::Fatal("User", "Ring 3 execution self-test timed out");
+                Diagnostics::Fatal("User", "ELF Ring 3 execution self-test timed out");
             __asm__ volatile("pause");
         }
 
         ProcessorLocal* processor = CurrentProcessor();
         if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.BootstrapThread ||
-            !runtime.KernelPageMap.IsActive() || !runtime.FirstUserThread.UserModeConfigured())
-            Diagnostics::Fatal("User", "kernel state was not restored after user preemption");
+            !runtime.KernelPageMap.IsActive() || !runtime.FirstUserThread.UserModeConfigured() ||
+            !runtime.FirstUserImage.ContainsExecutableAddress(runtime.FirstUserImage.EntryPoint()))
+            Diagnostics::Fatal("User", "kernel state was not restored after ELF userspace preemption");
 
         if (CurrentKernelEntryStack() != runtime.BootstrapThread.Stack()->Top())
             Diagnostics::Fatal("User", "kernel entry stack does not follow the running thread");
 
+        Diagnostics::Write("[zOS/ELF] Native user executable reached its ELF entry point.\n");
+        Diagnostics::Write("[zOS/ELF] BSS zero-fill verified.\n");
         Diagnostics::Write("[zOS/User] CPL3 execution observed.\n");
         Diagnostics::Write("[zOS/User] User-mode timer entry verified.\n");
         Diagnostics::Write("[zOS/User] Conditional SWAPGS path verified.\n");
@@ -760,11 +642,11 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
     }
 
     void RunSystemCallSelfTest(KernelRuntime& runtime) noexcept {
-        const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
-        if (data_direct.IsNull())
-            Diagnostics::Fatal("Syscall", "syscall test lost the user data-page direct map");
+        using namespace ::Zos::User::FirstProgram;
 
-        auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
+        volatile State* state = FirstProgramState(runtime);
+        if (state == nullptr)
+            Diagnostics::Fatal("Syscall", "syscall test lost the first user program state mapping");
 
         if (!runtime.SystemCallEntry.IsInitialized() ||
             runtime.FirstUserProcess.State() != Processes::ProcessState::Active ||
@@ -772,19 +654,26 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
             Diagnostics::Fatal("Syscall", "syscall self-test began with invalid execution state");
 
         const Uint64 start = runtime.Clock.Nanoseconds();
-        while (user_data[3] != FirstUserProcessId ||
-               user_data[4] != FirstUserSystemCallStackMarker) {
+        while (state->ProcessId != FirstUserProcessId ||
+               state->PreservedRegister != PreservedRegisterMarker ||
+               state->StackBeforeSystemCall == 0 ||
+               state->StackAfterSystemCall == 0) {
             if (runtime.Clock.Nanoseconds() - start > 1'000'000'000ULL)
                 Diagnostics::Fatal("Syscall", "native syscall round-trip self-test timed out");
             __asm__ volatile("pause");
         }
 
+        if (state->StackBeforeSystemCall != state->StackAfterSystemCall ||
+            state->StackBeforeSystemCall < runtime.FirstUserImage.Stack().Base.Value() ||
+            state->StackBeforeSystemCall >= runtime.FirstUserImage.StackTop().Value())
+            Diagnostics::Fatal("Syscall", "SYSRET did not restore the original user stack state");
+
         if (runtime.SystemCallEntry.DispatchCount() != 1)
             Diagnostics::Fatal("Syscall", "unexpected native syscall dispatch count");
 
-        const Uint64 progress_before = user_data[1];
+        const Uint64 progress_before = state->Progress;
         const Uint64 continuation_start = runtime.Clock.Nanoseconds();
-        while (user_data[1] == progress_before) {
+        while (state->Progress == progress_before) {
             if (runtime.Clock.Nanoseconds() - continuation_start > 500'000'000ULL)
                 Diagnostics::Fatal("Syscall", "userspace did not continue after SYSRET");
             __asm__ volatile("pause");
@@ -800,18 +689,19 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
 
         Diagnostics::Write("[zOS/Syscall] User syscall entered on the current kernel stack.\n");
         Diagnostics::Write("[zOS/Syscall] GetProcessId returned process ");
-        Diagnostics::WriteDecimal(user_data[3]);
+        Diagnostics::WriteDecimal(state->ProcessId);
         Diagnostics::Write(".\n");
         Diagnostics::Write("[zOS/Syscall] User RSP and preserved register state restored.\n");
         Diagnostics::Write("[zOS/Syscall] Native syscall round trip verified.\n");
     }
 
     void RunUserFaultIsolationSelfTest(KernelRuntime& runtime) noexcept {
-        const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
-        if (data_direct.IsNull())
-            Diagnostics::Fatal("User", "user fault test lost the data-page direct map");
+        using namespace ::Zos::User::FirstProgram;
 
-        auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
+        volatile State* state = FirstProgramState(runtime);
+        if (state == nullptr)
+            Diagnostics::Fatal("User", "user fault test lost the first user program state mapping");
+
         if (runtime.FirstUserProcess.State() != Processes::ProcessState::Active ||
             runtime.FirstUserThread.State() != Scheduling::ThreadState::Ready ||
             !runtime.FirstUserThread.UserModeConfigured())
@@ -820,17 +710,13 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         const Uint64 initial_terminations = runtime.BootstrapScheduler.TerminationCount();
 
         /*
-        * The CPL3 loop polls this third qword. On its next timeslice it performs
-        * a read from the intentionally unmapped stack-guard page.
-        */
-        user_data[2] = 1;
+         * The ELF program polls this field. On its next timeslice it reads from
+         * the intentionally unmapped stack guard page and should receive #PF.
+         */
+        state->FaultRequest = 1;
 
         const Uint64 timeout_start = runtime.Clock.Nanoseconds();
         while (runtime.FirstUserProcess.State() != Processes::ProcessState::Terminated) {
-            /*
-            * The process state changes on this same CPU from interrupt context.
-            * Prevent the compiler from treating it as loop-invariant.
-            */
             __asm__ volatile("" ::: "memory");
             if (runtime.Clock.Nanoseconds() - timeout_start > 1'000'000'000ULL)
                 Diagnostics::Fatal("User", "user fault isolation self-test timed out");
@@ -847,24 +733,19 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
 
         if (!record.Valid || record.ThreadId != FirstUserThreadId ||
             fault.Kind != UserFaultKind::PageFault || !fault.AddressValid ||
-            fault.Address != FirstUserFaultAddress ||
-            fault.InstructionPointer != FirstUserCodeAddress + 78 ||
+            fault.Address != runtime.FirstUserImage.StackGuard() ||
+            !runtime.FirstUserImage.ContainsExecutableAddress(fault.InstructionPointer) ||
             fault.Access != UserFaultAccess::Read ||
             fault.Reason != UserFaultReason::NonPresent ||
             fault.ReservedBitViolation)
-            Diagnostics::Fatal("User", "contained page-fault record is invalid");
+            Diagnostics::Fatal("User", "contained ELF page-fault record is invalid");
 
         if (!runtime.KernelPageMap.IsActive() ||
             CurrentProcessor() != &runtime.BootstrapProcessor ||
             CurrentProcessor()->CurrentThread != &runtime.BootstrapThread)
             Diagnostics::Fatal("User", "kernel execution was not restored after user fault");
 
-        /*
-         * Prove that the kernel timer and remaining runnable kernel threads keep
-         * moving after the user process is dead, while the dead user's progress
-         * counter never advances again.
-         */
-        const Uint64 stopped_counter = user_data[1];
+        const Uint64 stopped_counter = state->Progress;
         const Uint64 initial_interrupts = runtime.Timer.InterruptCount();
         const Uint64 continuation_start = runtime.Clock.Nanoseconds();
         while (runtime.Timer.InterruptCount() < initial_interrupts + 6) {
@@ -873,7 +754,7 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
             __asm__ volatile("pause");
         }
 
-        if (user_data[1] != stopped_counter ||
+        if (state->Progress != stopped_counter ||
             runtime.FirstUserThread.State() != Scheduling::ThreadState::Terminated ||
             runtime.FirstUserProcess.State() != Processes::ProcessState::Terminated)
             Diagnostics::Fatal("User", "terminated user execution resumed");
@@ -883,5 +764,4 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
         Diagnostics::Write("[zOS/User] Kernel scheduling continued after user fault.\n");
         Diagnostics::Write("[zOS/User] User fault isolation verified.\n");
     }
-
 }

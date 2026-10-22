@@ -16,7 +16,7 @@ namespace Zos::Kernel::Initialization::ExecutionBootstrap {
     void InitializeProcessAddressSpaces(KernelRuntime& runtime) noexcept;
     void RunProcessAddressSpaceSelfTest(KernelRuntime& runtime) noexcept;
 
-    void InitializeRing3State(KernelRuntime& runtime) noexcept;
+    void LoadFirstUserExecutable(KernelRuntime& runtime) noexcept;
     void RunRing3SelfTest(KernelRuntime& runtime) noexcept;
     void RunSystemCallSelfTest(KernelRuntime& runtime) noexcept;
     void RunUserFaultIsolationSelfTest(KernelRuntime& runtime) noexcept;

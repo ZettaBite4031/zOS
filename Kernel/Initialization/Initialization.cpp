@@ -367,18 +367,20 @@ namespace Zos::Kernel::Initialization {
         if (syscall_error != SystemCallInitializationError::Success)
             Diagnostics::Fatal("Syscall", SystemCallEntry::Describe(syscall_error));
 
-        ExecutionBootstrap::InitializeRing3State(runtime);
+        AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::SystemCallsReady);
+
+        ExecutionBootstrap::LoadFirstUserExecutable(runtime);
+
+        AdvancePhase(runtime, KernelPhase::SystemCallsReady, KernelPhase::UserExecutableReady);
+
         ExecutionBootstrap::RunRing3SelfTest(runtime);
-
-        AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::Ring3Ready);
-
         ExecutionBootstrap::RunSystemCallSelfTest(runtime);
 
-        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::SystemCallsReady);
+        AdvancePhase(runtime, KernelPhase::UserExecutableReady, KernelPhase::Ring3Ready);
 
         ExecutionBootstrap::RunUserFaultIsolationSelfTest(runtime);
 
-        AdvancePhase(runtime, KernelPhase::SystemCallsReady, KernelPhase::UserFaultIsolationReady);
+        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::UserFaultIsolationReady);
 
         EnterRuntime(runtime);
     }

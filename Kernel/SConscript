@@ -1,14 +1,18 @@
 from pathlib import Path
 
-Import("kernel_environment", "output_root")
+from SCons.Script import Action
+
+Import("kernel_environment", "output_root", "first_user_program")
 
 component_output = f"{output_root}/Kernel"
 component_directory = Path(Dir(".").srcnode().abspath)
 linker_script = File("Linker.ld")
 
 source_exts = [ ".c", ".cc", ".cpp", ".cxx" ]
-
-source_files = sorted(path for path in component_directory.rglob("*") if path.is_file() and path.suffix.lower() in source_exts)
+source_files = sorted(
+    path for path in component_directory.rglob("*")
+    if path.is_file() and path.suffix.lower() in source_exts
+)
 
 if not source_files:
     raise RuntimeError("Kernel contains no translation units.")
@@ -19,14 +23,74 @@ for source_path in source_files:
     relative_path = source_path.relative_to(component_directory)
     object_path = relative_path.with_suffix(kernel_environment["OBJSUFFIX"])
 
-    kernel_objects.append(kernel_environment.Object(target=f"{component_output}/{object_path.as_posix()}", source=File(str(source_path))))
+    kernel_objects.append(
+        kernel_environment.Object(
+            target=f"{component_output}/{object_path.as_posix()}",
+            source=File(str(source_path)),
+        )
+    )
 
-kernel = kernel_environment.Command(target=f"{component_output}/Kernel.elf", source=kernel_objects, action=(
-    "$LINK $KERNEL_LINKFLAGS "
-    "--script=$KERNEL_LINKER_SCRIPT "
-    "--entry=KernelEntry "
-    "-o $TARGET "
-    "$SOURCES"), KERNEL_LINKER_SCRIPT=linker_script.abspath)
+
+def EmbedFirstUserProgram(target, source, env):
+    destination = Path(str(target[0]))
+    image_path = Path(str(source[0]))
+    image = image_path.read_bytes()
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    for offset in range(0, len(image), 16):
+        chunk = image[offset:offset + 16]
+        lines.append("        " + ", ".join(f"0x{byte:02X}" for byte in chunk) + ",")
+
+    content = "\n".join([
+        "#include <Kernel/Executables/EmbeddedUserImages.hpp>",
+        "",
+        "namespace Zos::Kernel::Executables {",
+        "    namespace {",
+        "        alignas(16) const Memory::Uint8 g_FirstUserProgramImage[]{",
+        *lines,
+        "        };",
+        "    }",
+        "",
+        "    EmbeddedImage FirstUserProgramImage() noexcept {",
+        "        return EmbeddedImage{",
+        "            .Data = g_FirstUserProgramImage,",
+        "            .Size = sizeof(g_FirstUserProgramImage),",
+        "        };",
+        "    }",
+        "}",
+        "",
+    ])
+
+    destination.write_text(content, encoding="utf-8")
+    return 0
+
+
+embedded_user_source = kernel_environment.Command(
+    target=f"{component_output}/Generated/FirstUserProgramImage.cpp",
+    source=first_user_program,
+    action=Action(EmbedFirstUserProgram, "Embedding native user image $SOURCE"),
+)
+
+embedded_user_object = kernel_environment.Object(
+    target=f"{component_output}/Generated/FirstUserProgramImage{kernel_environment['OBJSUFFIX']}",
+    source=embedded_user_source,
+)
+kernel_objects.append(embedded_user_object)
+
+kernel = kernel_environment.Command(
+    target=f"{component_output}/Kernel.elf",
+    source=kernel_objects,
+    action=(
+        "$LINK $KERNEL_LINKFLAGS "
+        "--script=$KERNEL_LINKER_SCRIPT "
+        "--entry=KernelEntry "
+        "-o $TARGET "
+        "$SOURCES"
+    ),
+    KERNEL_LINKER_SCRIPT=linker_script.abspath,
+)
 
 kernel_environment.Depends(kernel, linker_script)
 
