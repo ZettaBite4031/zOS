@@ -25,12 +25,37 @@ namespace Zos::Kernel::Architecture::AMD64 {
         inline constexpr Uint32 SpuriousVectorMask{ 0xFFu };
         inline constexpr Uint32 SoftwareEnableBit{ 1u << 8 };
 
+        inline constexpr Uint32 TimerLvtRegisterOffset{ 0x320u };
+        inline constexpr Uint32 TimerInitialCountRegisterOffset{ 0x380u };
+        inline constexpr Uint32 TimerCurrentCountRegisterOffset{ 0x390u };
+        inline constexpr Uint32 TimerDivideConfigurationRegisterOffset{ 0x3E0u };
+
+        inline constexpr Uint32 TimerLvtMaskBit{ 1u << 16 };
+        inline constexpr Uint32 TimerLvtPeriodicBit{ 1u << 17 };
+        inline constexpr Uint32 TimerLvtVectorMask{ 0xFFu };
+
+        inline constexpr Uint32 TimerDivideConfigurationMask{ 0xBu };
+
         [[nodiscard]] constexpr Uint32 X2ApicMsrForOffset(Uint32 offset) noexcept {
             return X2ApicMsrBase + (offset >> 4);
         }
 
         [[nodiscard]] constexpr PhysicalAddress ApicPhysicalBase(Uint64 apic_base) noexcept {
             return PhysicalAddress(apic_base & ApicBaseAddressMask);
+        }
+
+        [[nodiscard]] constexpr Uint32 TimerDivideEncoding(LocalApicTimerDivide divide) noexcept {
+            switch (divide) {
+            case LocalApicTimerDivide::By1: return 0xBu;
+            case LocalApicTimerDivide::By2: return 0x0u;
+            case LocalApicTimerDivide::By4: return 0x1u;
+            case LocalApicTimerDivide::By8: return 0x2u;
+            case LocalApicTimerDivide::By16: return 0x3u;
+            case LocalApicTimerDivide::By32: return 0x8u;
+            case LocalApicTimerDivide::By64: return 0x9u;
+            case LocalApicTimerDivide::By128: return 0xAu;
+            default: return 0xFFFFFFFFu;
+            }
         }
     }
 
@@ -179,6 +204,67 @@ namespace Zos::Kernel::Architecture::AMD64 {
     void LocalApic::EndOfInterrupt() noexcept {
         if (!m_Initialized) return;
         WriteRegister(EndOfInterruptRegisterOffset, 0);
+    }
+
+    bool LocalApic::ConfigureTimer(Memory::Uint8 vector, LocalApicTimerMode mode, LocalApicTimerDivide divide, bool masked) noexcept {
+        if (!m_Initialized || InterruptManager::VectorClass(vector) != InterruptVectorClass::LocalApic)
+            return false;
+
+        const Uint32 divide_encoding = TimerDivideEncoding(divide);
+        if (divide_encoding == 0xFFFFFFFFu)
+            return false;
+
+        /*
+        * Mask the source first and stop any timer state inherited from
+        * firmware before changing the divider or delivery mode.
+        */
+        Uint32 lvt = static_cast<Uint32>(vector) | TimerLvtMaskBit;
+        if (mode == LocalApicTimerMode::Periodic)
+            lvt |= TimerLvtPeriodicBit;
+
+        WriteRegister(TimerLvtRegisterOffset, lvt);
+        WriteRegister(TimerInitialCountRegisterOffset, 0);
+        WriteRegister(TimerDivideConfigurationRegisterOffset, divide_encoding);
+
+        if ((ReadRegister(TimerDivideConfigurationRegisterOffset) &
+            TimerDivideConfigurationMask) != divide_encoding)
+            return false;
+
+        if (!masked) {
+            lvt &= ~TimerLvtMaskBit;
+            WriteRegister(TimerLvtRegisterOffset, lvt);
+        }
+
+        const Uint32 configured_lvt = ReadRegister(TimerLvtRegisterOffset);
+        const Uint32 validation_mask = TimerLvtVectorMask | TimerLvtMaskBit | TimerLvtPeriodicBit;
+        return (configured_lvt & validation_mask) == (lvt & validation_mask);
+    }
+
+    bool LocalApic::SetTimerMasked(bool masked) noexcept {
+        if (!m_Initialized)
+            return false;
+
+        Uint32 lvt = ReadRegister(TimerLvtRegisterOffset);
+
+        if (masked)
+            lvt |= TimerLvtMaskBit;
+        else
+            lvt &= ~TimerLvtMaskBit;
+
+        WriteRegister(TimerLvtRegisterOffset, lvt);
+
+        const Uint32 configured = ReadRegister(TimerLvtRegisterOffset);
+        return ((configured & TimerLvtMaskBit) != 0) == masked;
+    }
+
+    void LocalApic::SetTimerInitialCount(Uint32 count) noexcept {
+        if (!m_Initialized) return;
+        WriteRegister(TimerInitialCountRegisterOffset, count);
+    }
+
+    Uint32 LocalApic::TimerCurrentCount() const noexcept {
+        if (!m_Initialized) return 0;
+        return ReadRegister(TimerCurrentCountRegisterOffset);
     }
 
     bool LocalApic::MadtContainsEnabledProcessor(const Platform::ACPI::Madt& madt, Uint32 apic_id) noexcept {

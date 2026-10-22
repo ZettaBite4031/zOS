@@ -17,6 +17,7 @@
 #include <Kernel/Platform/HPET.hpp>
 
 #include <Kernel/Time/Clock.hpp>
+#include <Kernel/Time/LocalApicTimer.hpp>
 
 namespace Zos::Kernel {
     struct BootContext final {
@@ -79,6 +80,7 @@ namespace Zos::Kernel {
         LocalApicReady,
         InterruptPolicyReady,
         MonotonicClockReady,
+        LocalApicTimerReady,
 
         Runtime,
     };
@@ -112,6 +114,7 @@ namespace Zos::Kernel {
         Platform::Hpet Hpet{};
 
         Time::MonotonicClock Clock{};
+        Time::LocalApicTimer Timer{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads

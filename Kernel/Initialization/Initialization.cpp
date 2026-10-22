@@ -194,7 +194,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::MonotonicClockReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::LocalApicTimerReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -311,6 +311,15 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Fatal("Time", Time::MonotonicClock::Describe(clock_error));
 
         AdvancePhase(runtime, KernelPhase::InterruptPolicyReady, KernelPhase::MonotonicClockReady);
+
+        const auto timer_error = runtime.Timer.Initialize(runtime.Apic, runtime.Interrupts, runtime.Clock);
+        if (timer_error != Time::LocalApicTimerInitializationError::Success)
+            Diagnostics::Fatal("Timer", Time::LocalApicTimer::Describe(timer_error));
+
+        if (!runtime.Timer.EnableAndVerifyInterruptDelivery())
+            Diagnostics::Fatal("Timer", "Local APIC timer interrupt delivery validation failed");
+
+        AdvancePhase(runtime, KernelPhase::MonotonicClockReady, KernelPhase::LocalApicTimerReady);
 
         EnterRuntime(runtime);
     }

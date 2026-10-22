@@ -29,6 +29,22 @@ namespace Zos::Kernel::Architecture::AMD64 {
         RegisterValidationFailed,
     };
 
+    enum class LocalApicTimerMode : Memory::Uint32 {
+        OneShot,
+        Periodic,
+    };
+
+    enum class LocalApicTimerDivide : Memory::Uint32 {
+        By1,
+        By2,
+        By4,
+        By8,
+        By16,
+        By32,
+        By64,
+        By128,
+    };
+
     class LocalApic final {
     public:
         constexpr LocalApic() noexcept = default;
@@ -51,6 +67,14 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] Memory::VirtualAddress MmioBase() const noexcept { return m_MmioMapping.Base(); }
 
         void EndOfInterrupt() noexcept;
+
+        [[nodiscard]] bool ConfigureTimer(Memory::Uint8 vector, LocalApicTimerMode mode, LocalApicTimerDivide divide, bool masked) noexcept;
+
+        [[nodiscard]] bool SetTimerMasked(bool masked) noexcept;
+
+        void SetTimerInitialCount(Memory::Uint32 count) noexcept;
+
+        [[nodiscard]] Memory::Uint32 TimerCurrentCount() const noexcept;
 
         [[nodiscard]] static const char* ModeName(LocalApicMode mode) noexcept;
         [[nodiscard]] static const char* Describe(LocalApicInitializationError error) noexcept;

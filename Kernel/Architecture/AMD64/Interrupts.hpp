@@ -21,6 +21,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
     inline constexpr Memory::Uint8 LocalApicVectorFirst{ 0xE0 };
     inline constexpr Memory::Uint8 LocalApicVectorLast{ 0xEF };
 
+    inline constexpr Memory::Uint8 LocalApicTimerVector{ LocalApicVectorFirst };
+
     inline constexpr Memory::Uint8 IpiVectorFirst{ 0xF0 };
     inline constexpr Memory::Uint8 IpiVectorLast{ 0xFE };
 
