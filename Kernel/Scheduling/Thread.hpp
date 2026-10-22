@@ -37,6 +37,18 @@ namespace Zos::Kernel::Scheduling {
         ResumeStateMismatch,
         AddressSpaceSwitchFailed,
         ResumeAddressSpaceMismatch,
+        KernelPrivilegeStackUpdateFailed,
+        ResumeKernelPrivilegeStackMismatch,
+    };
+
+    enum class ThreadUserModeError : Memory::Uint32 {
+        Success,
+        NotInitialized,
+        AlreadyConfigured,
+        InvalidState,
+        InvalidProcess,
+        InvalidEntryMapping,
+        InvalidStackMapping,
     };
 
     class Thread final {
@@ -69,6 +81,14 @@ namespace Zos::Kernel::Scheduling {
          */
         [[nodiscard]] ThreadSwitchError SwitchTo(Thread& next) noexcept;
 
+        [[nodiscard]] ThreadUserModeError ConfigureUserMode(Memory::VirtualAddress entry, Memory::VirtualAddress stack_top) noexcept;
+
+        [[noreturn]] void EnterUserMode() noexcept;
+
+        [[nodiscard]] bool UserModeConfigured() const noexcept { return m_UserModeConfigured; }
+        [[nodiscard]] Memory::VirtualAddress UserEntry() const noexcept { return m_UserEntry; }
+        [[nodiscard]] Memory::VirtualAddress UserStackTop() const noexcept { return m_UserStackTop; }
+
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] ThreadId Id() const noexcept { return m_Id; }
         [[nodiscard]] ThreadState State() const noexcept { return m_State; }
@@ -87,6 +107,7 @@ namespace Zos::Kernel::Scheduling {
         [[nodiscard]] static const char* StateName(ThreadState state) noexcept;
         [[nodiscard]] static const char* Describe(ThreadInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(ThreadSwitchError error) noexcept;
+        [[nodiscard]] static const char* Describe(ThreadUserModeError error) noexcept;
 
     private:
         friend class Scheduler;
@@ -110,9 +131,13 @@ namespace Zos::Kernel::Scheduling {
         Architecture::AMD64::ThreadContext m_Context{};
         Thread* m_ReadyNext{};
 
+        Memory::VirtualAddress m_UserEntry{};
+        Memory::VirtualAddress m_UserStackTop{};
+
         bool m_OwnsStack{};
         bool m_ContextReady{};
         bool m_ReadyQueued{};
         bool m_Initialized{};
+        bool m_UserModeConfigured{};
     };
 }

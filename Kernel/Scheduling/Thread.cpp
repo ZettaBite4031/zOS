@@ -1,9 +1,15 @@
 #include <Kernel/Scheduling/Thread.hpp>
 
+#include <Kernel/Architecture/AMD64/Interrupts.hpp>
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
+#include <Kernel/Architecture/AMD64/UserMode.hpp>
+
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+
 #include <Kernel/Scheduling/Scheduler.hpp>
+
 #include <Kernel/Processes/Process.hpp>
+
 
 namespace Zos::Kernel::Scheduling {
     namespace {
@@ -103,6 +109,9 @@ namespace Zos::Kernel::Scheduling {
         if (next.m_State != ThreadState::Ready || !next.m_ContextReady)
             return ThreadSwitchError::TargetNotReady;
 
+        if (m_Stack == nullptr || next.m_Stack == nullptr || !Architecture::AMD64::SetCurrentKernelPrivilegeStack(next.m_Stack->Top()))
+            return ThreadSwitchError::KernelPrivilegeStackUpdateFailed;
+
         Architecture::AMD64::PageMap* current_space = m_OwningProcess != nullptr ? m_OwningProcess->AddressSpace() : nullptr;
         Architecture::AMD64::PageMap* next_space = next.m_OwningProcess != nullptr ? next.m_OwningProcess->AddressSpace() : nullptr;
         if (current_space == nullptr || next_space == nullptr ||!current_space->IsActive())
@@ -110,8 +119,10 @@ namespace Zos::Kernel::Scheduling {
 
         if (current_space != next_space) {
             const auto address_space_error = next_space->SwitchTo();
-            if (address_space_error != Architecture::AMD64::PageMapSwitchError::Success)
+            if (address_space_error != Architecture::AMD64::PageMapSwitchError::Success) {
+                (void)Architecture::AMD64::SetCurrentKernelPrivilegeStack(m_Stack->Top());
                 return ThreadSwitchError::AddressSpaceSwitchFailed;
+            }
         }
 
         m_State = ThreadState::Ready;
@@ -121,6 +132,9 @@ namespace Zos::Kernel::Scheduling {
         m_ContextReady = true;
 
         Architecture::AMD64::SwitchThreadContext(&m_Context, &next.m_Context);
+
+        if (m_Stack == nullptr || Architecture::AMD64::CurrentKernelPrivilegeStack() != m_Stack->Top())
+            return ThreadSwitchError::ResumeKernelPrivilegeStackMismatch;
 
         processor = Architecture::AMD64::CurrentProcessor();
         if (processor == nullptr || processor->CurrentThread != this || m_State != ThreadState::Running)
@@ -155,6 +169,59 @@ namespace Zos::Kernel::Scheduling {
         thread->m_Entry(thread->m_EntryContext);
         thread->m_State = ThreadState::Terminated;
         Diagnostics::Fatal("Thread", "kernel thread entry returned before termination scheduling exists");
+    }
+
+    ThreadUserModeError Thread::ConfigureUserMode(Memory::VirtualAddress entry, Memory::VirtualAddress stack_top) noexcept {
+        if (!m_Initialized) return ThreadUserModeError::NotInitialized;
+        if (m_UserModeConfigured) return ThreadUserModeError::AlreadyConfigured;
+        if (m_State != ThreadState::Ready) return ThreadUserModeError::InvalidState;
+        if (m_OwningProcess == nullptr || m_OwningProcess->AddressSpace() == nullptr)
+            return ThreadUserModeError::InvalidProcess;
+
+        if (entry.IsNull() || stack_top.IsNull() || !Architecture::AMD64::PageMap::IsCanonical(entry) || !Architecture::AMD64::PageMap::IsCanonical(stack_top) ||
+            entry.Value() >= 0x0000800000000000ULL || stack_top.Value() >= 0x0000800000000000ULL || (stack_top.Value() & 0xFULL) != 0 || stack_top.Value() < sizeof(Memory::Uint64))
+            return ThreadUserModeError::InvalidState;
+
+        const Architecture::AMD64::PageMap* address_space = m_OwningProcess->AddressSpace();
+        const auto code = address_space->Translate(entry);
+        if (!code.Mapped ||
+            !Memory::HasAccess(code.Options.Access, Memory::PageAccess::Read) ||
+            !Memory::HasAccess(code.Options.Access, Memory::PageAccess::Execute) ||
+            !Memory::HasAccess(code.Options.Access, Memory::PageAccess::User) ||
+            Memory::HasAccess(code.Options.Access, Memory::PageAccess::Write) ||
+            Memory::HasAccess(code.Options.Access, Memory::PageAccess::Global))
+            return ThreadUserModeError::InvalidEntryMapping;
+
+        const auto stack = address_space->Translate(stack_top - sizeof(Memory::Uint64));
+        if (!stack.Mapped ||
+            !Memory::HasAccess(stack.Options.Access, Memory::PageAccess::Read) ||
+            !Memory::HasAccess(stack.Options.Access, Memory::PageAccess::Write) ||
+            !Memory::HasAccess(stack.Options.Access, Memory::PageAccess::User) ||
+            Memory::HasAccess(stack.Options.Access, Memory::PageAccess::Execute) ||
+            Memory::HasAccess(stack.Options.Access, Memory::PageAccess::Global))
+            return ThreadUserModeError::InvalidStackMapping;
+
+        m_UserEntry = entry;
+        m_UserStackTop = stack_top;
+        m_UserModeConfigured = true;
+
+        return ThreadUserModeError::Success;
+    }
+
+    [[noreturn]] void Thread::EnterUserMode() noexcept {
+        if (!m_Initialized || !m_UserModeConfigured || m_State != ThreadState::Running ||
+            m_OwningProcess == nullptr || m_OwningProcess->AddressSpace() == nullptr ||
+            !m_OwningProcess->AddressSpace()->IsActive() || m_Stack == nullptr)
+            Diagnostics::Fatal("Thread", "user-mode transition requested from invalid thread state");
+
+        Architecture::AMD64::ProcessorLocal* processor = Architecture::AMD64::CurrentProcessor();
+        if (processor == nullptr || processor->CurrentThread != this)
+            Diagnostics::Fatal("Thread", "user-mode transition thread does not own the processor");
+
+        if (Architecture::AMD64::CurrentKernelPrivilegeStack() != m_Stack->Top())
+            Diagnostics::Fatal("Thread", "TSS RSP0 does not match the user thread kernel stack");
+
+        Architecture::AMD64::EnterUserMode(m_UserEntry,m_UserStackTop);
     }
 
     void Thread::Print() const noexcept {
@@ -220,7 +287,22 @@ namespace Zos::Kernel::Scheduling {
         case ThreadSwitchError::ResumeStateMismatch: return "resumed thread state does not match processor ownership";
         case ThreadSwitchError::AddressSpaceSwitchFailed: return "failed to activate the target thread process address space";
         case ThreadSwitchError::ResumeAddressSpaceMismatch: return "resumed thread address space does not match process ownership";
+        case ThreadSwitchError::KernelPrivilegeStackUpdateFailed: return "failed to update TSS RSP0 for the target thread";
+        case ThreadSwitchError::ResumeKernelPrivilegeStackMismatch: return "resumed thread does not own the active TSS RSP0";
         default: return "unknown cooperative thread switch error";
+        }
+    }
+
+    const char* Thread::Describe(ThreadUserModeError error) noexcept {
+        switch (error) {
+        case ThreadUserModeError::Success: return "success";
+        case ThreadUserModeError::NotInitialized: return "thread is not initialized";
+        case ThreadUserModeError::AlreadyConfigured: return "thread already has user-mode execution state";
+        case ThreadUserModeError::InvalidState: return "thread state is invalid for user-mode configuration";
+        case ThreadUserModeError::InvalidProcess: return "thread does not have a valid owning process address space";
+        case ThreadUserModeError::InvalidEntryMapping: return "user entry point is not mapped executable user memory";
+        case ThreadUserModeError::InvalidStackMapping: return "user stack is not mapped writable user memory";
+        default: return "unknown thread user-mode configuration error";
         }
     }
 }

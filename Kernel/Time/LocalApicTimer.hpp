@@ -40,6 +40,7 @@ namespace Zos::Kernel::Time {
         [[nodiscard]] Memory::Uint64 InterruptCount() const noexcept { return m_InterruptCount; }
         [[nodiscard]] Memory::Uint64 ObservedRateHz() const noexcept { return m_ObservedRateHz; }
         [[nodiscard]] bool ProcessorLocalObservedInInterrupt() const noexcept { return m_ProcessorLocalObserved; }
+        [[nodiscard]] bool UserModeObservedInInterrupt() const noexcept { return m_UserModeObserved; }
 
         [[nodiscard]] static const char* Describe(LocalApicTimerInitializationError error) noexcept;
 
@@ -62,6 +63,7 @@ namespace Zos::Kernel::Time {
         volatile Memory::Uint64 m_FirstInterruptNanoseconds{};
         volatile Memory::Uint64 m_LastInterruptNanoseconds{};
         volatile bool m_ProcessorLocalObserved{};
+        volatile bool m_UserModeObserved{};
 
         bool m_Initialized{};
 

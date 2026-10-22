@@ -151,6 +151,7 @@ namespace Zos::Kernel::Time {
         m_LastInterruptNanoseconds = 0;
         m_ObservedRateHz = 0;
         m_ProcessorLocalObserved = false;
+        m_UserModeObserved = false;
 
         if (!m_Apic->SetTimerMasked(false)) return false;
         const Uint64 test_start = m_Clock->Nanoseconds();
@@ -227,9 +228,11 @@ namespace Zos::Kernel::Time {
         return true;
     }
 
-    void LocalApicTimer::HandleInterrupt(Architecture::AMD64::InterruptContext&) noexcept {
+    void LocalApicTimer::HandleInterrupt(Architecture::AMD64::InterruptContext& context) noexcept {
         LocalApicTimer* timer = s_ActiveTimer;
         if (timer == nullptr || timer->m_Clock == nullptr) return;
+
+        if (context.FromUserMode()) timer->m_UserModeObserved = true;
 
         Architecture::AMD64::ProcessorLocal* current = Architecture::AMD64::CurrentProcessor();
         if (timer->m_Processor != nullptr) {

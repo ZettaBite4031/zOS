@@ -10,6 +10,9 @@ namespace Zos::Kernel::Architecture::AMD64 {
     inline constexpr Memory::Uint16 KernelDataSelector{ 0x10 };
     inline constexpr Memory::Uint16 TaskStateSelector{ 0x18 };
 
+    inline constexpr Memory::Uint16 UserDataSelector{ 0x2B };
+    inline constexpr Memory::Uint16 UserCodeSelector{ 0x33 };
+
     inline constexpr Memory::Uint64 InterruptVectorCount{ 256 };
 
     inline constexpr Memory::Uint8 ExceptionVectorFirst{ 0x00 };
@@ -65,6 +68,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         Memory::Uint64 Rip;
         Memory::Uint64 Cs;
         Memory::Uint64 Rflags;
+
+        [[nodiscard]] bool FromUserMode() const noexcept { return (Cs & 0x3ULL) == 0x3ULL; }
     };
 
     static_assert(__builtin_offsetof(InterruptContext, Vector) == 15 * sizeof(Memory::Uint64));
@@ -120,6 +125,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         void Dispatch(InterruptContext& context) noexcept;
 
+        [[nodiscard]] bool SetKernelPrivilegeStack(Memory::VirtualAddress stack_top) noexcept;
+
         /*
          * Temporarily installs a handler for #BP, executes INT3,
          * confirms that control returns through IRETQ, and restores
@@ -133,6 +140,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] Memory::VirtualAddress TrampolineBase() const noexcept { return m_TrampolineVirtual.Base(); }
+        [[nodiscard]] Memory::VirtualAddress KernelPrivilegeStack() const noexcept { return Memory::VirtualAddress(m_Tss.Rsp0); }
 
         [[nodiscard]] const char* HandlerName(Memory::Uint8 vector) const noexcept;
 
@@ -207,8 +215,14 @@ namespace Zos::Kernel::Architecture::AMD64 {
             Memory::Uint64 KernelCode{};
             Memory::Uint64 KernelData{};
             TssDescriptor Tss{};
+            Memory::Uint64 UserData{};
+            Memory::Uint64 UserCode{};
         } __attribute__((packed));
 
+        static_assert(__builtin_offsetof(GlobalDescriptorTable, Tss) == TaskStateSelector);
+        static_assert(__builtin_offsetof(GlobalDescriptorTable, UserData) == (UserDataSelector & ~Memory::Uint16{3}));
+        static_assert(__builtin_offsetof(GlobalDescriptorTable, UserCode) ==(UserCodeSelector & ~Memory::Uint16{3}));
+        
         void InitializeHandlers() noexcept;
         void RegisterBuiltinHandlers() noexcept;
 
@@ -254,4 +268,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
     };
 
     [[noreturn]] void GenericInterruptHandler(InterruptContext& context) noexcept;
+
+    [[nodiscard]] bool SetCurrentKernelPrivilegeStack(Memory::VirtualAddress stack_topc ) noexcept;
+    [[nodiscard]] Memory::VirtualAddress CurrentKernelPrivilegeStack() noexcept;
 }

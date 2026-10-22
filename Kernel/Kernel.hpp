@@ -94,6 +94,7 @@ namespace Zos::Kernel {
         LocalApicTimerReady,
         PreemptionReady,
         ProcessAddressSpacesReady,
+        Ring3Ready,
 
         Runtime,
     };
@@ -129,6 +130,10 @@ namespace Zos::Kernel {
 
         Time::MonotonicClock Clock{};
         Time::LocalApicTimer Timer{};
+
+        Memory::PhysicalAllocation FirstUserCodePage{};
+        Memory::PhysicalAllocation FirstUserDataPage{};
+        Memory::PhysicalAllocation FirstUserStackBacking{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads

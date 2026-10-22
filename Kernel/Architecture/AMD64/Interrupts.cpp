@@ -56,6 +56,15 @@ __asm__(
     "   pushq %r14\n"
     "   pushq %r15\n"
 
+    "   testb $3, 144(%rsp)\n"
+    "   jz 1f\n"
+    "   swapgs\n"
+    "   movw $0x10, %ax\n"
+    "   movw %ax, %ds\n"
+    "   movw %ax, %es\n"
+    "   movw %ax, %ss\n"
+    "1:\n"
+
     /*
      * R12 now contains the exact InterruptContext pointer.
      *
@@ -85,6 +94,14 @@ __asm__(
      * Return to the exact register image.
      */
     "   movq %r12, %rsp\n"
+
+    "   testb $3, 144(%rsp)\n"
+    "   jz 2f\n"
+    "   movw $0x2B, %ax\n"
+    "   movw %ax, %ds\n"
+    "   movw %ax, %es\n"
+    "   swapgs\n"
+    "2:\n"
 
     "    popq %r15\n"
     "    popq %r14\n"
@@ -757,11 +774,17 @@ namespace Zos::Kernel::Architecture::AMD64 {
          */
         constexpr Uint64 KernelDataDescriptor{ 0x00CF92000000FFFFULL };
 
+        constexpr Uint64 UserDataDescriptor{ 0x00CFF2000000FFFFULL };
+        constexpr Uint64 UserCodeDescriptor{ 0x00AFFA000000FFFFULL };
+
         m_Gdt = {};
         m_Tss = {};
 
         m_Gdt.KernelCode = KernelCodeDescriptor;
         m_Gdt.KernelData = KernelDataDescriptor;
+
+        m_Gdt.UserData = UserDataDescriptor;
+        m_Gdt.UserCode = UserCodeDescriptor;
 
         /*
          * Stack grows downward, so IST1 points immediately after
@@ -1165,6 +1188,24 @@ namespace Zos::Kernel::Architecture::AMD64 {
         case InterruptInitializationError::DescriptorLoadFailed: return "failed to activate or validate zOS descriptor tables";
         }
         return "unknown interrupt initialization error";
+    }
+
+    bool InterruptManager::SetKernelPrivilegeStack(VirtualAddress stack_top) noexcept {
+        if (!m_Initialized || stack_top.IsNull() || !PageMap::IsCanonical(stack_top) || (stack_top.Value() & 0xFULL) != 0)
+            return false;
+
+        m_Tss.Rsp0 = stack_top.Value();
+        return m_Tss.Rsp0 == stack_top.Value();
+    }
+
+    bool SetCurrentKernelPrivilegeStack(VirtualAddress stack_top) noexcept {
+        return g_InterruptManager != nullptr && g_InterruptManager->SetKernelPrivilegeStack(stack_top);
+    }
+
+    VirtualAddress CurrentKernelPrivilegeStack() noexcept {
+        if (g_InterruptManager == nullptr)
+            return {};
+        return g_InterruptManager->KernelPrivilegeStack();
     }
 
     [[noreturn]] void GenericInterruptHandler(InterruptContext& context) noexcept {

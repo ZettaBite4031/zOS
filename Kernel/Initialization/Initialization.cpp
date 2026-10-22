@@ -50,6 +50,42 @@ namespace Zos::Kernel::Initialization {
 
         volatile bool g_ProcessAddressSpaceWorkerObserved{};
 
+        inline constexpr Uint64 FirstUserModeStackPages{ 4 };
+
+        inline constexpr VirtualAddress FirstUserCodeAddress{ 0x0000000040000000ULL };
+        inline constexpr VirtualAddress FirstUserDataAddress{ 0x0000000040001000ULL };
+
+        /*
+         * Leave one unmapped guard page at 0x70000000.
+         */
+        inline constexpr VirtualAddress FirstUserStackGuard{ 0x0000000070000000ULL };
+        inline constexpr VirtualAddress FirstUserStackBase{ 0x0000000070001000ULL };
+
+        inline constexpr VirtualAddress FirstUserStackTop{ FirstUserStackBase.Value() + FirstUserModeStackPages * PageSize };
+        inline constexpr Uint64 FirstUserModeMarker{ 0x5A4F535553455231ULL };
+
+        volatile bool g_UserModeReady{};
+
+        static_assert((FirstUserStackTop.Value() & 0xFULL) == 0);
+
+        void WriteLittleEndian64(Uint8* destination, Uint64 value) noexcept {
+            for (Uint64 byte = 0; byte < 8; byte++)
+                destination[byte] = static_cast<Uint8>(value >> (byte * 8));
+        }
+
+        [[nodiscard]] bool ZeroDirectMappedAllocation(const PhysicalAllocation& allocation) noexcept {
+            if (!allocation.IsValid()) return false;
+
+            const VirtualAddress direct = Layout::DirectMapAddress(allocation.Base());
+            if (direct.IsNull()) return false;
+
+            auto* bytes = reinterpret_cast<volatile Uint8*>(direct.Value());
+            for (Uint64 index = 0; index < allocation.SizeBytes(); index++)
+                bytes[index] = 0;
+
+            return true;
+        }
+
         [[noreturn]] void FirstWorkerThreadEntry(void* context) noexcept {
             if (context == nullptr) Diagnostics::Fatal("Thread", "first worker thread received a null context");
 
@@ -146,7 +182,8 @@ namespace Zos::Kernel::Initialization {
             *private_value = ProcessPrivateWorkerMarker;
             g_ProcessAddressSpaceWorkerObserved = true;
 
-            for (;;) __asm__ volatile("hlt");
+            while (!g_UserModeReady) __asm__ volatile("hlt");
+            runtime.FirstUserThread.EnterUserMode();
         }
 
         void AdvancePhase(KernelRuntime& runtime, KernelPhase expected, KernelPhase next) noexcept {
@@ -607,6 +644,165 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Process] Cross-process CR3 scheduling verified.\n");
         }
 
+        void InitializeRing3State(KernelRuntime& runtime) noexcept {
+            g_UserModeReady = false;
+
+            PageMap* address_space = runtime.FirstUserProcess.AddressSpace();
+            if (address_space == nullptr || !runtime.KernelPageMap.IsActive() || address_space->IsActive())
+                Diagnostics::Fatal("User", "Ring 3 setup began with invalid address-space state");
+
+            if (runtime.KernelPageMap.IsMapped(FirstUserCodeAddress) ||
+                runtime.KernelPageMap.IsMapped(FirstUserDataAddress) ||
+                runtime.KernelPageMap.IsMapped(FirstUserStackBase) ||
+                address_space->IsMapped(FirstUserCodeAddress) ||
+                address_space->IsMapped(FirstUserDataAddress) ||
+                address_space->IsMapped(FirstUserStackGuard) ||
+                address_space->IsMapped(FirstUserStackBase))
+                Diagnostics::Fatal("User", "Ring 3 virtual addresses are already occupied");
+
+            if (runtime.PhysicalMemory.AllocatePage(runtime.FirstUserCodePage) != PhysicalAllocationError::Success)
+                Diagnostics::Fatal("User", "failed to allocate the first user code page");
+
+            if (runtime.PhysicalMemory.AllocatePage(runtime.FirstUserDataPage) != PhysicalAllocationError::Success)
+                Diagnostics::Fatal("User", "failed to allocate the first user data page");
+
+            if (runtime.PhysicalMemory.AllocateContiguous(FirstUserModeStackPages, runtime.FirstUserStackBacking) != PhysicalAllocationError::Success)
+                Diagnostics::Fatal("User", "failed to allocate the first user stack");
+
+            if (!ZeroDirectMappedAllocation(runtime.FirstUserCodePage) ||
+                !ZeroDirectMappedAllocation(runtime.FirstUserDataPage) ||
+                !ZeroDirectMappedAllocation(runtime.FirstUserStackBacking))
+                Diagnostics::Fatal("User", "failed to initialize user physical backing");
+
+            const VirtualAddress code_direct = Layout::DirectMapAddress(runtime.FirstUserCodePage.Base());
+            const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
+            if (code_direct.IsNull() || data_direct.IsNull())
+                Diagnostics::Fatal("User", "user backing is outside the direct map");
+
+            auto* code = reinterpret_cast<Uint8*>(code_direct.Value());
+
+            /*
+             * Tiny raw AMD64 user program:
+             *
+             *   movabs FirstUserDataAddress, %rax
+             *   movabs FirstUserModeMarker, %rdx
+             *   mov    %rdx, (%rax)
+             * loop:
+             *   incq   8(%rax)
+             *   pause
+             *   jmp    loop
+             *
+             * It deliberately contains no syscall and no privileged instruction.
+             */
+            code[0] = 0x48;
+            code[1] = 0xB8;
+            WriteLittleEndian64(code + 2, FirstUserDataAddress.Value());
+
+            code[10] = 0x48;
+            code[11] = 0xBA;
+            WriteLittleEndian64(code + 12, FirstUserModeMarker);
+
+            code[20] = 0x48;
+            code[21] = 0x89;
+            code[22] = 0x10;
+
+            code[23] = 0x48;
+            code[24] = 0xFF;
+            code[25] = 0x40;
+            code[26] = 0x08;
+
+            code[27] = 0xF3;
+            code[28] = 0x90;
+
+            code[29] = 0xEB;
+            code[30] = 0xF8;
+
+            auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
+
+            user_data[0] = 0;
+            user_data[1] = 0;
+
+            const MappingOptions user_code{
+                .Access = PageAccess::Read | PageAccess::Execute | PageAccess::User,
+                .Cache = CachePolicy::WriteBack,
+            };
+
+            const MappingOptions user_data_options{
+                .Access = PageAccess::Read | PageAccess::Write | PageAccess::User,
+                .Cache = CachePolicy::WriteBack,
+            };
+
+            if (address_space->MapPage(FirstUserCodeAddress, runtime.FirstUserCodePage.Base(), user_code) != MappingError::Success)
+                Diagnostics::Fatal("User", "failed to map the first user code page");
+
+            if (address_space->MapPage(FirstUserDataAddress, runtime.FirstUserDataPage.Base(), user_data_options) != MappingError::Success)
+                Diagnostics::Fatal("User", "failed to map the first user data page");
+
+            if (address_space->MapRange(FirstUserStackBase, runtime.FirstUserStackBacking.Base(), FirstUserModeStackPages, user_data_options) != MappingError::Success)
+                Diagnostics::Fatal("User", "failed to map the first user stack");
+
+            if (address_space->IsMapped(FirstUserStackGuard))
+                Diagnostics::Fatal("User", "first user stack guard page is mapped");
+
+            /*
+             * Configuration must become visible atomically with respect to the
+             * already-running preemptive scheduler.
+             */
+            __asm__ volatile("cli" ::: "memory");
+
+            if (runtime.BootstrapProcessor.CurrentThread != &runtime.BootstrapThread ||
+                runtime.FirstUserThread.State() != Scheduling::ThreadState::Ready) {
+                __asm__ volatile("sti" ::: "memory");
+                Diagnostics::Fatal("User", "user thread was not quiescent during Ring 3 configuration");
+            }
+
+            const auto user_mode_error = runtime.FirstUserThread.ConfigureUserMode(FirstUserCodeAddress, FirstUserStackTop);
+            if (user_mode_error != Scheduling::ThreadUserModeError::Success) {
+                __asm__ volatile("sti" ::: "memory");
+                Diagnostics::Fatal("User", Scheduling::Thread::Describe(user_mode_error));
+            }
+
+            g_UserModeReady = true;
+
+            __asm__ volatile("sti" ::: "memory");
+
+            Diagnostics::Write("[zOS/User] Ring 3 execution state prepared.\n");
+            Diagnostics::Write("[zOS/User] Entry: ");
+            Diagnostics::WriteHex(FirstUserCodeAddress.Value());
+            Diagnostics::Write("\n");
+
+            Diagnostics::Write("[zOS/User] Stack top: ");
+            Diagnostics::WriteHex(FirstUserStackTop.Value());
+            Diagnostics::Write("\n");
+        }
+
+        void RunRing3SelfTest(KernelRuntime& runtime) noexcept {
+            const VirtualAddress data_direct = Layout::DirectMapAddress(runtime.FirstUserDataPage.Base());
+            if (data_direct.IsNull())
+                Diagnostics::Fatal("User", "first user data page lost its direct-map alias");
+
+            auto* user_data = reinterpret_cast<volatile Uint64*>(data_direct.Value());
+            const Uint64 start = runtime.Clock.Nanoseconds();
+            while (user_data[0] != FirstUserModeMarker || user_data[1] == 0 || !runtime.Timer.UserModeObservedInInterrupt()) {
+                if (runtime.Clock.Nanoseconds() - start > 1'000'000'000ULL)
+                    Diagnostics::Fatal("User", "Ring 3 execution self-test timed out");
+                __asm__ volatile("pause");
+            }
+
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.BootstrapThread ||
+                !runtime.KernelPageMap.IsActive() || !runtime.FirstUserThread.UserModeConfigured())
+                Diagnostics::Fatal("User", "kernel state was not restored after user preemption");
+
+            if (CurrentKernelPrivilegeStack() != runtime.BootstrapThread.Stack()->Top())
+                Diagnostics::Fatal("User", "TSS RSP0 does not follow the running kernel thread");
+
+            Diagnostics::Write("[zOS/User] CPL3 execution observed.\n");
+            Diagnostics::Write("[zOS/User] User-mode timer entry verified.\n");
+            Diagnostics::Write("[zOS/User] Conditional SWAPGS path verified.\n");
+            Diagnostics::Write("[zOS/User] Ring 3 architectural transition verified.\n");
+        }
+
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
             if (runtime.Boot.Initialized)
                 Diagnostics::Fatal("Startup", "boot context was internalized more than once");
@@ -649,7 +845,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -816,6 +1012,11 @@ namespace Zos::Kernel::Initialization {
         RunProcessAddressSpaceSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::PreemptionReady, KernelPhase::ProcessAddressSpacesReady);
+
+        InitializeRing3State(runtime);
+        RunRing3SelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::Ring3Ready);
 
         EnterRuntime(runtime);
     }

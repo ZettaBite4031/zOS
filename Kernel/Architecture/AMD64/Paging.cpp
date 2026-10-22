@@ -541,7 +541,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
                         const VirtualAddress virtual_address = ComposeVirtualAddress(pml4, pdpt_index, pd_index, pt_index);
                         const MappingError map_error = MapPage(virtual_address, EntryAddress(leaf), DecodeOptions(leaf));
                         if (map_error != MappingError::Success)
-                            return PageMapKernelMappingInstallError::Success;
+                            return PageMapKernelMappingInstallError::MappingFailed;
                     }
                 }
             }
