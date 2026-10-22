@@ -10,6 +10,7 @@
 #include <Kernel/Architecture/AMD64/Interrupts.hpp>
 #include <Kernel/Architecture/AMD64/CPU.hpp>
 #include <Kernel/Architecture/AMD64/APIC.hpp>
+#include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 
 #include <Kernel/Platform/ACPI/ACPI.hpp>
 #include <Kernel/Platform/ACPI/MADT.hpp>
@@ -80,6 +81,7 @@ namespace Zos::Kernel {
         LocalApicReady,
         InterruptPolicyReady,
         MonotonicClockReady,
+        ProcessorLocalReady,
         LocalApicTimerReady,
 
         Runtime,
@@ -107,6 +109,7 @@ namespace Zos::Kernel {
         Architecture::AMD64::InterruptManager Interrupts{};
         Architecture::AMD64::CpuInfo Cpu{};
         Architecture::AMD64::LocalApic Apic{};
+        Architecture::AMD64::ProcessorLocal BootstrapProcessor{};
         Memory::KernelHeap Heap{};
 
         Platform::ACPI::TableDirectory Acpi{};

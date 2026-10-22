@@ -37,9 +37,11 @@ namespace Zos::Kernel::Time {
 
     LocalApicTimer* LocalApicTimer::s_ActiveTimer{};
 
-    LocalApicTimerInitializationError LocalApicTimer::Initialize(Architecture::AMD64::LocalApic& apic, Architecture::AMD64::InterruptManager& interrupts, const MonotonicClock& clock) noexcept {
+    LocalApicTimerInitializationError LocalApicTimer::Initialize(Architecture::AMD64::LocalApic& apic, Architecture::AMD64::InterruptManager& interrupts, 
+        const MonotonicClock& clock, const Architecture::AMD64::ProcessorLocal& processor) noexcept {
+
         if (m_Initialized) return LocalApicTimerInitializationError::AlreadyInitialized;
-        if (!apic.IsInitialized() || !interrupts.IsInitialized() || !clock.IsInitialized())
+        if (!apic.IsInitialized() || !interrupts.IsInitialized() || !clock.IsInitialized() || !processor.IsInitialized())
             return LocalApicTimerInitializationError::InvalidDependency;
 
         if (s_ActiveTimer != nullptr) return LocalApicTimerInitializationError::ActiveInstanceExists;
@@ -48,6 +50,7 @@ namespace Zos::Kernel::Time {
 
         m_Apic = &apic;
         m_Clock = &clock;
+        m_Processor = &processor;
 
         if (!Calibrate()) return LocalApicTimerInitializationError::CalibrationFailed;
 
@@ -145,6 +148,7 @@ namespace Zos::Kernel::Time {
         m_FirstInterruptNanoseconds = 0;
         m_LastInterruptNanoseconds = 0;
         m_ObservedRateHz = 0;
+        m_ProcessorLocalObserved = false;
 
         if (!m_Apic->SetTimerMasked(false)) return false;
         const Uint64 test_start = m_Clock->Nanoseconds();
@@ -221,14 +225,21 @@ namespace Zos::Kernel::Time {
         return true;
     }
 
-    void LocalApicTimer::HandleInterrupt(Architecture::AMD64::InterruptContext&) noexcept {
+    void LocalApicTimer::HandleInterrupt(Architecture::AMD64::InterruptContext& ) noexcept {
         LocalApicTimer* timer = s_ActiveTimer;
         if (timer == nullptr || timer->m_Clock == nullptr) return;
 
+        if (timer->m_Processor != nullptr) {
+            Architecture::AMD64::ProcessorLocal* current = Architecture::AMD64::CurrentProcessor();
+            if (current == timer->m_Processor && current->Self == current &&
+                current->IsInitialized() && current->ApicId == timer->m_Processor->ApicId)
+                timer->m_ProcessorLocalObserved = true;
+        }
+
         const Uint64 now = timer->m_Clock->Nanoseconds();
         const Uint64 count = timer->m_InterruptCount;
-
         if (count == 0) timer->m_FirstInterruptNanoseconds = now;
+
         timer->m_LastInterruptNanoseconds = now;
         timer->m_InterruptCount = count + 1;
     }

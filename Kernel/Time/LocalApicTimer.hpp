@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Kernel/Architecture/AMD64/APIC.hpp>
+#include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
+
 #include <Kernel/Time/Clock.hpp>
 
 namespace Zos::Kernel::Time {
@@ -22,7 +24,8 @@ namespace Zos::Kernel::Time {
         LocalApicTimer(const LocalApicTimer&) = delete;
         LocalApicTimer& operator=(const LocalApicTimer&) = delete;
 
-        [[nodiscard]] LocalApicTimerInitializationError Initialize(Architecture::AMD64::LocalApic& apic, Architecture::AMD64::InterruptManager& interrupts, const MonotonicClock& clock) noexcept;
+        [[nodiscard]] LocalApicTimerInitializationError Initialize(Architecture::AMD64::LocalApic& apic, Architecture::AMD64::InterruptManager& interrupts, 
+            const MonotonicClock& clock, const Architecture::AMD64::ProcessorLocal& processor) noexcept;
 
         /*
          * Performs the first controlled STI in zOS, proves repeated timer
@@ -36,6 +39,7 @@ namespace Zos::Kernel::Time {
         [[nodiscard]] Memory::Uint32 ReloadCount() const noexcept { return m_ReloadCount; }
         [[nodiscard]] Memory::Uint64 InterruptCount() const noexcept { return m_InterruptCount; }
         [[nodiscard]] Memory::Uint64 ObservedRateHz() const noexcept { return m_ObservedRateHz; }
+        [[nodiscard]] bool ProcessorLocalObservedInInterrupt() const noexcept { return m_ProcessorLocalObserved; }
 
         [[nodiscard]] static const char* Describe(LocalApicTimerInitializationError error) noexcept;
 
@@ -48,6 +52,7 @@ namespace Zos::Kernel::Time {
 
         Architecture::AMD64::LocalApic* m_Apic{};
         const MonotonicClock* m_Clock{};
+        const Architecture::AMD64::ProcessorLocal* m_Processor{};
 
         Memory::Uint64 m_FrequencyHz{};
         Memory::Uint64 m_ObservedRateHz{};
@@ -56,6 +61,7 @@ namespace Zos::Kernel::Time {
         volatile Memory::Uint64 m_InterruptCount{};
         volatile Memory::Uint64 m_FirstInterruptNanoseconds{};
         volatile Memory::Uint64 m_LastInterruptNanoseconds{};
+        volatile bool m_ProcessorLocalObserved{};
 
         bool m_Initialized{};
 

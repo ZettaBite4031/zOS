@@ -199,12 +199,9 @@ namespace Zos::Kernel::Initialization {
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
         /*
-         * No scheduler exists yet.
-         *
-         * Maskable interrupts remain disabled until APIC/IOAPIC
-         * initialization establishes extern interrupt routing.
+         * No scheduler exists yet. The BSP idles between Local APIC
+         * timer interrupts with maskable interrupt delivery enabled.
          */
-        __asm__ volatile("cli");
         for (;;) __asm__ volatile("hlt");
     }
 
@@ -310,16 +307,27 @@ namespace Zos::Kernel::Initialization {
         if (clock_error != Time::MonotonicClockInitializationError::Success)
             Diagnostics::Fatal("Time", Time::MonotonicClock::Describe(clock_error));
 
-        AdvancePhase(runtime, KernelPhase::InterruptPolicyReady, KernelPhase::MonotonicClockReady);
+        AdvancePhase(runtime, KernelPhase::InterruptPolicyReady, KernelPhase::MonotonicClockReady );
 
-        const auto timer_error = runtime.Timer.Initialize(runtime.Apic, runtime.Interrupts, runtime.Clock);
+        const auto processor_error = runtime.BootstrapProcessor.Initialize(0, runtime.Apic, true);
+        if (processor_error != Architecture::AMD64::ProcessorLocalInitializationError::Success)
+            Diagnostics::Fatal("CPU", Architecture::AMD64::ProcessorLocal::Describe(processor_error));
+
+        AdvancePhase(runtime, KernelPhase::MonotonicClockReady, KernelPhase::ProcessorLocalReady);
+
+        const auto timer_error = runtime.Timer.Initialize(runtime.Apic, runtime.Interrupts, runtime.Clock, runtime.BootstrapProcessor);
         if (timer_error != Time::LocalApicTimerInitializationError::Success)
             Diagnostics::Fatal("Timer", Time::LocalApicTimer::Describe(timer_error));
 
         if (!runtime.Timer.EnableAndVerifyInterruptDelivery())
             Diagnostics::Fatal("Timer", "Local APIC timer interrupt delivery validation failed");
 
-        AdvancePhase(runtime, KernelPhase::MonotonicClockReady, KernelPhase::LocalApicTimerReady);
+        if (!runtime.Timer.ProcessorLocalObservedInInterrupt())
+            Diagnostics::Fatal("CPU", "processor-local state was not observed in interrupt context");
+
+        Diagnostics::Write("[zOS/CPU] Processor-local interrupt access verified.\n");
+
+        AdvancePhase(runtime, KernelPhase::ProcessorLocalReady, KernelPhase::LocalApicTimerReady);
 
         EnterRuntime(runtime);
     }
