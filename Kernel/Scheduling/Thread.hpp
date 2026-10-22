@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
+#include <Kernel/Architecture/AMD64/ContextSwitching.hpp>
 #include <Kernel/Memory/KernelStack.hpp>
 
 namespace Zos::Kernel::Scheduling {
@@ -19,6 +20,17 @@ namespace Zos::Kernel::Scheduling {
         InvalidDependency,
         InvalidEntry,
         StackInitializationFailed,
+        ContextInitializationFailed,
+    };
+
+    enum class ThreadSwitchError : Memory::Uint32 {
+        Success,
+        InvalidThread,
+        InterruptsEnabled,
+        NotCurrentThread,
+        CurrentStateInvalid,
+        TargetNotReady,
+        ResumeStateMismatch,
     };
 
     class Thread final {
@@ -43,6 +55,12 @@ namespace Zos::Kernel::Scheduling {
         [[nodiscard]] ThreadInitializationError InitializeKernel(ThreadId id, ThreadEntry entry, void* entry_context, Memory::PhysicalMemoryManager& physical_memory, 
             Memory::VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map, Memory::Uint64 stack_page_count) noexcept;
 
+        /*
+         * Cooperatively transfer execution from this Running thread to a
+         * Ready thread. IF must already be clear.
+         */
+        [[nodiscard]] ThreadSwitchError SwitchTo(Thread& next) noexcept;
+
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] ThreadId Id() const noexcept { return m_Id; }
         [[nodiscard]] ThreadState State() const noexcept { return m_State; }
@@ -53,23 +71,30 @@ namespace Zos::Kernel::Scheduling {
         [[nodiscard]] Memory::KernelStack* Stack() noexcept { return m_Stack; }
         [[nodiscard]] const Memory::KernelStack* Stack() const noexcept { return m_Stack; }
         [[nodiscard]] bool OwnsStack() const noexcept { return m_OwnsStack; }
+        [[nodiscard]] bool HasContext() const noexcept { return m_ContextReady; }
+
 
         [[nodiscard]] static const char* StateName(ThreadState state) noexcept;
         [[nodiscard]] static const char* Describe(ThreadInitializationError error) noexcept;
+        [[nodiscard]] static const char* Describe(ThreadSwitchError error) noexcept;
 
     private:
+        static void StartContext(void* argument) noexcept;
         void Print() const noexcept;
 
         ThreadId m_Id{};
         ThreadState m_State{ ThreadState::Ready };
 
         ThreadEntry m_Entry{};
-        void* m_EntryContext;
+        void* m_EntryContext{};
 
         Memory::KernelStack m_OwnedStack{};
         Memory::KernelStack* m_Stack{};
 
+        Architecture::AMD64::ThreadContext m_Context{};
+
         bool m_OwnsStack{};
+        bool m_ContextReady{};
         bool m_Initialized{};
     };
 }

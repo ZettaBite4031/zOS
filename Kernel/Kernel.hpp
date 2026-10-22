@@ -86,6 +86,7 @@ namespace Zos::Kernel {
         MonotonicClockReady,
         ProcessorLocalReady,
         KernelThreadsReady,
+        CooperativeContextSwitchReady,
         LocalApicTimerReady,
 
         Runtime,

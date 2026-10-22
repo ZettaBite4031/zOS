@@ -23,13 +23,40 @@ namespace Zos::Kernel::Initialization {
         inline constexpr Scheduling::ThreadId BootstrapThreadId{ 0 };
         inline constexpr Scheduling::ThreadId FirstWorkerThreadId{ 1 };
 
-        [[noreturn]] void FirstWorkerThreadEntry(void*) noexcept {
+        bool g_FirstWorkerEntered{};
+        bool g_FirstWorkerStackVerified{};
+
+        [[noreturn]] void FirstWorkerThreadEntry(void* context) noexcept {
+            if (context == nullptr) Diagnostics::Fatal("Thread", "first worker thread received a null context");
+
+            auto& runtime = *static_cast<KernelRuntime*>(context);
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.FirstWorkerThread)
+                Diagnostics::Fatal("Thread", "first worker thread does not own the current processor");
+
+            Uint64 rsp{};
+            __asm__ volatile("movq %%rsp, %0" : "=r"(rsp));
+
+            const Memory::KernelStack* stack = runtime.FirstWorkerThread.Stack();
+            if (stack == nullptr || !stack->Contains(VirtualAddress(rsp)))
+                Diagnostics::Fatal("Thread", "first worker thread is not executing on its own stack");
+
+            g_FirstWorkerEntered = true;
+            g_FirstWorkerStackVerified = true;
+
+            Diagnostics::Write("[zOS/Thread] Worker thread entered on dedicated stack.\n");
+
+            const auto switch_error = runtime.FirstWorkerThread.SwitchTo(runtime.BootstrapThread);
+
+            if (switch_error != Scheduling::ThreadSwitchError::Success)
+                Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(switch_error));
+
             /*
-            * Step 9 only records this entry contract.
-            * Step 10 will actually construct a context that enters it.
+            * Step 10 only expects one Bootstrap -> Worker -> Bootstrap
+            * round trip. A later scheduler milestone will define what
+            * happens when this worker is selected again.
             */
-            for (;;)
-                __asm__ volatile("pause");
+            Diagnostics::Fatal("Thread", "first worker thread resumed before scheduler initialization");
         }
 
         void AdvancePhase(KernelRuntime& runtime, KernelPhase expected, KernelPhase next) noexcept {
@@ -181,14 +208,14 @@ namespace Zos::Kernel::Initialization {
             * records that reality rather than performing a context transition.
             */
             processor->CurrentThread = &runtime.BootstrapThread;
-            if (processor->CurrentThread != &runtime.BootstrapThread || !runtime.BootstrapThread.IsInitialized() ||
-                runtime.BootstrapThread.Id() != BootstrapThreadId || runtime.BootstrapThread.State() != Scheduling::ThreadState::Running ||
-                runtime.BootstrapThread.Stack() != &runtime.PrimaryStack || runtime.BootstrapThread.OwnsStack())
+            if (processor->CurrentThread != &runtime.BootstrapThread || !runtime.BootstrapThread.IsInitialized() || runtime.BootstrapThread.Id() != BootstrapThreadId || 
+                runtime.BootstrapThread.State() != Scheduling::ThreadState::Running || runtime.BootstrapThread.Stack() != &runtime.PrimaryStack || runtime.BootstrapThread.OwnsStack() ||
+                runtime.BootstrapThread.HasContext())
                 Diagnostics::Fatal("Thread", "bootstrap-thread state or processor binding is invalid");
 
             Diagnostics::Write("[zOS/Thread] Current processor binding verified.\n");
 
-            const auto worker_error = runtime.FirstWorkerThread.InitializeKernel(FirstWorkerThreadId, &FirstWorkerThreadEntry, nullptr,
+            const auto worker_error = runtime.FirstWorkerThread.InitializeKernel(FirstWorkerThreadId, &FirstWorkerThreadEntry, &runtime,
                 runtime.PhysicalMemory, runtime.KernelAddresses, runtime.KernelPageMap, FirstKernelThreadStackPages);
 
             if (worker_error != Scheduling::ThreadInitializationError::Success)
@@ -197,7 +224,7 @@ namespace Zos::Kernel::Initialization {
             const Memory::KernelStack* worker_stack = runtime.FirstWorkerThread.Stack();
             if (!runtime.FirstWorkerThread.IsInitialized() || runtime.FirstWorkerThread.Id() != FirstWorkerThreadId ||
                 runtime.FirstWorkerThread.State() != Scheduling::ThreadState::Ready || runtime.FirstWorkerThread.Entry() != &FirstWorkerThreadEntry ||
-                runtime.FirstWorkerThread.EntryContext() != nullptr || !runtime.FirstWorkerThread.OwnsStack() ||
+                runtime.FirstWorkerThread.EntryContext() != &runtime || !runtime.FirstWorkerThread.OwnsStack() ||
                 worker_stack == nullptr || worker_stack == &runtime.PrimaryStack)
                 Diagnostics::Fatal("Thread", "first kernel thread state is invalid");
 
@@ -209,6 +236,49 @@ namespace Zos::Kernel::Initialization {
                 Diagnostics::Fatal("Thread", "kernel thread stacks overlap");
 
             Diagnostics::Write("[zOS/Thread] Kernel thread foundation established.\n");
+        }
+
+        void RunCooperativeContextSwitchSelfTest(KernelRuntime& runtime) noexcept {
+            g_FirstWorkerEntered = false;
+            g_FirstWorkerStackVerified = false;
+
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.BootstrapThread)
+                Diagnostics::Fatal("Thread", "bootstrap thread is not current before context-switch test");
+
+            Uint64 rsp_before{};
+            __asm__ volatile("movq %%rsp, %0" : "=r"(rsp_before));
+            if (!runtime.PrimaryStack.Contains(VirtualAddress(rsp_before)))
+                Diagnostics::Fatal("Thread", "bootstrap thread is not executing on the primary stack");
+
+            /*
+            * IF is still clear here. SwitchTo() deliberately requires that,
+            * so CurrentThread cannot be observed halfway through the RSP
+            * transition by a hardware interrupt.
+            */
+            const auto switch_error = runtime.BootstrapThread.SwitchTo(runtime.FirstWorkerThread);
+            if (switch_error != Scheduling::ThreadSwitchError::Success)
+                Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(switch_error));
+
+            /*
+            * We only reach this point after Thread 1 explicitly switches
+            * back to Thread 0.
+            */
+            if (!g_FirstWorkerEntered || !g_FirstWorkerStackVerified)
+                Diagnostics::Fatal("Thread", "worker thread did not execute successfully");
+
+            processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.BootstrapThread ||
+                runtime.BootstrapThread.State() != Scheduling::ThreadState::Running || runtime.FirstWorkerThread.State() != Scheduling::ThreadState::Ready ||
+                !runtime.BootstrapThread.HasContext() || !runtime.FirstWorkerThread.HasContext())
+                Diagnostics::Fatal("Thread", "thread state was not restored after cooperative switch");
+
+            Uint64 rsp_after{};
+            __asm__ volatile("movq %%rsp, %0" : "=r"(rsp_after));
+            if (!runtime.PrimaryStack.Contains(VirtualAddress(rsp_after)))
+                Diagnostics::Fatal("Thread", "bootstrap thread resumed on the wrong stack");
+
+            Diagnostics::Write("[zOS/Thread] Cooperative context switch verified.\n");
         }
 
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
@@ -378,6 +448,10 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::ProcessorLocalReady, KernelPhase::KernelThreadsReady);
 
+        RunCooperativeContextSwitchSelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::KernelThreadsReady, KernelPhase::CooperativeContextSwitchReady);
+
         const auto timer_error = runtime.Timer.Initialize(runtime.Apic, runtime.Interrupts, runtime.Clock, runtime.BootstrapProcessor);
         if (timer_error != Time::LocalApicTimerInitializationError::Success)
             Diagnostics::Fatal("Timer", Time::LocalApicTimer::Describe(timer_error));
@@ -393,7 +467,7 @@ namespace Zos::Kernel::Initialization {
 
         Diagnostics::Write("[zOS/CPU] Processor-local interrupt access verified.\n");
 
-        AdvancePhase(runtime, KernelPhase::KernelThreadsReady, KernelPhase::LocalApicTimerReady);
+        AdvancePhase(runtime, KernelPhase::CooperativeContextSwitchReady, KernelPhase::LocalApicTimerReady);
 
         EnterRuntime(runtime);
     }
