@@ -23,6 +23,8 @@
 #include <Kernel/Scheduling/Thread.hpp>
 #include <Kernel/Scheduling/Scheduler.hpp>
 
+#include <Kernel/Processes/Process.hpp>
+
 namespace Zos::Kernel {
     struct BootContext final {
         /*
@@ -85,6 +87,7 @@ namespace Zos::Kernel {
         InterruptPolicyReady,
         MonotonicClockReady,
         ProcessorLocalReady,
+        KernelProcessReady,
         KernelThreadsReady,
         CooperativeContextSwitchReady,
         SchedulerReady,
@@ -130,6 +133,8 @@ namespace Zos::Kernel {
          * introduce per-thread kernel stacks.
          */
         Memory::KernelStack PrimaryStack{};
+
+        Processes::Process KernelProcess{};
 
         Scheduling::Thread BootstrapThread{};
         Scheduling::Thread FirstWorkerThread{};

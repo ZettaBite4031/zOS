@@ -2,6 +2,7 @@
 
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 #include <Kernel/Diagnostics/Diagnostics.hpp>
+#include <Kernel/Processes/Process.hpp>
 
 namespace Zos::Kernel::Scheduling {
     namespace {
@@ -22,11 +23,11 @@ namespace Zos::Kernel::Scheduling {
         inline constexpr Memory::Uint64 RflagsInterruptEnable{ 1ULL << 9 };
     }
     
-    ThreadInitializationError Thread::InitializeBootstrap(ThreadId id, Memory::KernelStack& current_stack) noexcept {
-        if (m_Initialized || m_Stack != nullptr || m_OwnedStack.IsInitialized())
+    ThreadInitializationError Thread::InitializeBootstrap(ThreadId id, Processes::Process& owning_process, Memory::KernelStack& current_stack) noexcept {
+        if (m_Initialized || m_OwningProcess != nullptr || m_ProcessNext != nullptr || m_Stack != nullptr || m_OwnedStack.IsInitialized())
             return ThreadInitializationError::AlreadyInitialized;
 
-        if (!current_stack.IsInitialized())
+        if (!owning_process.IsInitialized() || owning_process.State() != Processes::ProcessState::Active || !current_stack.IsInitialized())
             return ThreadInitializationError::InvalidDependency;
 
         m_Id = id;
@@ -45,23 +46,22 @@ namespace Zos::Kernel::Scheduling {
         m_ContextReady = false;
         m_Initialized = true;
 
+        owning_process.AttachThread(*this);
+
         Print();
         return ThreadInitializationError::Success;
     }
 
-    ThreadInitializationError Thread::InitializeKernel(ThreadId id, ThreadEntry entry, void* entry_context, Memory::PhysicalMemoryManager& physical_memory,
-        Memory::VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map, Memory::Uint64 stack_page_count) noexcept {
-
-        if (m_Initialized || m_Stack != nullptr || m_OwnedStack.IsInitialized())
+    ThreadInitializationError Thread::InitializeKernel(ThreadId id, Processes::Process& owning_process, ThreadEntry entry, void* entry_context,
+        Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map, Memory::Uint64 stack_page_count) noexcept {
+        if (m_Initialized || m_OwningProcess != nullptr || m_ProcessNext != nullptr || m_Stack != nullptr || m_OwnedStack.IsInitialized())
             return ThreadInitializationError::AlreadyInitialized;
 
-        if (!physical_memory.IsInitialized() || !virtual_addresses.IsInitialized() ||
-            !page_map.IsInitialized() || !page_map.IsActive())
+        if (!owning_process.IsInitialized() || owning_process.State() != Processes::ProcessState::Active || !physical_memory.IsInitialized() ||
+            !virtual_addresses.IsInitialized() || !page_map.IsInitialized() || !page_map.IsActive())
             return ThreadInitializationError::InvalidDependency;
 
-        if (entry == nullptr)
-            return ThreadInitializationError::InvalidEntry;
-
+        if (entry == nullptr) return ThreadInitializationError::InvalidEntry;
         const auto stack_error = m_OwnedStack.Initialize(physical_memory, virtual_addresses, page_map, stack_page_count);
         if (stack_error != Memory::KernelStackInitializationError::Success)
             return ThreadInitializationError::StackInitializationFailed;
@@ -78,6 +78,8 @@ namespace Zos::Kernel::Scheduling {
         m_OwnsStack = true;
         m_ContextReady = true;
         m_Initialized = true;
+
+        owning_process.AttachThread(*this);
 
         Print();
         return ThreadInitializationError::Success;
@@ -100,27 +102,14 @@ namespace Zos::Kernel::Scheduling {
         if (next.m_State != ThreadState::Ready || !next.m_ContextReady)
             return ThreadSwitchError::TargetNotReady;
 
-        /*
-         * Publish scheduler-visible ownership before loading the new RSP.
-         * IF is required to be clear, so no interrupt handler can observe
-         * the narrow transition between this update and the actual switch.
-         */
         m_State = ThreadState::Ready;
         next.m_State = ThreadState::Running;
         processor->CurrentThread = &next;
 
-        /*
-         * The outgoing context becomes valid as this call is suspended.
-         */
         m_ContextReady = true;
 
         Architecture::AMD64::SwitchThreadContext(&m_Context, &next.m_Context);
 
-        /*
-         * Reaching here means some later cooperative switch restored this
-         * exact call frame. The thread that resumed us must already have
-         * restored our scheduler-visible Running state and CPU binding.
-         */
         processor = Architecture::AMD64::CurrentProcessor();
         if (processor == nullptr || processor->CurrentThread != this || m_State != ThreadState::Running)
             return ThreadSwitchError::ResumeStateMismatch;
@@ -131,8 +120,8 @@ namespace Zos::Kernel::Scheduling {
     void Thread::StartContext(void* argument) noexcept {
         Thread* thread = static_cast<Thread*>(argument);
 
-        if (thread == nullptr || !thread->m_Initialized || thread->m_State != ThreadState::Running ||
-            thread->m_Entry == nullptr)
+        if (thread == nullptr || !thread->m_Initialized || thread->m_OwningProcess == nullptr ||
+            thread->m_State != ThreadState::Running || thread->m_Entry == nullptr)
             Diagnostics::Fatal("Thread", "fresh kernel thread entered with invalid state");
 
         Architecture::AMD64::ProcessorLocal* processor = Architecture::AMD64::CurrentProcessor();
@@ -140,14 +129,7 @@ namespace Zos::Kernel::Scheduling {
             Diagnostics::Fatal("Thread", "fresh kernel thread does not own the current processor");
 
         thread->m_Entry(thread->m_EntryContext);
-
-        /*
-         * Thread termination/reaping belongs to a later scheduler milestone.
-         * Record the terminal state, but never return through the synthetic
-         * architectural startup frame.
-         */
         thread->m_State = ThreadState::Terminated;
-
         Diagnostics::Fatal("Thread", "kernel thread entry returned before termination scheduling exists");
     }
 
@@ -157,6 +139,12 @@ namespace Zos::Kernel::Scheduling {
         Diagnostics::Write("[zOS/Thread] Thread ID: ");
         Diagnostics::WriteDecimal(m_Id);
         Diagnostics::Write("\n");
+
+        if (m_OwningProcess != nullptr) {
+            Diagnostics::Write("[zOS/Thread] Process ID: ");
+            Diagnostics::WriteDecimal(m_OwningProcess->Id());
+            Diagnostics::Write("\n");
+        }
 
         Diagnostics::Write("[zOS/Thread] State: ");
         Diagnostics::Write(StateName(m_State));

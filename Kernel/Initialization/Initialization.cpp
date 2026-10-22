@@ -23,6 +23,8 @@ namespace Zos::Kernel::Initialization {
         inline constexpr Scheduling::ThreadId BootstrapThreadId{ 0 };
         inline constexpr Scheduling::ThreadId FirstWorkerThreadId{ 1 };
 
+        inline constexpr Processes::ProcessId KernelProcessId{ 0 };
+
         bool g_FirstWorkerEntered{};
         bool g_FirstWorkerStackVerified{};
 
@@ -214,8 +216,18 @@ namespace Zos::Kernel::Initialization {
                 Diagnostics::Fatal("Stack", "permanent kernel stack guard page is mapped");
         }
 
+        void InitializeKernelProcess(KernelRuntime& runtime) noexcept {
+            const auto process_error = runtime.KernelProcess.InitializeKernel(KernelProcessId);
+            if (process_error != Processes::ProcessInitializationError::Success)
+                Diagnostics::Fatal("Process", Processes::Process::Describe(process_error));
+
+            if (!runtime.KernelProcess.IsInitialized() || runtime.KernelProcess.Id() != KernelProcessId ||
+                runtime.KernelProcess.State() != Processes::ProcessState::Active || runtime.KernelProcess.ThreadCount() != 0)
+                Diagnostics::Fatal("Process", "kernel process initial state is invalid");
+        }
+
         void InitializeKernelThreads(KernelRuntime& runtime) noexcept {
-            const auto bootstrap_error = runtime.BootstrapThread.InitializeBootstrap(BootstrapThreadId, runtime.PrimaryStack);
+            const auto bootstrap_error = runtime.BootstrapThread.InitializeBootstrap(BootstrapThreadId, runtime.KernelProcess, runtime.PrimaryStack);
             if (bootstrap_error != Scheduling::ThreadInitializationError::Success)
                 Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(bootstrap_error));
 
@@ -228,24 +240,23 @@ namespace Zos::Kernel::Initialization {
             * records that reality rather than performing a context transition.
             */
             processor->CurrentThread = &runtime.BootstrapThread;
-            if (processor->CurrentThread != &runtime.BootstrapThread || !runtime.BootstrapThread.IsInitialized() || runtime.BootstrapThread.Id() != BootstrapThreadId || 
-                runtime.BootstrapThread.State() != Scheduling::ThreadState::Running || runtime.BootstrapThread.Stack() != &runtime.PrimaryStack || runtime.BootstrapThread.OwnsStack() ||
-                runtime.BootstrapThread.HasContext())
+            if (processor->CurrentThread != &runtime.BootstrapThread || !runtime.BootstrapThread.IsInitialized() || runtime.BootstrapThread.Id() != BootstrapThreadId ||
+                runtime.BootstrapThread.State() != Scheduling::ThreadState::Running || runtime.BootstrapThread.OwningProcess() != &runtime.KernelProcess ||
+                runtime.BootstrapThread.Stack() != &runtime.PrimaryStack || runtime.BootstrapThread.OwnsStack() || runtime.BootstrapThread.HasContext())
                 Diagnostics::Fatal("Thread", "bootstrap-thread state or processor binding is invalid");
 
             Diagnostics::Write("[zOS/Thread] Current processor binding verified.\n");
 
-            const auto worker_error = runtime.FirstWorkerThread.InitializeKernel(FirstWorkerThreadId, &FirstWorkerThreadEntry, &runtime,
-                runtime.PhysicalMemory, runtime.KernelAddresses, runtime.KernelPageMap, FirstKernelThreadStackPages);
+            const auto worker_error = runtime.FirstWorkerThread.InitializeKernel(FirstWorkerThreadId, runtime.KernelProcess, &FirstWorkerThreadEntry,
+                &runtime, runtime.PhysicalMemory, runtime.KernelAddresses, runtime.KernelPageMap, FirstKernelThreadStackPages);
 
             if (worker_error != Scheduling::ThreadInitializationError::Success)
                 Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(worker_error));
 
             const Memory::KernelStack* worker_stack = runtime.FirstWorkerThread.Stack();
-            if (!runtime.FirstWorkerThread.IsInitialized() || runtime.FirstWorkerThread.Id() != FirstWorkerThreadId ||
-                runtime.FirstWorkerThread.State() != Scheduling::ThreadState::Ready || runtime.FirstWorkerThread.Entry() != &FirstWorkerThreadEntry ||
-                runtime.FirstWorkerThread.EntryContext() != &runtime || !runtime.FirstWorkerThread.OwnsStack() ||
-                worker_stack == nullptr || worker_stack == &runtime.PrimaryStack)
+            if (!runtime.FirstWorkerThread.IsInitialized() || runtime.FirstWorkerThread.Id() != FirstWorkerThreadId || runtime.FirstWorkerThread.State() != Scheduling::ThreadState::Ready ||
+                runtime.FirstWorkerThread.OwningProcess() != &runtime.KernelProcess || runtime.FirstWorkerThread.Entry() != &FirstWorkerThreadEntry || runtime.FirstWorkerThread.EntryContext() != &runtime ||
+                !runtime.FirstWorkerThread.OwnsStack() || worker_stack == nullptr || worker_stack == &runtime.PrimaryStack)
                 Diagnostics::Fatal("Thread", "first kernel thread state is invalid");
 
             if (!worker_stack->IsInitialized() || worker_stack->UsableSpan().PageCount != FirstKernelThreadStackPages ||
@@ -254,8 +265,17 @@ namespace Zos::Kernel::Initialization {
 
             if (runtime.PrimaryStack.Contains(worker_stack->Bottom()) || worker_stack->Contains(runtime.PrimaryStack.Bottom()))
                 Diagnostics::Fatal("Thread", "kernel thread stacks overlap");
-
+            
             Diagnostics::Write("[zOS/Thread] Kernel thread foundation established.\n");
+
+            if (runtime.KernelProcess.ThreadCount() != 2 || !runtime.KernelProcess.OwnsThread(runtime.BootstrapThread) ||
+                !runtime.KernelProcess.OwnsThread(runtime.FirstWorkerThread))
+                Diagnostics::Fatal("Process", "kernel process thread membership is invalid");
+
+            Diagnostics::Write("[zOS/Process] Kernel process thread membership verified.\n");
+            Diagnostics::Write("[zOS/Process] Threads: ");
+            Diagnostics::WriteDecimal(runtime.KernelProcess.ThreadCount());
+            Diagnostics::Write("\n");
         }
 
         void RunCooperativeContextSwitchSelfTest(KernelRuntime& runtime) noexcept {
@@ -520,9 +540,13 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::MonotonicClockReady, KernelPhase::ProcessorLocalReady);
 
+        InitializeKernelProcess(runtime);
+
+        AdvancePhase(runtime, KernelPhase::ProcessorLocalReady, KernelPhase::KernelProcessReady);
+
         InitializeKernelThreads(runtime);
 
-        AdvancePhase(runtime, KernelPhase::ProcessorLocalReady, KernelPhase::KernelThreadsReady);
+        AdvancePhase(runtime, KernelPhase::KernelProcessReady, KernelPhase::KernelThreadsReady);
 
         RunCooperativeContextSwitchSelfTest(runtime);
 
@@ -530,6 +554,10 @@ namespace Zos::Kernel::Initialization {
 
         InitializeScheduler(runtime);
         RunSchedulerSelfTest(runtime);
+
+        ProcessorLocal* processor = CurrentProcessor();
+        if (processor == nullptr || processor->CurrentThread == nullptr || processor->CurrentThread->OwningProcess() != &runtime.KernelProcess)
+            Diagnostics::Fatal("Process", "current thread lost kernel process ownership");
 
         AdvancePhase(runtime, KernelPhase::CooperativeContextSwitchReady, KernelPhase::SchedulerReady);
 
