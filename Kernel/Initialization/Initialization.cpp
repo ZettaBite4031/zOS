@@ -1,4 +1,6 @@
 #include <Kernel/Initialization/Initialization.hpp>
+
+#include <Kernel/Initialization/CityBootstrap.hpp>
 #include <Kernel/Initialization/ExecutionBootstrap.hpp>
 #include <Kernel/Initialization/MemoryBootstrap.hpp>
 #include <Kernel/Initialization/SelfTests.hpp>
@@ -195,7 +197,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::UserRuntimeReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::FirstCityReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -381,6 +383,11 @@ namespace Zos::Kernel::Initialization {
         ExecutionBootstrap::RunUserRuntimeExitSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::Ring3Ready, KernelPhase::UserRuntimeReady);
+
+        CityBootstrap::LaunchCity(runtime);
+        CityBootstrap::RunCitySelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::UserRuntimeReady, KernelPhase::FirstCityReady);
 
         EnterRuntime(runtime);
     }

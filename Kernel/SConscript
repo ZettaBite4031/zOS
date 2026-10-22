@@ -2,7 +2,7 @@ from pathlib import Path
 
 from SCons.Script import Action
 
-Import("kernel_environment", "output_root", "first_user_program")
+Import("kernel_environment", "output_root", "first_user_program", "city_user_programs")
 
 component_output = f"{output_root}/Kernel"
 component_directory = Path(Dir(".").srcnode().abspath)
@@ -67,6 +67,47 @@ def EmbedFirstUserProgram(target, source, env):
     return 0
 
 
+def EmbedCityPrograms(target, source, env):
+    destination = Path(str(target[0]))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "#include <Kernel/Executables/EmbeddedUserImages.hpp>",
+        "",
+        "namespace Zos::Kernel::Executables {",
+        "    namespace {",
+    ]
+
+    roles = ("Exit", "Fault", "Survivor")
+    for role, source_node in zip(roles, source):
+        image = Path(str(source_node)).read_bytes()
+
+        lines.append(f"        alignas(16) const Memory::Uint8 g_City{role}Image[]{{")
+
+        for offset in range(0, len(image), 16):
+            chunk = image[offset:offset + 16]
+            lines.append("            " + ", ".join(f"0x{byte:02X}" for byte in chunk) + ",")
+
+        lines.append("        };")
+
+    lines.extend(["    }", ""])
+
+    for role in roles:
+        lines.extend([
+            f"    EmbeddedImage City{role}Image() noexcept {{",
+            "        return EmbeddedImage{",
+            f"            .Data = g_City{role}Image,",
+            f"            .Size = sizeof(g_City{role}Image),",
+            "        };",
+            "    }",
+            "",
+        ])
+
+    lines.append("}")
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return 0
+
+
 embedded_user_source = kernel_environment.Command(
     target=f"{component_output}/Generated/FirstUserProgramImage.cpp",
     source=first_user_program,
@@ -78,6 +119,18 @@ embedded_user_object = kernel_environment.Object(
     source=embedded_user_source,
 )
 kernel_objects.append(embedded_user_object)
+
+city_embedded_source = kernel_environment.Command(
+    target=f"{component_output}/Generated/CityProgramImages.cpp",
+    source=[city_user_programs[role][0] for role in ("Exit", "Fault", "Survivor")],
+    action=Action(EmbedCityPrograms, "Embedding First City native executables"),
+)
+
+city_embedded_object = kernel_environment.Object(
+    target=f"{component_output}/Generated/CityProgramImages{kernel_environment['OBJSUFFIX']}",
+    source=city_embedded_source,
+)
+kernel_objects.append(city_embedded_object)
 
 kernel = kernel_environment.Command(
     target=f"{component_output}/Kernel.elf",

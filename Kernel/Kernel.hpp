@@ -26,6 +26,8 @@
 #include <Kernel/Scheduling/Scheduler.hpp>
 
 #include <Kernel/Processes/Process.hpp>
+#include <Kernel/Processes/UserProcessLauncher.hpp>
+
 #include <Kernel/Executables/UserExecutableLoader.hpp>
 
 namespace Zos::Kernel {
@@ -101,6 +103,7 @@ namespace Zos::Kernel {
         UserExecutableReady,
         Ring3Ready,
         UserRuntimeReady,
+        FirstCityReady,
 
         Runtime,
     };
@@ -140,6 +143,10 @@ namespace Zos::Kernel {
         Time::LocalApicTimer Timer{};
 
         Executables::LoadedUserImage FirstUserImage{};
+
+        Processes::UserProcessInstance CityExit{};
+        Processes::UserProcessInstance CityFault{};
+        Processes::UserProcessInstance CitySurvivor{};
 
         /*
          * Permanent bootstrap/runtime stack until kernel threads

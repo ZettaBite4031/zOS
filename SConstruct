@@ -36,12 +36,17 @@ first_user_program = SConscript(
     "User/FirstProgram/SConscript",
     exports={"user_environment": user_environment, "output_root": output_root},
 )
+city_user_programs = SConscript(
+    "User/CityPrograms/SConscript",
+    exports={"user_environment": user_environment, "output_root": output_root},
+)
 kernel = SConscript(
     "Kernel/SConscript",
     exports={
         "kernel_environment": kernel_environment,
         "output_root": output_root,
         "first_user_program": first_user_program,
+        "city_user_programs": city_user_programs,
     },
 )
 
@@ -200,6 +205,14 @@ user_program_verification = host_environment.Command(
     source=first_user_program,
     action=Action(VerifyUserProgram, "Verifying native user image $SOURCE"),
 )
+city_user_verifications = [
+    host_environment.Command(
+        target=f"{output_root}/Verification/City{role}.stamp",
+        source=city_user_programs[role],
+        action=Action(VerifyUserProgram, f"Verifying City {role} ELF $SOURCE"),
+    )
+    for role in ("Exit", "Fault", "Survivor")
+]
 
 staged_loader = host_environment.Command(
     target=f"{output_root}/ESP/EFI/BOOT/BOOTX64.EFI",
@@ -221,13 +234,19 @@ build_products = [
     loader_verification,
     kernel_verification,
     user_program_verification,
+    *city_user_verifications,
     staged_loader,
     staged_kernel,
 ]
 
 Default(build_products)
 Alias("build", build_products)
-Alias("verify", [loader_verification, kernel_verification, user_program_verification])
+Alias("verify", [
+    loader_verification,
+    kernel_verification,
+    user_program_verification,
+    *city_user_verifications,
+])
 
 # Build.py uses this non-interactive alias before starting a debug session.
 # Keeping preparation inside SCons preserves the same dependency graph used by

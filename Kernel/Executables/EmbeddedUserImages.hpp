@@ -13,4 +13,8 @@ namespace Zos::Kernel::Executables {
     };
 
     [[nodiscard]] EmbeddedImage FirstUserProgramImage() noexcept;
+
+    [[nodiscard]] EmbeddedImage CityExitImage() noexcept;
+    [[nodiscard]] EmbeddedImage CityFaultImage() noexcept;
+    [[nodiscard]] EmbeddedImage CitySurvivorImage() noexcept;
 }
