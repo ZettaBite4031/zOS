@@ -4,304 +4,163 @@
 
 ### A modern, from-scratch operating system for AMD64
 
-**UEFI-native · Modern C++ · NT-inspired · Built for learning, experimentation, and eventual everyday use**
-
-<br>
+**UEFI-native · C++23 · NT-inspired · Built to become a real desktop operating system**
 
 ![Architecture](https://img.shields.io/badge/architecture-AMD64-4B6B88?style=flat-square)
 ![Firmware](https://img.shields.io/badge/firmware-UEFI-4B6B88?style=flat-square)
 ![Language](https://img.shields.io/badge/language-C%2B%2B23-4B6B88?style=flat-square)
 ![Build](https://img.shields.io/badge/build-SCons-4B6B88?style=flat-square)
-![Toolchain](https://img.shields.io/badge/toolchain-LLVM%20%2F%20Clang-4B6B88?style=flat-square)
-![Status](https://img.shields.io/badge/status-early%20development-C88A36?style=flat-square)
+![Toolchain](https://img.shields.io/badge/toolchain-LLVM%2022.1.8-4B6B88?style=flat-square)
+![Status](https://img.shields.io/badge/status-user%20mode%20online-C88A36?style=flat-square)
 
 </div>
 
 ---
 
-> zOS is a hobby operating-system project with a serious engineering goal: to grow from a small experimental kernel into a coherent, usable, and maintainable general-purpose operating system.
+zOS is a from-scratch, general-purpose operating system for modern AMD64 machines.
 
-zOS is being developed entirely from scratch for modern AMD64 systems. It boots through UEFI, is written primarily in modern C++, and is designed around explicit subsystem boundaries, deterministic tooling, and long-term expandability.
+It is not a Unix clone, a Linux distribution, or a Windows reimplementation. zOS takes strong architectural inspiration from Windows NT, especially its separation of low-level kernel mechanisms from higher-level policy, process and object model, handle-based resource management, layered I/O design, and willingness to treat user-mode subsystems as first-class parts of the operating system.
 
-The project is not intended to be a Unix clone, a Linux distribution, or a reimplementation of Windows. Its architecture takes inspiration from the Windows NT kernel family—particularly its object model, Executive subsystems, handle-based resource management, layered I/O system, and separation between hardware-specific and platform-independent code—while remaining an original operating system without compatibility constraints.
+The long-term goal is ambitious but simple to state:
 
-## Why zOS?
+> Build an operating system that can eventually be used as an everyday desktop, without inheriting Unix as its native personality and without depending on Microsoft to provide the Windows-style experience.
 
-Operating systems are often built incrementally until early shortcuts become permanent architecture.
+The project is still experimental, but it has moved well beyond the boot-screen stage. zOS currently boots through UEFI, constructs its own memory environment, initializes modern interrupt and timer facilities, schedules kernel threads preemptively, creates independent process address spaces, enters AMD64 Ring 3, and contains fatal user-mode faults without taking down the kernel.
 
-zOS takes the opposite approach.
+## Current milestone
 
-The project is being restarted from a previous custom operating system implementation so that its foundations can be designed deliberately using newer coding practices, stronger architectural boundaries, and a clearer understanding of the technical debt that tends to accumulate in low-level systems.
+The current development milestone is **Step 16: User Fault Isolation**.
 
-The primary motivation is still curiosity and enjoyment. zOS exists because operating systems are interesting to design, build, debug, and understand.
+Implemented today:
 
-The long-term ambition, however, is larger than a bootable demonstration:
+- UEFI x64 loader and versioned boot handoff
+- Freestanding AMD64 C++23 kernel
+- Physical and virtual memory management
+- Permanent kernel address space, heap, stacks, and metadata ownership
+- ACPI table discovery and MADT topology parsing
+- AMD64 capability discovery
+- x2APIC/local APIC support and legacy PIC quiescence
+- HPET-assisted invariant-TSC monotonic clock
+- Local APIC timer
+- GS-based processor-local state
+- Kernel threads and guarded stacks
+- Cooperative and timer-driven preemptive scheduling
+- Process objects and thread membership
+- Independent per-process CR3 roots
+- Ring 3 execution with TSS `RSP0`, `IRETQ`, and conditional `SWAPGS`
+- User code/data/stack mappings with an unmapped guard page
+- Fatal CPL3 exception containment
+- Non-returning scheduler termination for a faulting user thread
+- Process fault records and verified kernel survival after a user page fault
 
-> zOS should eventually become a genuinely usable operating system, while remaining understandable enough for one developer to reason about and maintain.
+The next milestone is **Step 17: native `SYSCALL` / `SYSRET`**.
 
-## Project goals
+See [Documentation/Roadmap.md](Documentation/Roadmap.md) for the full roadmap.
 
-zOS aims to become:
+## Design principles
 
-* A native 64-bit operating system for AMD64 hardware
-* Fully UEFI-based, without a legacy BIOS boot path
-* Modern-first in its use of hardware and platform standards
-* Structured around an NT-inspired hybrid-kernel architecture
-* Written with modern, freestanding C++ where appropriate
-* Capable of supporting user-mode applications and system services
-* Designed for asynchronous and layered I/O
-* Built around typed kernel objects and validated handles
-* Multiprocessor-aware from its architectural foundations
-* Reproducible to build from a clean development environment
-* Suitable for both virtual machines and real hardware
-* Usable as more than an academic or boot-screen-only kernel
+### zOS stays zOS
 
-zOS is also intended to remain enjoyable to work on. Features such as release codenames, custom tooling, and original subsystem designs are welcome when they improve the identity of the project without compromising technical quality.
+Compatibility is a major long-term goal, but foreign operating systems must not define the native kernel architecture.
 
-## Design philosophy
+Windows and Linux software should eventually be translated onto native zOS facilities at the highest practical layer. The long-term module system is intended to allow a foreign logical module name, such as a Windows DLL identity or Linux shared-object identity, to resolve to a native zOS implementation without requiring a forest of forwarding libraries.
+
+The rule is:
+
+> Foreign API or ABI → translate once → native zOS API.
+
+See [Documentation/Compatibility.md](Documentation/Compatibility.md).
 
 ### Modern first
 
-Modern platform mechanisms are the primary implementation path.
+Modern mechanisms are the primary path:
 
-Examples include:
+- UEFI rather than legacy BIOS
+- GPT rather than MBR-oriented boot design
+- x2APIC where available
+- MSI-X/MSI for device interrupts
+- PCI Express ECAM
+- NVMe as an early real-storage target
+- xHCI for USB
+- ACPI for discovery and power management
+- NX, SMEP, SMAP, PCID, and related processor protections where supported
 
-* UEFI instead of legacy BIOS
-* GPT instead of MBR-oriented booting
-* x2APIC where available
-* MSI-X and MSI for device interrupts
-* PCI Express ECAM
-* NVMe as the primary storage target
-* xHCI for USB
-* ACPI for platform discovery and power management
-* NX, SMEP, SMAP, PCID, and other processor protections where supported
-
-Older mechanisms may exist as compatibility paths or temporary bring-up tools, but they must remain isolated and must not define the architecture of higher-level systems.
+Older mechanisms may exist for compatibility or bring-up, but must not shape platform-independent architecture.
 
 ### Architecture before convenience
 
-zOS avoids introducing major facilities solely because they are easy to make work quickly.
+A feature is not finished merely because it works once.
 
-Subsystems should have clear:
+Subsystems should have explicit ownership, dependency direction, lifetime rules, failure behavior, and a believable expansion path. Temporary bring-up code is fine when it is localized and clearly temporary. Architectural debt is not.
 
-* Responsibilities
-* Interfaces
-* Ownership rules
-* Dependency directions
-* Synchronization models
-* Failure semantics
-* Expansion paths
+### Files represent concepts; directories represent ownership
 
-A working implementation is important, but a working implementation that permanently damages the architecture is not considered complete.
+zOS intentionally avoids both giant catch-all files and directory forests full of tiny abstractions.
 
-### Explicit ownership
+A file should represent something a developer would naturally search for by name. A directory should represent a real subsystem or ownership boundary.
 
-Kernel resources should have clear ownership and lifetime behavior.
+### Freestanding C++ without pretending it is C
 
-The long-term kernel object model is expected to include objects such as:
+The kernel uses C++23 in a freestanding environment. Exceptions, RTTI, hosted startup code, and the ordinary host C/C++ runtime are not assumed.
 
-* Processes
-* Threads
-* Jobs
-* Sections
-* Files
-* Devices
-* Drivers
-* Events
-* Semaphores
-* Timers
-* Ports
-* Security tokens
-* Object directories
-* Symbolic links
+Modern language features are welcome when their runtime costs and ownership implications are understood.
 
-User mode will interact with these resources through validated handles rather than direct kernel pointers.
+## Architectural direction
 
-### No accidental host dependencies
-
-The build must not depend on whichever compiler, standard library, SDK, linker, or utility happens to be installed globally.
-
-The project uses a repository-local, version-pinned toolchain and records the tools used to produce each build.
-
-### Focused repository growth
-
-The repository begins with only the components that currently exist.
-
-Directories are added when they represent real ownership boundaries, not merely to make the project appear larger or more mature than it is.
-
-Headers and translation units are colocated by component rather than separated into mirrored `src/` and `include/` hierarchies.
-
-## Architecture direction
-
-The long-term architecture is expected to contain four major layers.
+The current code is still compact, but the intended direction is:
 
 ```text
-┌───────────────────────────────────────────────┐
-│                User-mode system               │
-│  Applications · Services · Native runtime     │
-├───────────────────────────────────────────────┤
-│                    Executive                  │
-│ Object · Memory · Process · I/O · Security    │
-├───────────────────────────────────────────────┤
-│                  Kernel core                  │
-│ Scheduling · Dispatch · Interrupts · Timers   │
-├───────────────────────────────────────────────┤
-│      HAL and AMD64 architecture mechanisms    │
-│ ACPI · APIC · SMP · Paging · CPU facilities   │
-└───────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│                  User-mode system                  │
+│ Applications · Services · Runtimes · Compatibility │
+├────────────────────────────────────────────────────┤
+│                    Executive                       │
+│ Objects · Memory · Process · I/O · Security        │
+├────────────────────────────────────────────────────┤
+│                   Kernel core                      │
+│ Scheduling · Dispatch · Interrupts · Timers        │
+├────────────────────────────────────────────────────┤
+│           Platform / architecture support          │
+│ AMD64 · ACPI · APIC · Paging · Device plumbing     │
+└────────────────────────────────────────────────────┘
 ```
 
-The exact implementation will evolve as the system develops, but several architectural principles are already established:
+The kernel is intended to remain hybrid rather than becoming either a giant monolith or a purity-driven microkernel.
 
-* The kernel will be hybrid rather than purely monolithic or microkernel-based.
-* The Executive will contain most operating-system policy.
-* The kernel core will remain comparatively small.
-* The HAL will isolate machine-level platform behavior.
-* Drivers will use a layered I/O architecture.
-* Executable loading will remain separate from process creation.
-* Security and access rights will be part of the object model rather than a late addition.
-* User-mode environments may eventually expose different APIs without changing the kernel into a Unix-like design.
+Some high-risk or high-complexity facilities may eventually live in privileged user-mode services where that improves containment. Graphics is a likely example: a small trusted hardware-facing layer plus large user-mode graphics drivers and runtimes.
 
-More detailed architectural decisions belong in the project documentation rather than this README.
-
-## Modern C++ without a hosted runtime
-
-zOS uses modern C++, beginning with a C++23 language baseline.
-
-The project intends to use appropriate standard facilities such as:
-
-```cpp
-std::variant
-std::optional
-std::expected
-std::span
-std::array
-std::tuple
-std::string_view
-```
-
-The kernel is freestanding and does not depend on Newlib.
-
-Instead, zOS will provide a controlled compiler-support runtime and selectively validate standard-library facilities before approving them for kernel use.
-
-Exceptions and RTTI are initially disabled in kernel mode. This does not prevent the use of modern C++ language features; it avoids introducing complex runtime behavior before the necessary memory management, unwinding, and failure infrastructure exists.
-
-A fuller C and C++ runtime may later be provided for user-mode applications.
-
-## Current status
-
-zOS is in early development.
-
-The current repository establishes the first build and boot foundation:
-
-* Repository-local LLVM and SCons toolchain
-* UEFI x64 application build
-* Freestanding ELF64 AMD64 kernel build
-* OVMF boot under QEMU
-* Headless debug-port output
-* Optional graphical QEMU display
-* Binary-format verification
-* Separate UEFI and kernel build environments
-* Staged EFI System Partition directory
-* Debug and Release configurations
-
-The UEFI loader currently proves that firmware can locate and execute `BOOTX64.EFI`.
-
-The kernel is built as an independent ELF64 image with a defined entry point.
-
-The next major milestone is for the UEFI loader to locate, validate, load, and transfer control to the kernel.
-
-## Near-term roadmap
-
-The initial development path is intentionally narrow.
-
-### Boot foundation
-
-* Read the kernel from the EFI System Partition
-* Parse and validate the ELF64 image
-* Load `PT_LOAD` segments
-* Construct a versioned boot environment
-* Capture the final UEFI memory map
-* Exit UEFI boot services
-* Enter the kernel
-
-### Kernel foundation
-
-* Establish structured logging
-* Initialize physical memory management
-* Define the virtual address-space layout
-* Initialize page-table ownership
-* Add exception handling
-* Establish CPU-local state
-* Introduce the first HAL boundaries
-* Prepare for symmetric multiprocessing
-
-### Executive foundation
-
-* Kernel object model
-* Handle tables
-* Dispatcher objects
-* Threads and scheduler
-* Processes and address spaces
-* Native system-call entry
-* First user-mode process
-
-### I/O foundation
-
-* Driver and device objects
-* I/O request packets
-* PCI Express discovery
-* NVMe storage
-* Partition management
-* Initial filesystem
-* Namespace-based file access
-
-The roadmap will expand as each foundational layer becomes stable.
+See [Documentation/Architecture.md](Documentation/Architecture.md) and [Documentation/DriverAndIO.md](Documentation/DriverAndIO.md).
 
 ## Repository layout
 
-The initial repository remains intentionally small:
+The repository currently reflects implemented components rather than speculative ones:
 
 ```text
 zOS/
 ├── Boot/
+│   ├── Protocol.hpp
 │   └── UEFI/
-│       ├── Loader.cpp
-│       ├── UEFI.hpp
-│       └── SConscript
-│
 ├── BuildSystem/
-│   ├── Environments.py
-│   └── Toolchain.py
-│
 ├── Documentation/
 ├── Kernel/
-│   ├── Kernel.cpp
-│   ├── Linker.ld
-│   └── SConscript
-│
+│   ├── Architecture/AMD64/
+│   ├── Diagnostics/
+│   ├── Initialization/
+│   ├── Memory/
+│   ├── Platform/
+│   ├── Processes/
+│   ├── Runtime/
+│   ├── Scheduling/
+│   └── Time/
 ├── Tools/
 ├── Build.py
 ├── SConstruct
 └── README.md
 ```
 
-Future directories such as `Executive`, `HAL`, `Architecture`, `Drivers`, and `Runtime` will be added only when their first concrete responsibilities are implemented.
-
 ## Development environment
 
-The current development environment is:
-
-* Ubuntu 22.04 under WSL2
-* LLVM and Clang
-* LLD and `lld-link`
-* SCons
-* QEMU
-* OVMF
-* GDB
-* Python 3
-
-The repository should be stored inside the WSL Linux filesystem for better build performance and more predictable Linux filesystem behavior.
+The tested host environment is Ubuntu 22.04 under WSL2, with the repository stored in the WSL Linux filesystem.
 
 Recommended location:
 
@@ -309,219 +168,115 @@ Recommended location:
 ~/Projects/zOS
 ```
 
-Avoid building from `/mnt/c/...` unless necessary.
-
-## Setting up the toolchain
-
-The setup script installs the required Ubuntu host utilities and prepares the repository-local LLVM and SCons environment.
+The setup script prepares a repository-local toolchain containing LLVM 22.1.8 and SCons 4.10.1.
 
 ```bash
 chmod +x Tools/SetupDevEnv.sh
 ./Tools/SetupDevEnv.sh
 ```
 
-To activate the environment manually:
-
-```bash
-source .zos/Toolchain/Environment.sh
-```
-
-To verify the existing installation:
+Verify an existing setup:
 
 ```bash
 ./Tools/SetupDevEnv.sh --verify-only
 ```
 
-Or:
+or:
 
 ```bash
 ./Tools/VerifyDevEnv.py
 ```
 
-Generated toolchain files are stored under:
-
-```text
-.zos/Toolchain/
-```
-
-The `.zos` directory is local development state and should not be committed.
-
-## Building zOS
-
-Build the default Debug configuration:
+## Building and running
 
 ```bash
 ./Build.py build
-```
-
-Build with multiple jobs:
-
-```bash
 ./Build.py build -j8
-```
-
-Build the Release configuration:
-
-```bash
 ./Build.py build Configuration=Release
-```
-
-Verify the generated UEFI and kernel images:
-
-```bash
 ./Build.py verify
-```
-
-Run zOS under QEMU:
-
-```bash
 ./Build.py run
-```
-
-Clean generated outputs:
-
-```bash
+./Build.py debug
 ./Build.py clean
 ```
 
-Build products are placed under:
+Outputs are placed under:
 
 ```text
 Output/<Configuration>/AMD64/
 ```
 
-For example:
+See [Documentation/Development.md](Documentation/Development.md) for details.
+
+## Long-term direction
 
 ```text
-Output/Debug/AMD64/
-├── Boot/
-│   └── UEFI/
-│       └── BOOTX64.EFI
-├── Kernel/
-│   └── Kernel.elf
-├── ESP/
-├── Firmware/
-└── Verification/
+CPU / kernel execution
+        ↓
+native userspace
+        ↓
+object + handle + IPC model
+        ↓
+module and driver architecture
+        ↓
+storage + filesystems
+        ↓
+networking
+        ↓
+everyday hardware
+        ↓
+desktop and software rendering
+        ↓
+accelerated graphics
+        ↓
+native application platform
+        ↓
+Windows / Linux native compatibility
+        ↓
+installer, updates, recovery, hardening
+        ↓
+daily-driver zOS
 ```
 
-## Build-system policy
+Driver modules are intended to be dynamically selected from hardware and dependency information. A small boot-module package will eventually provide the storage-critical drivers required before the system volume can be mounted; the full on-disk driver repository can then provide networking, USB, audio, graphics, and other hardware support.
 
-SCons is the canonical build system.
+Filesystems are expected to begin with RAMFS and FAT, followed by exFAT and eventually native NTFS support. A custom zOS filesystem is deliberately postponed until the operating system has enough real-world storage experience to know what it actually needs.
 
-The build is divided into separate construction environments for:
+Graphics will begin with a basic framebuffer path and later grow into a split model with a standardized zOS GPU interface, hardware-facing system drivers, and substantial user-mode graphics implementations.
 
-* Host tools and tests
-* The UEFI loader
-* The freestanding kernel
+## Documentation
 
-This prevents UEFI-specific ABI and linker behavior from leaking into kernel code.
+- [Architecture](Documentation/Architecture.md)
+- [Long-term Roadmap](Documentation/Roadmap.md)
+- [Development](Documentation/Development.md)
+- [Native Compatibility](Documentation/Compatibility.md)
+- [Driver, Storage, Networking, and Graphics Direction](Documentation/DriverAndIO.md)
 
-The build system should remain structured:
-
-```text
-SConstruct
-    Top-level graph, aliases, and configuration
-
-BuildSystem/
-    Shared toolchain and environment definitions
-
-Component/SConscript
-    Component-owned sources and dependencies
-```
-
-Production source lists should generally be explicit rather than automatically globbing every source file in a directory.
-
-## Versioning
-
-zOS uses Semantic Versioning.
-
-Early development releases will remain under major version zero:
-
-```text
-0.1.0-alpha.1
-0.1.0
-0.2.0
-1.0.0
-```
-
-Important protocols and compatibility surfaces will also have independent versions, including:
-
-* Boot protocol
-* Kernel ABI
-* Driver ABI
-* Native user-mode API
-
-Meaningful milestone releases may receive codenames.
-
-For example:
-
-```text
-zOS 0.5.0 "Wayfinder"
-zOS 1.0.0 "First Light"
-```
-
-Codenames are descriptive only and do not affect compatibility.
+Documentation should distinguish clearly between **implemented**, **next**, and **long-term design**. Future plans are not current capabilities.
 
 ## Project maturity
 
 zOS is experimental software.
 
-It is not currently suitable for:
+Do not currently trust it with important data, security-sensitive workloads, or valuable bare-metal machines.
 
-* Production use
-* Storing important data
-* Security-sensitive environments
-* Running directly on valuable hardware
-* Replacing an existing operating system
-
-Development currently targets QEMU and OVMF first. Real-hardware support will be introduced deliberately as the boot, memory, interrupt, and driver foundations mature.
-
-## Documentation
-
-Project documentation is maintained under:
-
-```text
-Documentation/
-```
-
-Current and planned documents include:
-
-* Architecture and Development Charter
-* Development Environment
-* Initial Repository Design
-* Boot Protocol
-* Coding Standard
-* Kernel Object Model
-* Memory Architecture
-* I/O Architecture
-* Driver Model
-* Native System API
-* Platform Profiles
-
-The README provides orientation. Detailed design decisions belong in their respective documents.
+QEMU/OVMF remains the primary bring-up environment. Real-hardware support will be introduced deliberately as the driver, I/O, storage, and recovery foundations mature.
 
 ## Contributing
 
-zOS is currently primarily a personal hobby project and remains in a highly formative architectural stage.
+zOS is primarily a personal operating-system project in an active architectural phase.
 
-Issues, technical discussion, design review, and careful experimentation are welcome. Large implementation contributions should align with the project’s established architecture rather than introducing isolated “make it work” solutions.
+Technical discussion, review, experiments, and careful contributions are welcome. Large changes should fit the established direction rather than introducing isolated shortcuts that permanently dictate higher-level architecture.
 
-Before proposing substantial changes, review the documentation and ensure that the change preserves:
+Before proposing a major subsystem, preserve the project's core rules:
 
-* Modern-first platform design
-* Clear subsystem ownership
-* Explicit lifetime behavior
-* Freestanding compatibility
-* Toolchain reproducibility
-* Long-term architectural expandability
-
-## Acknowledgements
-
-zOS is informed by operating-system architecture, firmware standards, processor documentation, prior zOS development experience, and the study of existing systems.
-
-The project takes conceptual inspiration from Windows NT’s subsystem organization while remaining an independent design.
-
-It is also shaped by the broader hobby operating-system community and the many developers who publish low-level research, documentation, experiments, and debugging techniques.
+- modern-first platform design
+- clear ownership and lifetime
+- explicit subsystem boundaries
+- freestanding compatibility
+- reproducible tooling
+- native zOS abstractions first
+- foreign compatibility through translation, not architectural takeover
+- implementation growth only when a real feature needs it
 
 ---
 
@@ -529,6 +284,6 @@ It is also shaped by the broader hobby operating-system community and the many d
 
 ### Built from first principles, one boundary at a time.
 
-**zOS is not trying to become large quickly. It is trying to become correct deliberately.**
+**Make it work. Make the boundary correct. Then make it bigger.**
 
 </div>
