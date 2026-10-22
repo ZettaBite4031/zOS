@@ -1,15 +1,18 @@
 # zOS Long-Term Roadmap
 
-This roadmap is directional rather than contractual.
+This roadmap is directional rather than contractual. Each numbered Step is intended to be a concrete feature milestone with an observable completion condition. Later Steps may move when implementation teaches us something new.
 
-Each numbered item is intended to be a concrete feature milestone with an observable completion condition. Exact ordering beyond the near-term milestones may move when implementation teaches us something new.
-
-Current repository baseline:
+**Current repository baseline (after inter-era cleanup):**
 
 ```text
-Step 16 complete: User Fault Isolation
-Next: Step 17, native SYSCALL / SYSRET
+Era I:  Execution Foundation — complete (Steps 1–16)
+Era II: Native Userspace — complete (Steps 17–20)
+Inter-era architectural cleanup — complete
+Step 20 complete: First City
+Next: Step 21, Kernel Object and Handle Manager (Era III)
 ```
+
+Step numbers refer to **feature milestones**, not commits or file sets. Completion means the milestone's relevant behavior was exercised and verified. This does not imply production readiness, comprehensive hardware support, or full resource reclamation.
 
 ## Era I — Execution foundation
 
@@ -64,34 +67,31 @@ Next: Step 17, native SYSCALL / SYSRET
 
 ## Era II — Native userspace
 
-### 17. Native `SYSCALL` / `SYSRET` ← NEXT
+### 17. Native `SYSCALL` / `SYSRET` ✅
 - Establish the first intentional userspace-to-kernel ABI.
-- Switch safely between user and kernel stacks.
-- Keep architecture entry separate from ABI dispatch.
+- Switch safely between user and kernel stacks; keep architecture entry separate from native dispatch.
 
-### 18. Static user ELF loader
-- Load real user executables instead of generated machine-code pages.
-- Map segments with correct permissions.
-- Construct a user stack and entry context.
+### 18. Static user ELF loader ✅
+- Load real static user executables instead of generated machine-code pages.
+- Map segments with correct permissions and construct a guarded user stack and entry context.
 
-### 19. Native zOS user runtime
-- Add startup/termination and basic syscall wrappers.
-- Provide the first small C/C++-friendly user runtime surface.
+### 19. Native zOS user runtime ✅
+- Add native startup/termination, basic syscall wrappers, and freestanding memory functions.
+- Support C++ `main()`, static constructors/destructors, and normal exit with a retained status.
 
-### 20. First City
-- Run multiple isolated native user processes.
-- One process may fault and die while another continues.
-- Establish the first complete kernel → loader → runtime → process vertical slice.
+### 20. First City ✅
+- Run three independently loaded, isolated native ELF64 processes.
+- Verify distinct backing for identical user addresses; contain one fatal fault, record another program's normal exit, and prove a third continues under preemption.
 
 ## Era III — Native object and service model
 
-### 21. Kernel object and handle manager
-- Represent kernel-owned resources as typed objects.
-- Give user mode validated handles rather than kernel pointers.
+### 21. Kernel object and handle manager ← NEXT
+- Represent kernel-owned resources as typed objects with explicit identity and reference lifetime.
+- Give user mode validated, per-process handles rather than kernel pointers; establish handle closure, rights, and stale-handle protection.
 
 ### 22. Waitable synchronization objects
 - Add events, semaphores, mutexes, and timers.
-- Allow threads to block instead of spin.
+- Allow threads to block and wake without spinning.
 
 ### 23. Shared sections and mapped memory
 - Share memory safely between processes.
@@ -349,23 +349,20 @@ Next: Step 17, native SYSCALL / SYSRET
 - Boot, network, sleep, play audio, accept input, render accelerated graphics, update, and recover.
 - Run useful native software and meaningful Windows/Linux software through native compatibility.
 
+## Inter-era cleanup after Step 20 ✅
+
+This work did not add a numbered feature milestone; it prepared the kernel for Era III:
+
+- Separate initialization orchestration from regression test implementations and long-lived test fixtures.
+- Refine the process launcher and executable-image view; record partial launch failures explicitly.
+- Consolidate native user ELF construction and kernel image embedding.
+- Centralize relevant AMD64 CPU/interrupt-state helpers and split interrupt entry and paging validation where appropriate.
+- Add a noninteractive QEMU smoke test for native runtime, First City, and permanent runtime milestones.
+
+The cleanup preserved externally observable bring-up behavior. Terminated process resource reclamation, SMP-safe synchronization, blocking/idle scheduling, and full UEFI loader restructuring are **not** considered completed by the cleanup.
+
 ## Future research — native zOS filesystem
 
-A custom filesystem is deliberately not assigned a roadmap number yet.
+A custom filesystem is deliberately not assigned a roadmap number yet. It should be designed only after zOS gains real-world experience with existing filesystems and discovers concrete requirements. Potential topics include copy-on-write, checksummed metadata and data, snapshots, compression, cloning, transactional updates, native security metadata, named streams, encryption, and recovery behavior.
 
-It should be designed only after zOS has extensive real-world experience with existing filesystems and knows what its own workloads actually require.
-
-Possible research topics include:
-
-- copy-on-write
-- metadata and data checksums
-- snapshots
-- compression
-- cloning
-- transactional updates
-- native security metadata
-- multiple named streams
-- encryption
-- recovery behavior
-
-The filesystem should exist because zOS has a concrete need, not merely because making one sounds fun.
+A native filesystem should exist because zOS has a demonstrated need, not merely because building one sounds fun.

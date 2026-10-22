@@ -1,324 +1,112 @@
 # zOS Architecture
 
-This document describes the architecture zOS has today and the direction future subsystems should preserve.
-
-It is not a promise that every long-term subsystem already exists.
+This document describes the architecture implemented through Step 20, the inter-era cleanup that followed it, and the boundaries future subsystems should preserve. Planned systems are identified as such; this is not a claim that the whole desktop OS exists.
 
 ## Identity
 
-zOS is a native AMD64 operating system with a UEFI-only boot architecture and an NT-inspired hybrid-kernel design.
+zOS is a native AMD64 operating system booting exclusively through UEFI. It is an original, NT-inspired hybrid-kernel design, not an NT clone or a Unix kernel. The relevant influences are mechanism/policy separation, explicit process and thread objects, typed resources and handles, layered I/O, higher-level Executive facilities, and user-mode services where appropriate.
 
-"NT-inspired" means zOS deliberately learns from ideas such as:
-
-- a small mechanism-oriented kernel core
-- higher-level Executive-style policy
-- typed kernel objects
-- validated handles
-- explicit process and thread objects
-- layered I/O
-- strong user/kernel separation
-- user-mode services where appropriate
-- hardware abstraction that does not leak vendor details upward
-
-It does not mean binary-compatible NT internals, duplicated Windows kernel structures, or a requirement to copy Windows behavior.
-
-zOS remains an original operating system.
-
-## Current implemented architecture
-
-As of Step 16, the boot-to-runtime path is:
+## Implemented boot-to-runtime path
 
 ```text
 UEFI firmware
     ↓
-BOOTX64.EFI
+BOOTX64.EFI → ELF64 Kernel.elf → versioned BootEnvironment handoff
     ↓
-ELF64 kernel loading
+KernelEntry / physical and virtual memory bootstrap
     ↓
-versioned BootEnvironment handoff
+Kernel-owned page tables, guarded permanent stack, heap and metadata
     ↓
-KernelEntry
+GDT / TSS / IDT, ACPI / MADT, CPU features, APIC and clock
     ↓
-physical + virtual memory bootstrap
+GS-based processor-local state / kernel process / threads
     ↓
-kernel-owned page map / CR3
+Round-robin scheduler and timer-driven preemption
     ↓
-interrupts + GDT + TSS + IDT
+Isolated per-process CR3 roots and CPL3 entry
     ↓
-permanent stack / heap / metadata
+Native SYSCALL / SYSRET and ELF64 user executable loading
     ↓
-ACPI + MADT + CPU capability discovery
+Minimal native C++ user runtime and independent process exit/fault handling
     ↓
-local APIC + timer + monotonic clock
+First City: three simultaneously runnable native processes
     ↓
-GS-based processor-local state
-    ↓
-kernel process + kernel threads
-    ↓
-round-robin scheduler + timer preemption
-    ↓
-isolated user process / private CR3
-    ↓
-Ring 3 execution
-    ↓
-user fault containment
-    ↓
-permanent runtime
+Permanent kernel runtime
 ```
 
-The kernel explicitly tracks initialization phases. A phase advance is a statement that the preceding subsystem and its self-tests have completed successfully.
+Initialization advances through explicit kernel phases, verified by bring-up tests. The cleanup after Step 20 separated test cases into `Kernel/Tests/` and test ownership into `Kernel/Tests/Fixtures/` while keeping permanent kernel infrastructure in `KernelRuntime`. The bootstrap still runs these tests deliberately. This is not yet an opt-in or production-disabled test harness.
 
 ## Memory
 
-The physical memory manager owns free physical pages after firmware handoff and boot-memory reclamation.
+The physical memory manager controls managed pages after the firmware handoff and reclamation of eligible boot-services memory. Bootstrap metadata is promoted to permanent storage. Runtime processes have independent page-table roots (CR3); upper-half kernel mappings can be shared, while user mappings are private. The still-low-linked kernel image requires transitional lower-half supervisor mappings within process address spaces.
 
-Boot-time metadata begins in controlled bootstrap storage and is promoted to permanent ownership as the kernel comes online.
+The kernel enforces meaningful mapping permissions: executable user segments are not writable, writable data and stacks are non-executable, user addresses require user-accessible mappings, and stack guards are unmapped. Mapping and metadata validation logic have separate translation-unit boundaries after cleanup; they remain part of the same underlying page-map ownership model.
 
-Runtime process address spaces have independent CR3 roots. Permanent upper-half kernel mappings are shared by reference, while process-private lower-half mappings remain isolated.
+First City confirms that different processes can map the **same user virtual addresses** to **different physical backing**. It does not imply shared memory, copy-on-write, demand paging, or arbitrary memory mapping by applications. Those are future milestones.
 
-The current low-linked kernel image requires transitional lower-half kernel mappings in each process address space. A future higher-half kernel image can remove this special case.
-
-The design requires page permissions to mean something:
-
-- executable user code is not writable
-- writable user data and stacks are not executable
-- user mappings are explicitly user-accessible
-- kernel mappings remain supervisor-only
-- user stack guard pages are intentionally unmapped
-
-Future work should continue toward NX, SMEP, SMAP, ASLR, and related protections where supported.
+The kernel should preserve the invariant that newly created kernel mappings needed by running processes are visible in their address spaces. Updating shared upper-half page-table structures and introducing new top-level branches require deliberate synchronization policies as virtual memory grows.
 
 ## CPU, interrupts, and time
 
-zOS currently supports modern AMD64 interrupt bring-up around the Local APIC and x2APIC where available.
+On the bootstrap processor, zOS discovers AMD64 CPU features, enumerates platform ACPI and MADT information, configures Local APIC/x2APIC where available, and quiesces the legacy 8259 PIC. It establishes an interrupt-vector policy, kernel exception handling, and a timer interrupt used for scheduling.
 
-The legacy 8259 PIC is quiesced rather than allowed to define the interrupt architecture.
+HPET provides a calibration reference; invariant TSC is preferred for monotonic runtime time where supported. Processor-local GS state records the running thread, entry-stack pointer, and local scheduler. Interrupt entry and paging validation have been separated into dedicated implementation units; the shared architectural contracts remain unchanged.
 
-Interrupt vectors are divided into deliberate ranges for CPU exceptions, device interrupts, Local APIC events, IPIs, and spurious delivery.
+`SYSCALL` transitions onto a kernel-owned thread stack without dereferencing an untrusted user stack. `SYSRET` restores validated user state. Architecture entry creates a syscall request while `Kernel/SystemCalls/` handles native dispatch. `SWAPGS` is used on user/kernel privilege transitions where required.
 
-HPET is used as a calibration reference. The invariant TSC is preferred as the runtime monotonic clock source when available.
-
-The Local APIC timer currently drives scheduler preemption.
-
-## Processor-local state
-
-The bootstrap processor has explicit processor-local state accessed through GS.
-
-This state owns processor-specific runtime references such as the current thread and local scheduler.
-
-Ring 3 transitions use the AMD64 `SWAPGS` model so kernel entry restores access to processor-local state and user return restores user GS state.
-
-Future SMP work should extend this per processor rather than replacing it with global scheduler state.
+The current runtime is single-processor. Merely masking interrupts is not a future SMP lock; cross-CPU object and scheduler operations will need explicit synchronization.
 
 ## Processes and threads
 
-A `Process` is not merely a PID.
+`Process` owns or references a PID, lifecycle state, address space, thread membership, and separate normal-exit and fatal-fault records. PID 0 is the kernel process and borrows the kernel page map. Isolated processes own distinct address spaces.
 
-It currently owns or references:
+A `Thread` has a kernel stack, saved context, scheduler state, and exactly one owning process. Current execution states are `Ready`, `Running`, and `Terminated`. The scheduler maintains a round-robin ready queue and switches CR3 and TSS `RSP0` as necessary. Blocking/waiting is not implemented yet.
 
-- process identity
-- lifecycle state
-- an address space
-- intrusive thread membership
-- fatal user-fault information
+`UserProcessInstance` combines ownership of one isolated process, its main thread and loaded image. The reusable launch path prepares the address space, loads a static executable, configures entry/stack, and registers the thread. Executable bytes are supplied through a non-owning image view, rather than coupling the launcher to embedded kernel storage. The current examples are still embedded, because no filesystem exists.
 
-PID 0 is the kernel process and borrows the permanent kernel page map.
+Launcher state explicitly distinguishes success and partial failure; **fully transactional rollback and recycling are not implemented**. Terminating a thread removes it from scheduling and records process completion, but it does not safely reclaim a still-active kernel stack. Current tests retain process objects, stacks, executable backing and page-table resources after termination. The object and handle model must build on that distinction rather than assuming a dead thread immediately implies an unreferenced object.
 
-An isolated process owns an independent runtime page map.
+## Native userspace
 
-Threads own execution state and kernel stacks. The scheduler operates on threads, while each thread belongs to exactly one process.
+The AMD64 native syscall ABI uses `RAX` for syscall number/return value; `RDI`, `RSI`, `RDX`, `R10`, `R8`, and `R9` for up to six arguments; and `RCX`/`R11` as architectural clobbers. A shared zOS ABI definition separates syscall numbering from kernel dispatch and user-mode wrappers.
 
-Current thread states are deliberately small:
+The implemented native syscall surface is intentionally small:
 
-```text
-Ready
-Running
-Terminated
-```
+- `GetProcessId`: query the calling process identity.
+- `ExitProcess`: terminate the calling single-threaded user process and preserve its exit status.
 
-More states should appear only when a real blocking or lifecycle mechanism requires them.
+The static ELF64 loader validates executable format and segment permissions, installs a user stack and guard page, and establishes a user entry point. The minimal freestanding `User/Runtime` supplies `_start`, C++ static initialization and termination, `main()`, syscall wrappers, and basic memory operations. It does not supply libc, heap allocation for user programs, dynamic modules, TLS, exceptions, a native SDK, or a generic process-creation syscall.
 
-## Scheduling
+The Step 19 regression executable verifies basic user startup, syscall round trips, stack/register preservation, destructor execution, and a normal exit. First City exercises three independent ELFs: one exits with a known status, another faults in CPL3 without taking down the kernel, and a third continues making progress under timer preemption. These are development fixtures, not installed system services.
 
-The current scheduler is a round-robin scheduler bound to processor-local state. It currently runs on the bootstrap processor; the ownership model is intended to extend per processor when SMP arrives.
+## Tests and ownership
 
-It supports:
+`Kernel/Initialization` owns initialization ordering. `Kernel/Tests` owns the tests themselves, and `Kernel/Tests/Fixtures` holds their long-lived objects separate from permanent subsystem state. This separation does not yet mean fixtures can be safely unloaded: their lifetimes must remain valid while scheduling or diagnostics could reference them.
 
-- explicit ready queues
-- cooperative yield
-- timer-driven preemption
-- CR3 switching across process boundaries
-- TSS `RSP0` synchronization with the running thread
-- non-returning termination of a fatal user thread
+`Tools/SmokeTest.py` runs a noninteractive QEMU boot of a selected Debug/Release configuration and checks expected runtime and First City diagnostic milestones. It complements build-time ELF/PE verification. It does not prove general hardware compatibility, security, or sustained multiprocess stress stability.
 
-Preemption saves a thread and makes it runnable again.
+## Next: native object and handle model (Era III)
 
-Termination abandons the faulting interrupt frame on the dead thread's kernel stack, marks the thread terminated, selects another ready thread, and never returns through `IRETQ` to invalid userspace state.
+Step 21 will introduce typed kernel-owned objects and process-local validated handles, not expose raw kernel pointers to user programs. Important distinct concepts include object identity, reference lifetime, handle ownership, handle generation/stale-handle protection, type validation, and rights checks. An object can outlive a handle, and a terminated process's observable identity can outlive its execution resources.
 
-## Ring 3
+Subsequent planned Era III work introduces waitable synchronization objects, shared sections and mappings, IPC, supervised user-mode services, and identities/security enforcement. None of those facilities are implemented merely by completing First City.
 
-zOS currently enters Ring 3 through an `IRETQ` frame containing user CS, SS, RSP, RIP, and RFLAGS.
+## Modules, drivers, and I/O (planned)
 
-User threads have:
+The future module loader should distinguish logical module **identity** from physical implementation. Native DLLs, privileged driver modules, and compatibility implementation modules may share relocations/imports concepts without sharing trust rules.
 
-- a validated executable entry mapping
-- a validated writable non-executable stack
-- TSS `RSP0` pointing at the thread's kernel stack
-- conditional `SWAPGS` on privilege-changing interrupt entry and return
+Hardware consumers should depend on standardized capabilities (`BlockDevice`, `NetworkAdapter`, `GraphicsAdapter`, `InputDevice`, `AudioDevice`) rather than vendor-specific classes. Device discovery, driver selection, dependencies, DMA/IOMMU and the storage boot package belong to later Eras. See [Driver and I/O Direction](DriverAndIO.md).
 
-Step 16 proves that a deliberate user page fault can terminate the user process while the kernel and remaining scheduler continue running.
+## Files, namespaces, and compatibility (planned)
 
-The next architectural addition is native `SYSCALL` / `SYSRET`.
+Native file objects should not inherit Unix inode semantics by default. Expected concepts include volumes, file and directory objects, streams, metadata, filesystem implementations, and a native object namespace. Windows/Linux paths and module names can later be presented as views over the same native facilities.
 
-## Native API direction
-
-The native zOS ABI must remain smaller and more coherent than any compatibility surface built above it.
-
-The AMD64 syscall entry path should gather architectural state into a neutral syscall context, determine the calling process, and dispatch through the appropriate ABI without embedding foreign syscall tables directly into architecture entry code.
-
-Native zOS facilities should eventually include general primitives such as:
-
-- objects and handles
-- processes and threads
-- sections and mapped memory
-- files and devices
-- events, semaphores, timers, and waits
-- ports/messages for IPC
-- asynchronous I/O
-- security tokens and access checks
-
-These primitives should be expressive enough that compatibility layers can translate foreign APIs onto them.
-
-## Object and handle model
-
-The long-term object manager is one of the most important NT-inspired pieces of zOS.
-
-Kernel resources should become typed objects with explicit lifetime and access semantics. User mode should receive validated handles rather than kernel pointers.
-
-Likely object categories include:
-
-```text
-Process
-Thread
-Section
-File
-Directory
-Device
-Driver
-Event
-Semaphore
-Timer
-Port
-SecurityToken
-ObjectDirectory
-SymbolicLink
-```
-
-The exact type system should emerge from implemented features rather than be created as a speculative hierarchy all at once.
-
-## Services and IPC
-
-Not every operating-system facility belongs in the kernel.
-
-zOS should eventually support privileged user-mode system services backed by strong IPC, shared sections, waitable objects, and security boundaries.
-
-This is especially attractive for service management, desktop/session components, higher-level driver helpers, graphics services, and compatibility infrastructure.
-
-The kernel should expose mechanisms; services can own policy where practical.
-
-## Modules
-
-The long-term module system should support a common low-level foundation for:
-
-- native user DLLs
-- kernel driver modules
-- compatibility implementation modules
-
-These module classes may have different trust rules and load paths even if they share concepts such as imports, exports, relocation, version metadata, and dependencies.
-
-A central architectural rule is:
-
-> Module identity is not required to equal physical implementation.
-
-That rule enables future Windows and Linux compatibility contracts without creating one forwarding library for every foreign module name.
-
-## Drivers
-
-Hardware consumers should depend on standardized capabilities, not vendor classes.
-
-Examples:
-
-```text
-BlockDevice
-NetworkAdapter
-GraphicsAdapter
-InputDevice
-AudioDevice
-```
-
-A driver binds to hardware and publishes one or more interfaces. Higher layers use those interfaces without checking PCI vendor IDs themselves.
-
-A future device/driver manager will discover hardware, match drivers, resolve dependencies, and load the minimum required module set.
-
-See `DriverAndIO.md`.
-
-## Files and namespaces
-
-The native file model should not inherit Unix inode semantics merely because they are familiar.
-
-The intended vocabulary is closer to:
-
-```text
-Volume
-FileObject
-DirectoryObject
-FileHandle
-Stream
-FileInformation
-FileIdentity
-Filesystem
-```
-
-Filesystem drivers implement storage formats beneath that abstraction.
-
-The namespace may expose native object paths while compatibility layers present Windows or Linux path views over the same underlying objects.
-
-## Compatibility boundary
-
-Compatibility is intended to be one of zOS's defining features, but it must remain layered.
-
-Preferred:
-
-```text
-foreign API / ABI
-      ↓
-translation
-      ↓
-native zOS API
-      ↓
-kernel / services
-```
-
-Avoid:
-
-```text
-foreign API
-      ↓
-fake foreign userspace
-      ↓
-fake foreign kernel
-      ↓
-zOS
-```
-
-Direct foreign syscalls may require ABI adapters, but they should still converge immediately onto native zOS operations.
-
-See `Compatibility.md`.
+Foreign APIs should translate onto native zOS APIs rather than inserting Windows/Linux syscall tables into architecture-entry code or reimplementing a second scheduler, process model, or kernel. See [Native Compatibility](Compatibility.md).
 
 ## Repository rule
 
-The repository should grow only when the implementation needs a new ownership boundary.
+The repository should grow when implementation requires a genuine ownership boundary:
 
 > A file represents a concept you naturally search for by name. A directory represents an ownership boundary.
 
-Avoid generic dumping grounds such as `Helpers`, `Common`, or `Managers` unless they truly represent a coherent owned subsystem.
+Avoid speculative interface hierarchies and generic dumping grounds. Explicit ownership and failure behavior take priority over cosmetic abstraction.

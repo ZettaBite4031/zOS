@@ -1,295 +1,137 @@
 # zOS Development
 
-This document describes the development environment and build behavior of the current repository.
+This document describes the current repository, development toolchain, build commands, and verification workflow after the inter-era cleanup following Step 20.
 
 ## Tested host
 
-The primary development host is:
+The primary development host is Ubuntu 22.04 under WSL2, x86-64, with the repository in the Linux filesystem (for example, `~/Projects/zOS`). Building from `/mnt/c/...` is discouraged because Windows-mounted filesystems can be slower and less predictable for Linux tooling. Native Ubuntu may work but is not the primary verified setup.
 
-```text
-Ubuntu 22.04
-WSL2
-x86-64 host
-repository stored in the WSL Linux filesystem
-```
+## Toolchain and setup
 
-Recommended checkout location:
+`Tools/SetupDevEnv.sh` prepares repository-local state under `.zos/`:
 
-```text
-~/Projects/zOS
-```
+- LLVM / Clang 22.1.8
+- SCons 4.10.1
+- supporting QEMU, OVMF, GDB and Python tooling
 
-Building from `/mnt/c/...` is discouraged because the Windows-mounted filesystem is slower and has less predictable Linux filesystem behavior.
-
-Native Ubuntu may work, but WSL2 on Ubuntu 22.04 is the currently tested setup.
-
-## Toolchain
-
-`Tools/SetupDevEnv.sh` creates repository-local development state under:
-
-```text
-.zos/
-```
-
-The current pinned major tools are:
-
-```text
-LLVM / Clang 22.1.8
-SCons 4.10.1
-```
-
-The setup also locates or installs supporting host tools such as QEMU, OVMF, GDB, and Python 3.
-
-`.zos/` is development-machine state and must not be committed.
-
-## Setup
+`.zos/` is local developer state and must not be committed.
 
 ```bash
 chmod +x Tools/SetupDevEnv.sh
 ./Tools/SetupDevEnv.sh
-```
-
-Verify an existing environment without reinstalling:
-
-```bash
 ./Tools/SetupDevEnv.sh --verify-only
-```
-
-or:
-
-```bash
+# Alternatively:
 ./Tools/VerifyDevEnv.py
-```
-
-Force a clean LLVM download when necessary:
-
-```bash
+# Re-download LLVM when required:
 ./Tools/SetupDevEnv.sh --force-llvm
 ```
 
-## Build commands
-
-Default Debug build:
+## Build and run commands
 
 ```bash
 ./Build.py build
-```
-
-Parallel build:
-
-```bash
 ./Build.py build -j8
-```
-
-Release build:
-
-```bash
 ./Build.py build Configuration=Release
-```
-
-Verify image formats:
-
-```bash
 ./Build.py verify
-```
-
-Run in QEMU:
-
-```bash
 ./Build.py run
-```
-
-Start the debugger workflow:
-
-```bash
 ./Build.py debug
-```
-
-The debug action builds the image, starts QEMU paused with a GDB server, launches GDB against `Kernel.elf`, sets a temporary breakpoint at `KernelMain`, connects, and continues to the breakpoint.
-
-The default GDB port is `1234`.
-
-```bash
 ./Build.py debug GdbPort=1235
-```
-
-Clean outputs:
-
-```bash
 ./Build.py clean
 ```
 
+Debug is the default configuration. `debug` builds the image, starts QEMU paused with its GDB server, attaches GDB to `Kernel.elf`, and breaks at `KernelMain`; the default port is `1234`.
+
+Run the automated boot regression test with:
+
+```bash
+python3 Tools/SmokeTest.py --configuration Debug
+python3 Tools/SmokeTest.py --configuration Release
+python3 Tools/SmokeTest.py --configuration Debug --timeout 60
+```
+
+The smoke test builds the requested configuration, starts QEMU headlessly, captures boot diagnostics, and checks for the native runtime, First City, and permanent runtime success markers while rejecting kernel fatal diagnostics. The guest intentionally remains running; a QEMU timeout is expected, provided all required milestones were observed. The smoke test is not a comprehensive stress or real-hardware test.
+
 ## Build outputs
 
-Artifacts are generated under:
+Generated files live under:
 
 ```text
 Output/<Configuration>/AMD64/
+├── Boot/UEFI/BOOTX64.EFI
+├── Kernel/Kernel.elf
+├── User/FirstProgram/FirstProgram.elf
+├── User/CityExit/CityExit.elf
+├── User/CityFault/CityFault.elf
+├── User/CitySurvivor/CitySurvivor.elf
+├── ESP/EFI/BOOT/BOOTX64.EFI
+├── ESP/zOS/Kernel.elf
+└── Verification/
 ```
 
-A normal build contains at least:
+Object and generated-source subdirectories may also appear. QEMU boots using the staged ESP tree and OVMF.
 
-```text
-Boot/UEFI/BOOTX64.EFI
-Kernel/Kernel.elf
-ESP/EFI/BOOT/BOOTX64.EFI
-ESP/zOS/Kernel.elf
-Verification/
-```
+## Separate target environments
 
-QEMU runs use the staged ESP tree and OVMF firmware.
+`SConstruct` sets up distinct UEFI, kernel and native userspace construction environments in `BuildSystem/Environments.py`.
 
-## Build separation
+### UEFI application
 
-The UEFI loader and kernel intentionally use different construction environments.
+The loader is compiled for `x86_64-pc-win32-coff`, freestanding C++23 and the UEFI ABI (`-fshort-wchar`), without host runtime dependencies. LLD's COFF linker produces a PE32+ EFI application with `EfiMain` as its entry point.
 
-### UEFI target
+### AMD64 kernel
 
-The loader is compiled as x86-64 COFF/PE with UEFI-specific ABI requirements.
+The kernel is compiled for `x86_64-unknown-none-elf`, freestanding C++23, without exceptions, RTTI, stack protector, hosted startup, PIC or PIE. It uses `-mno-red-zone` and avoids MMX/SSE use in the baseline execution environment, with warnings promoted to errors. LLD produces a static ELF64 image from `Kernel/Linker.ld` with entry symbol `KernelEntry`.
 
-Important compiler properties include:
+### Native user executables
 
-```text
---target=x86_64-pc-win32-coff
--std=c++23
--ffreestanding
--fshort-wchar
--fno-exceptions
--fno-rtti
--fno-stack-protector
-```
+`User/Runtime` is the small, separately compiled userspace support library. `BuildSystem/UserImages.py` consolidates native user ELF build rules and runtime-object reuse, while `SConstruct` wires the FirstProgram regression executable and the three City variants into the build. A generalized kernel embedding generator packages the resulting ELF files into the kernel for early bring-up. Embedded binaries are a temporary image source, not a requirement of the general process-launching model.
 
-It is linked as an EFI application with `lld-link`.
-
-### Kernel target
-
-The kernel is a freestanding ELF64 AMD64 target.
-
-Current baseline flags include:
-
-```text
---target=x86_64-unknown-none-elf
--std=c++23
--ffreestanding
--fno-exceptions
--fno-rtti
--fno-stack-protector
--fno-threadsafe-statics
--fno-use-cxa-atexit
--fno-pic
--fno-pie
--ffunction-sections
--fdata-sections
--mno-red-zone
--mno-mmx
--mno-sse
--mno-sse2
--Wall
--Wextra
--Wpedantic
--Werror
-```
-
-The kernel is linked statically with LLD using `Kernel/Linker.ld` and `KernelEntry` as the ELF entry symbol.
+The first user programs are static AMD64 ELF64 executables linked at fixed virtual addresses. The loader enforces segment permissions and expects a freestanding ABI. They do not rely on dynamic libraries or a host libc. User-image build flags differ from kernel flags where appropriate; the native C++ runtime provides `_start` and other required helpers.
 
 ## Debug and Release
 
-Debug adds:
+Debug currently adds `-O0 -g -fno-omit-frame-pointer`. Release adds `-O2 -g`; Release still retains debug symbols. Build and smoke-test both configurations after changes that affect calling conventions, memory maps, scheduling or executable startup.
+
+## Verification layers
+
+**Build-time format verification** checks the EFI application format/subsystem, the kernel ELF64 format and `KernelEntry`, and each native user ELF format and `_start` symbol.
+
+**Kernel self-tests** verify allocator operations, W^X and page-table behavior, boot-memory reclamation, memory-metadata promotion, exception entry, CPU-local access, scheduling and timer preemption, per-process memory isolation, user syscall return, native C++ startup/shutdown, normal exit, fatal CPL3 page-fault containment, and survival of unrelated processes.
+
+**QEMU smoke testing** checks that the integrated boot reaches expected milestones. A successful smoke run does not replace code review, failure-path tests, extensive concurrency stress, or physical-hardware validation.
+
+## Initialization, tests, and fixtures
+
+After the inter-era cleanup, code is organized by responsibility:
 
 ```text
--O0
--g
--fno-omit-frame-pointer
+Kernel/Initialization/          # State establishment, dependency ordering, boot orchestration
+Kernel/Tests/                   # Bring-up and regression test cases
+Kernel/Tests/Fixtures/          # Long-lived test-only process and thread ownership
+Kernel/Processes/               # Process lifecycle and reusable launching
+Kernel/Executables/             # Executable image view and ELF loading
+Kernel/Architecture/AMD64/      # CPU-specific entry, interrupts, mapping and instructions
 ```
 
-Release currently adds:
-
-```text
--O2
--g
-```
-
-Release still retains debug information.
-
-## Verification
-
-The build verifies generated artifacts rather than trusting linker success alone.
-
-The UEFI image is checked for:
-
-- `COFF-x86-64`
-- EFI application subsystem
-
-The kernel is checked for:
-
-- `elf64-x86-64`
-- `x86_64`
-- the expected entry symbol
-
-These checks are part of the normal build dependency graph.
-
-## QEMU-first development
-
-QEMU and OVMF are the primary bring-up environment.
-
-Temporary QEMU-specific mechanisms are acceptable when they are localized bring-up tools rather than architecture requirements.
-
-When a subsystem becomes permanent, its interfaces should remain suitable for real hardware even if QEMU is the first implementation target.
+Tests still run during bootstrap. Their ownership is deliberately separate from production kernel services, but test processes and their resources must remain alive if scheduler or diagnostic references remain. The current kernel does not yet have safe general teardown or reclamation of terminated user process resources.
 
 ## Coding direction
 
-The kernel uses compact, explicit C++ rather than framework-style abstraction.
+Prefer explicit dependencies, ownership, error enums, clear architectural boundaries, deliberate failure paths, and regression tests for critical invariants. Use compact freestanding C++ rather than framework-style abstractions. Avoid speculative interfaces, generic helper repositories, surprising allocation, exceptions in kernel control flow, and assumptions that a local interrupt mask is sufficient for SMP synchronization.
 
-Prefer:
-
-- clear ownership
-- small public APIs
-- explicit error enums where failure is expected
-- no allocation hidden inside surprising helpers
-- architecture-specific code inside architecture boundaries
-- runtime validation during bring-up
-- self-tests that prove important invariants
-
-Avoid:
-
-- generic `Helper` collections
-- speculative interfaces with no current implementation
-- tiny-file bureaucracy
-- exception-driven kernel control flow
-- host-runtime dependencies
-- cleverness that hides lifetime or privilege transitions
-
-## Self-tests
-
-Current initialization intentionally performs substantial runtime validation, including:
-
-- allocator and mapping validation
-- permanent metadata promotion
-- boot-memory reclamation
-- interrupt entry/return
-- processor-local access
-- thread context switching
-- scheduler rotation
-- timer preemption
-- process address-space isolation
-- Ring 3 execution
-- CPL3 timer entry
-- user page-fault containment
-
-These tests are executable statements of architectural invariants and should remain useful as the kernel evolves.
+The low-level runtime uses consolidated AMD64 helpers where appropriate. A launch failure state is explicit, but partial-resource rollback is not yet a universal guarantee. When modifying lifecycle logic, distinguish process termination, thread descheduling, object reference lifetime, and reclamation.
 
 ## Commit discipline
 
-Milestone commits should be short enough to scan.
-
-Preferred:
+Keep milestone commits easy to scan:
 
 ```text
-Add user fault isolation
+Add native multiprocess execution
 
-- Contain fatal CPL3 exceptions without halting the kernel
-- Terminate the faulting process and thread
-- Verify scheduling continues after the user fault
+- Add reusable user process launching
+- Build and embed independent ELF64 applications
+- Verify memory isolation and process lifecycle behavior
+- Confirm scheduling survives normal exits and fatal user faults
 ```
 
-Avoid changelog-sized commit bodies for ordinary milestones.
+Save longer retrospectives for release or Era-level documentation rather than turning ordinary commits into changelogs.
