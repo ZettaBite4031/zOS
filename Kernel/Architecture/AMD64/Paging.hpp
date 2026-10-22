@@ -37,6 +37,24 @@ namespace Zos::Kernel::Architecture::AMD64 {
         RollbackFailed,
     };
 
+    enum class PageMapKernelMappingInstallError : Memory::Uint32 {
+        Success,
+        NotInitialized,
+        InvalidSource,
+        DestinationNotEmpty,
+        UnsupportedLargePage,
+        MappingFailed,
+        ValidationFailed,
+    };
+
+    enum class PageMapSwitchError : Memory::Uint32 {
+        Success,
+        NotInitialized,
+        InvalidState,
+        InterruptsEnabled,
+        RootTableMismatch,
+    };
+
     enum class MappingError : Memory::Uint32 {
         Success,
         NotInitialized,
@@ -70,6 +88,10 @@ namespace Zos::Kernel::Architecture::AMD64 {
         PageMap& operator=(const PageMap&) = delete;
 
         [[nodiscard]] PageMapInitializationError Initialize(Memory::PhysicalMemoryManager& physical_memory, Memory::BootstrapMetadataArena& metadata) noexcept;
+        [[nodiscard]] PageMapInitializationError InitializeRuntime(Memory::PhysicalMemoryManager& physical_memory) noexcept;
+        [[nodiscard]] PageMapKernelMappingInstallError InstallKernelMappingsFrom(const PageMap& kernel_page_map) noexcept;
+
+        [[nodiscard]] PageMapSwitchError SwitchTo() noexcept;
         [[nodiscard]] PageMapActivationError Activate() noexcept;
         [[nodiscard]] PageMapMetadataPromotionError PromoteMetadata() noexcept;
 
@@ -82,7 +104,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] bool Validate() const noexcept;
 
         [[nodiscard]] bool IsInitialized() const noexcept { return !m_RootTable.IsNull(); }
-        [[nodiscard]] bool IsActive() const noexcept { return m_Active; }
+        [[nodiscard]] bool IsActive() const noexcept { return IsInitialized() && CurrentRootTable() == m_RootTable; }
         [[nodiscard]] bool IsMetadataPromoted() const noexcept { return m_MetadataPromoted; }
         [[nodiscard]] Memory::PhysicalAddress RootTable() const noexcept { return m_RootTable; }
         [[nodiscard]] const PageMapStatistics& Statistics() const noexcept { return m_Statistics; }
@@ -95,10 +117,16 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] static const char* Describe(PageMapInitializationError error) noexcept;
         [[nodiscard]] static const char* Describe(PageMapActivationError error) noexcept;
         [[nodiscard]] static const char* Describe(PageMapMetadataPromotionError error) noexcept;
+        [[nodiscard]] static const char* Describe(PageMapKernelMappingInstallError error) noexcept;
+        [[nodiscard]] static const char* Describe(PageMapSwitchError error) noexcept;
         [[nodiscard]] static const char* Describe(MappingError error) noexcept;
 
     private:
         using Entry = Memory::Uint64;
+
+        [[nodiscard]] static Memory::VirtualAddress ComposeVirtualAddress(Memory::Uint64 pml4, Memory::Uint64 pdpt, Memory::Uint64 pd, Memory::Uint64 pt) noexcept;
+
+        [[nodiscard]] bool OwnsOrSharesTable(Memory::PhysicalAddress address) const noexcept;
 
         inline static constexpr Memory::Uint64 EntriesPerTable{ 512 };
         inline static constexpr Memory::Uint64 AddressMask{ 0x000FFFFFFFFFF000ULL };
@@ -185,10 +213,11 @@ namespace Zos::Kernel::Architecture::AMD64 {
         [[nodiscard]] bool RollbackResolution(TableResolution& resolution) noexcept;
         void RecycleTableRecord(TableRecord& record) noexcept;
 
-        bool m_Active{};
+        bool m_DirectMapAccess{};
         bool m_MetadataPromoted{};
         Memory::PhysicalMemoryManager* m_PhysicalMemory{};
         Memory::BootstrapMetadataArena* m_BootstrapMetadata{};
+        const PageMap* m_KernelPageMap{};
         Memory::PhysicalAddress m_RootTable{};
         TableRecord* m_TableRecords{};
         TableRecord* m_RecycledTableRecords{};

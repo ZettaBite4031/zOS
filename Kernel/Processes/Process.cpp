@@ -4,11 +4,52 @@
 #include <Kernel/Scheduling/Thread.hpp>
 
 namespace Zos::Kernel::Processes {
-    ProcessInitializationError Process::InitializeKernel(ProcessId id) noexcept {
-        if (m_Initialized) return ProcessInitializationError::AlreadyInitialized;
+    ProcessInitializationError Process::InitializeKernel(ProcessId id, Architecture::AMD64::PageMap& kernel_page_map) noexcept {
+        if (m_Initialized || m_PageMap != nullptr) return ProcessInitializationError::AlreadyInitialized;
+        if (!kernel_page_map.IsInitialized() || !kernel_page_map.IsMetadataPromoted() || !kernel_page_map.IsActive())
+            return ProcessInitializationError::InvalidDependency;
 
         m_Id = id;
         m_State = ProcessState::Active;
+
+        m_PageMap = &kernel_page_map;
+        m_OwnsPageMap = false;
+
+        m_ThreadHead = nullptr;
+        m_ThreadTail = nullptr;
+        m_ThreadCount = 0;
+
+        m_Initialized = true;
+
+        Print();
+        return ProcessInitializationError::Success;
+    }
+
+    ProcessInitializationError Process::InitializeIsolated(ProcessId id, Memory::PhysicalMemoryManager& physical_memory, const Architecture::AMD64::PageMap& kernel_page_map) noexcept {
+        if (m_Initialized || m_PageMap != nullptr || m_OwnedPageMap.IsInitialized())
+            return ProcessInitializationError::AlreadyInitialized;
+
+        if (!physical_memory.IsInitialized() || !physical_memory.IsMetadataAccessPromoted() ||
+            !kernel_page_map.IsInitialized() || !kernel_page_map.IsMetadataPromoted())
+            return ProcessInitializationError::InvalidDependency;
+
+        const auto initialization_error = m_OwnedPageMap.InitializeRuntime(physical_memory);
+
+        if (initialization_error != Architecture::AMD64::PageMapInitializationError::Success)
+            return ProcessInitializationError::AddressSpaceInitializationFailed;
+
+        const auto install_error = m_OwnedPageMap.InstallKernelMappingsFrom(kernel_page_map);
+        if (install_error != Architecture::AMD64::PageMapKernelMappingInstallError::Success)
+            return ProcessInitializationError::KernelMappingInstallFailed;
+
+        if (!m_OwnedPageMap.Validate() || m_OwnedPageMap.RootTable() == kernel_page_map.RootTable())
+            return ProcessInitializationError::KernelMappingInstallFailed;
+
+        m_Id = id;
+        m_State = ProcessState::Active;
+
+        m_PageMap = &m_OwnedPageMap;
+        m_OwnsPageMap = true;
 
         m_ThreadHead = nullptr;
         m_ThreadTail = nullptr;
@@ -48,7 +89,8 @@ namespace Zos::Kernel::Processes {
     }
 
     void Process::Print() const noexcept {
-        Diagnostics::Write("[zOS/Process] Kernel process initialized.\n");
+        Diagnostics::Write(m_OwnsPageMap ? "[zOS/Process] Isolated process initialized.\n" : "[zOS/Process] Kernel process initialized.\n");
+
         Diagnostics::Write("[zOS/Process] Process ID: ");
         Diagnostics::WriteDecimal(m_Id);
         Diagnostics::Write("\n");
@@ -56,6 +98,14 @@ namespace Zos::Kernel::Processes {
         Diagnostics::Write("[zOS/Process] State: ");
         Diagnostics::Write(StateName(m_State));
         Diagnostics::Write("\n");
+
+        if (m_PageMap != nullptr) {
+            Diagnostics::Write("[zOS/Process] Address-space ownership: ");
+            Diagnostics::Write(m_OwnsPageMap ? "owned\n" : "borrowed\n");
+            Diagnostics::Write("[zOS/Process] CR3 root: ");
+            Diagnostics::WriteHex(m_PageMap->RootTable().Value());
+            Diagnostics::Write("\n");
+        }
     }
 
     const char* Process::StateName(ProcessState state) noexcept {
@@ -71,6 +121,9 @@ namespace Zos::Kernel::Processes {
         switch (error) {
         case ProcessInitializationError::Success: return "success";
         case ProcessInitializationError::AlreadyInitialized: return "process is already initialized";
+        case ProcessInitializationError::InvalidDependency: return "process initialization dependency is invalid";
+        case ProcessInitializationError::AddressSpaceInitializationFailed: return "failed to initialize the process address space";
+        case ProcessInitializationError::KernelMappingInstallFailed: return "failed to install permanent kernel mappings into the process";
         default: return "unknown process initialization error";
         }
     }

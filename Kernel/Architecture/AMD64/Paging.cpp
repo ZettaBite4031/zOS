@@ -189,11 +189,22 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
     PageMap::Entry* PageMap::TablePointer(PhysicalAddress address) const noexcept {
         if (address.IsNull() || !address.IsPageAligned()) return nullptr;
-        if (!m_Active) return reinterpret_cast<Entry*>(address.Value());
+        if (!m_DirectMapAccess) return reinterpret_cast<Entry*>(address.Value());
         if (!Layout::IsDirectMappable(address)) return nullptr;
         return reinterpret_cast<Entry*>(Layout::DirectMapAddress(address).Value());
     }
 
+    VirtualAddress PageMap::ComposeVirtualAddress(Uint64 pml4, Uint64 pdpt, Uint64 pd, Uint64 pt) noexcept {
+        Uint64 value = (pml4 << 39) | (pdpt << 30) | (pd << 21) | (pt << 12);
+        if ((pml4 & 0x100ULL) != 0) value |= 0xFFFF000000000000ULL;
+        return VirtualAddress(value);
+    }
+
+    bool PageMap::OwnsOrSharesTable(PhysicalAddress address) const noexcept {
+        if (FindTableRecord(address) != nullptr) return true;
+        return m_KernelPageMap != nullptr && m_KernelPageMap != this &&
+            m_KernelPageMap->FindTableRecord(address) != nullptr;
+    }
 
     bool PageMap::MoveOwnership(PhysicalAllocation& destination, PhysicalAllocation& source) noexcept {
         if (destination.IsValid() || !source.IsValid()) return false;
@@ -215,7 +226,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
     }
 
     bool PageMap::AllocateMetadataPage(MetadataPool& pool) noexcept {
-        if (!m_Active || m_PhysicalMemory == nullptr || !m_PhysicalMemory->IsInitialized() || !m_PhysicalMemory->IsMetadataAccessPromoted()) return false;
+        if (!m_DirectMapAccess  || m_PhysicalMemory == nullptr || !m_PhysicalMemory->IsInitialized() || !m_PhysicalMemory->IsMetadataAccessPromoted()) return false;
 
         PhysicalAllocation allocation{};
         if (m_PhysicalMemory->AllocatePage(allocation) != PhysicalAllocationError::Success) return false;
@@ -411,6 +422,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         m_BootstrapMetadata = &metadata;
         m_MetadataPromoted = false;
         m_PermanentMetadata = {};
+        m_KernelPageMap = nullptr;
+        m_DirectMapAccess = false;
 
         PhysicalAddress root{};
         const PageMapInitializationError error = AllocateTable(root);
@@ -424,9 +437,136 @@ namespace Zos::Kernel::Architecture::AMD64 {
         return PageMapInitializationError::Success;
     }
 
+    PageMapInitializationError PageMap::InitializeRuntime(PhysicalMemoryManager& physical_memory) noexcept {
+        if (IsInitialized()) return PageMapInitializationError::AlreadyInitialized;
+        if (!physical_memory.IsInitialized() || !physical_memory.IsMetadataAccessPromoted())
+            return PageMapInitializationError::InvalidDependency;
+            
+        m_PhysicalMemory = &physical_memory;
+        m_BootstrapMetadata = nullptr;
+        m_KernelPageMap = nullptr;
+
+        m_MetadataPromoted = true;
+        m_DirectMapAccess = true;
+        m_PermanentMetadata = {};
+
+        PhysicalAddress root{};
+        const PageMapInitializationError error = AllocateTable(root);
+        if (error != PageMapInitializationError::Success) {
+            if (m_PermanentMetadata.Head != nullptr)
+                (void)DestroyMetadataPool(m_PermanentMetadata);
+
+            m_PhysicalMemory = nullptr;
+            m_MetadataPromoted = false;
+            m_DirectMapAccess = false;
+            m_TableRecords = nullptr;
+            m_RecycledTableRecords = nullptr;
+            return error;
+        }
+
+        m_RootTable = root;
+
+        if (!Validate())
+            return PageMapInitializationError::MetadataAllocationFailed;
+        return PageMapInitializationError::Success;
+    }
+
+    PageMapKernelMappingInstallError PageMap::InstallKernelMappingsFrom(const PageMap& kernel_page_map) noexcept {
+        if (!IsInitialized() || !m_MetadataPromoted || !m_DirectMapAccess)
+            return PageMapKernelMappingInstallError::NotInitialized;
+
+        if (&kernel_page_map == this || !kernel_page_map.IsInitialized() ||
+            !kernel_page_map.IsMetadataPromoted() || !kernel_page_map.m_DirectMapAccess)
+            return PageMapKernelMappingInstallError::InvalidSource;
+
+        if (m_Statistics.TablePages != 1 || m_Statistics.MappedPages != 0 || m_KernelPageMap != nullptr)
+            return PageMapKernelMappingInstallError::DestinationNotEmpty;
+
+        Entry* destination_root = TablePointer(m_RootTable);
+        const Entry* source_root = kernel_page_map.TablePointer(kernel_page_map.m_RootTable);
+        if (destination_root == nullptr || source_root == nullptr)
+            return PageMapKernelMappingInstallError::InvalidSource;
+
+        /*
+         * The upper half contains the permanent direct map, kernel dynamic
+         * mappings, stacks, MMIO, and other kernel-owned virtual regions.
+         *
+         * Share those PML4 branches so later kernel mappings inside an existing
+         * branch become visible to every process automatically.
+         */
+        m_KernelPageMap = &kernel_page_map;
+        for (Uint64 index = 256; index < EntriesPerTable; index++)
+            destination_root[index] = source_root[index];
+
+        /*
+         * The current kernel image is still linked low. Lower-half kernel leaves
+         * therefore cannot share their page-table branches with user mappings.
+         * Reproduce only non-user leaves into this process's private hierarchy.
+         */
+        for (Uint64 pml4 = 0; pml4 < 256; pml4++) {
+            if ((source_root[pml4] & Present) == 0) continue;
+            if ((source_root[pml4] & LargePage) != 0)
+                return PageMapKernelMappingInstallError::UnsupportedLargePage;
+
+            MappingError walk_error = MappingError::Success;
+            const Entry* pdpt = kernel_page_map.ResolveExistingNextTable(source_root, pml4, walk_error);
+            if (pdpt == nullptr)
+                return PageMapKernelMappingInstallError::InvalidSource;
+
+            for (Uint64 pdpt_index = 0; pdpt_index < EntriesPerTable; pdpt_index++) {
+                if ((pdpt[pdpt_index] & Present) == 0) continue;
+                if ((pdpt[pdpt_index] & LargePage) != 0) 
+                    return PageMapKernelMappingInstallError::UnsupportedLargePage;
+
+                const Entry* pd = kernel_page_map.ResolveExistingNextTable(pdpt, pdpt_index, walk_error);
+                if (pd == nullptr)
+                    return PageMapKernelMappingInstallError::InvalidSource;
+
+                for (Uint64 pd_index = 0; pd_index < EntriesPerTable; pd_index++) {
+                    if ((pd[pd_index] & Present) == 0) continue;
+                    if ((pd[pd_index] & LargePage) != 0)
+                        return PageMapKernelMappingInstallError::UnsupportedLargePage;
+
+                    const Entry* pt = kernel_page_map.ResolveExistingNextTable(pd, pd_index, walk_error);
+                    if (pt == nullptr)
+                        return PageMapKernelMappingInstallError::InvalidSource;
+
+                    for (Uint64 pt_index = 0; pt_index < EntriesPerTable; pt_index++) {
+                        const Entry leaf = pt[pt_index];
+                        if ((leaf & Present) == 0) continue;
+                        if ((leaf & LargePage) != 0)
+                            return PageMapKernelMappingInstallError::UnsupportedLargePage;
+
+                        if ((leaf & User) != 0) continue;
+                        const VirtualAddress virtual_address = ComposeVirtualAddress(pml4, pdpt_index, pd_index, pt_index);
+                        const MappingError map_error = MapPage(virtual_address, EntryAddress(leaf), DecodeOptions(leaf));
+                        if (map_error != MappingError::Success)
+                            return PageMapKernelMappingInstallError::Success;
+                    }
+                }
+            }
+        }
+
+        if (!Validate())
+            return PageMapKernelMappingInstallError::ValidationFailed;
+        return PageMapKernelMappingInstallError::Success;
+    }
+
+    PageMapSwitchError PageMap::SwitchTo() noexcept {
+        if (!IsInitialized()) return PageMapSwitchError::NotInitialized;
+        if (!m_MetadataPromoted || !m_DirectMapAccess) return PageMapSwitchError::InvalidState;
+        if ((ReadRflags() & RflagsInterruptEnable) != 0) return PageMapSwitchError::InterruptsEnabled;
+        if (IsActive()) return PageMapSwitchError::Success;
+
+        WriteCr3(m_RootTable.Value());
+        if (CurrentRootTable() != m_RootTable)
+            return PageMapSwitchError::RootTableMismatch;
+        return PageMapSwitchError::Success;
+    }
+
     PageMapActivationError PageMap::Activate() noexcept {
         if (!IsInitialized()) return PageMapActivationError::NotInitialized;
-        if (m_Active) return PageMapActivationError::AlreadyActive;
+        if (IsActive()) return PageMapActivationError::AlreadyActive;
         if (!SupportsExecuteDisable()) return PageMapActivationError::ExecuteDisableUnsupported;
 
         /*
@@ -495,7 +635,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
          * Everything after this point executes using 
          * zOS-owned tables.
          */
-        m_Active = true;
+        m_DirectMapAccess = true;
 
         m_BootstrapMetadata->EnableDirectMapAccess();
 
@@ -507,7 +647,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
     PageMapMetadataPromotionError PageMap::PromoteMetadata() noexcept {
         if (!IsInitialized()) return PageMapMetadataPromotionError::NotInitialized;
         if (m_MetadataPromoted) return PageMapMetadataPromotionError::AlreadyPromoted;
-        if (!m_Active || m_PhysicalMemory == nullptr || !m_PhysicalMemory->IsInitialized() || !m_PhysicalMemory->IsMetadataAccessPromoted() ||
+        if (!m_DirectMapAccess || m_PhysicalMemory == nullptr || !m_PhysicalMemory->IsInitialized() || !m_PhysicalMemory->IsMetadataAccessPromoted() ||
             m_BootstrapMetadata == nullptr || !m_BootstrapMetadata->IsInitialized())
             return PageMapMetadataPromotionError::InvalidDependency;
         if (!Validate()) return PageMapMetadataPromotionError::CorruptState;
@@ -623,7 +763,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         }
 
         const PhysicalAddress address = EntryAddress(entry);
-        if (address.IsNull() || !address.IsPageAligned() || FindTableRecord(address) == nullptr) {
+        if (address.IsNull() || !address.IsPageAligned() || !OwnsOrSharesTable(address)) {
             error = MappingError::CorruptPageTable;
             return nullptr;
         }
@@ -652,7 +792,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         }
 
         const PhysicalAddress address = EntryAddress(entry);
-        if (address.IsNull() || !address.IsPageAligned() || FindTableRecord(address) == nullptr) {
+        if (address.IsNull() || !address.IsPageAligned() || !OwnsOrSharesTable(address)) {
             error = MappingError::CorruptPageTable;
             return nullptr;
         }
@@ -697,6 +837,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if (!phys_addr.IsPageAligned() || (phys_addr.Value() & ~AddressMask) != 0)
             return MappingError::InvalidPhysicalAddress;
         if (!ValidOptions(options)) return MappingError::InvalidPermissions;
+        if (m_KernelPageMap != nullptr && Pml4Index(virt_addr) >= 256)
+            return MappingError::InvalidVirtualAddress;
 
         Entry* pml4 = TablePointer(m_RootTable);
         if (pml4 == nullptr) return MappingError::CorruptPageTable;
@@ -737,7 +879,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
 
         leaf = (phys_addr.Value() & AddressMask) | LeafFlags(options);
         m_Statistics.MappedPages++;
-        if (m_Active) InvalidatePage(virt_addr);
+        if (IsActive()) InvalidatePage(virt_addr);
         return MappingError::Success;
     }
 
@@ -766,6 +908,8 @@ namespace Zos::Kernel::Architecture::AMD64 {
     MappingError PageMap::UnmapPage(VirtualAddress virt_addr) noexcept {
         if (!IsInitialized()) return MappingError::NotInitialized;
         if (!IsCanonical(virt_addr) || !virt_addr.IsPageAligned()) return MappingError::InvalidVirtualAddress; 
+        if (m_KernelPageMap != nullptr && Pml4Index(virt_addr) >= 256)
+            return MappingError::InvalidVirtualAddress;
 
         Entry* pml4 = TablePointer(m_RootTable);
         if (pml4 == nullptr) return MappingError::CorruptPageTable;
@@ -799,7 +943,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         if ((leaf & Present) == 0) return MappingError::NotMapped;
 
         leaf = 0;
-        if (m_Active) InvalidatePage(virt_addr);
+        if (IsActive()) InvalidatePage(virt_addr);
         if (m_Statistics.MappedPages != 0) m_Statistics.MappedPages--;
         if (TableIsEmpty(pt)) {
             pd_entry = 0;
@@ -852,7 +996,17 @@ namespace Zos::Kernel::Architecture::AMD64 {
             (m_RootTable.Value() & ~AddressMask) != 0)
             return false;
 
-        if (m_Active && CurrentRootTable() != m_RootTable) return false;
+        if (m_KernelPageMap != nullptr) {
+            if (m_KernelPageMap == this || !m_KernelPageMap->IsInitialized() || !m_KernelPageMap->IsMetadataPromoted())
+                return false;
+
+            const Entry* root = TablePointer(m_RootTable);
+            const Entry* kernel_root = m_KernelPageMap->TablePointer(m_KernelPageMap->m_RootTable);
+            if (root == nullptr || kernel_root == nullptr) return false;
+            for (Uint64 index = 256; index < EntriesPerTable; index++)
+                if (root[index] != kernel_root[index]) return false;
+        }
+
 
         if (m_MetadataPromoted) {
             if (m_BootstrapMetadata != nullptr || m_PermanentMetadata.Head == nullptr || m_PermanentMetadata.Tail == nullptr) return false;
@@ -959,6 +1113,30 @@ namespace Zos::Kernel::Architecture::AMD64 {
         case PageMapMetadataPromotionError::ValidationFailed: return "permanent page-map metadata failed validation";
         case PageMapMetadataPromotionError::RollbackFailed: return "failed to release candidate page-map metadata";
         default: return "unknown page-map metadata promotion error";
+        }
+    }
+
+    const char* PageMap::Describe(PageMapKernelMappingInstallError error) noexcept {
+        switch (error) {
+        case PageMapKernelMappingInstallError::Success: return "success";
+        case PageMapKernelMappingInstallError::NotInitialized: return "destination page map is not runtime initialized";
+        case PageMapKernelMappingInstallError::InvalidSource: return "kernel page-map source is invalid";
+        case PageMapKernelMappingInstallError::DestinationNotEmpty: return "destination page map is not root-only";
+        case PageMapKernelMappingInstallError::UnsupportedLargePage: return "kernel mapping installation encountered a large page";
+        case PageMapKernelMappingInstallError::MappingFailed: return "failed to reproduce a lower-half kernel mapping";
+        case PageMapKernelMappingInstallError::ValidationFailed: return "installed kernel mappings failed validation";
+        default: return "unknown kernel mapping installation error";
+        }
+    }
+
+    const char* PageMap::Describe(PageMapSwitchError error) noexcept {
+        switch (error) {
+        case PageMapSwitchError::Success: return "success";
+        case PageMapSwitchError::NotInitialized: return "page map is not initialized";
+        case PageMapSwitchError::InvalidState: return "page map is not ready for runtime activation";
+        case PageMapSwitchError::InterruptsEnabled: return "page-map switch requires maskable interrupts to be disabled";
+        case PageMapSwitchError::RootTableMismatch: return "CR3 does not match the requested page-map root";
+        default: return "unknown page-map switch error";
         }
     }
 

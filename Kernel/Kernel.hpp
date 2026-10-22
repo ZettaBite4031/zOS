@@ -93,6 +93,7 @@ namespace Zos::Kernel {
         SchedulerReady,
         LocalApicTimerReady,
         PreemptionReady,
+        ProcessAddressSpacesReady,
 
         Runtime,
     };
@@ -136,9 +137,11 @@ namespace Zos::Kernel {
         Memory::KernelStack PrimaryStack{};
 
         Processes::Process KernelProcess{};
+        Processes::Process FirstUserProcess{};
 
         Scheduling::Thread BootstrapThread{};
         Scheduling::Thread FirstWorkerThread{};
+        Scheduling::Thread FirstUserThread{};
 
         Scheduling::Scheduler BootstrapScheduler{};
 

@@ -38,6 +38,18 @@ namespace Zos::Kernel::Initialization {
         inline constexpr Uint64 PreemptionSelfTestMinimumSwitches{ 6 };
         inline constexpr Uint64 PreemptionSelfTestTimeoutNanoseconds{ 1'000'000'000ULL };
 
+        inline constexpr Scheduling::ThreadId FirstUserThreadId{ 2 };
+        inline constexpr Processes::ProcessId FirstUserProcessId{ 1 };
+
+        inline constexpr Uint64 FirstUserThreadStackPages{ 8 };
+
+        inline constexpr VirtualAddress ProcessPrivateTestAddress{ 0x0000010000000000ULL };
+
+        inline constexpr Uint64 ProcessPrivateInitialMarker{ 0x5A4F535041434531ULL };
+        inline constexpr Uint64 ProcessPrivateWorkerMarker{ 0x5A4F535041434532ULL };
+
+        volatile bool g_ProcessAddressSpaceWorkerObserved{};
+
         [[noreturn]] void FirstWorkerThreadEntry(void* context) noexcept {
             if (context == nullptr) Diagnostics::Fatal("Thread", "first worker thread received a null context");
 
@@ -110,6 +122,31 @@ namespace Zos::Kernel::Initialization {
                     processor->LocalScheduler != &runtime.BootstrapScheduler)
                     Diagnostics::Fatal("Scheduler", "worker thread resumed with invalid scheduler ownership");
             }
+        }
+
+        [[noreturn]] void FirstUserProcessThreadEntry(void* context) noexcept {
+            if (context == nullptr)
+                Diagnostics::Fatal("Process", "isolated process thread received null context");
+            
+            auto& runtime = *static_cast<KernelRuntime*>(context);
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.FirstUserThread ||
+                runtime.FirstUserThread.OwningProcess() != &runtime.FirstUserProcess)
+                Diagnostics::Fatal("Process", "isolated process thread ownership invalid");
+
+            const auto* address_space = runtime.FirstUserProcess.AddressSpace();
+            if (address_space == nullptr || !address_space->IsActive() ||
+                PageMap::CurrentRootTable() != address_space->RootTable())
+                Diagnostics::Fatal("Process", "isolated process thread entered under the wrong CR3");
+
+            volatile Uint64* private_value = reinterpret_cast<volatile Uint64*>(ProcessPrivateTestAddress.Value());
+            if (*private_value != ProcessPrivateInitialMarker)
+                Diagnostics::Fatal("Process", "isolated process private mapping contains unexpected data");
+
+            *private_value = ProcessPrivateWorkerMarker;
+            g_ProcessAddressSpaceWorkerObserved = true;
+
+            for (;;) __asm__ volatile("hlt");
         }
 
         void AdvancePhase(KernelRuntime& runtime, KernelPhase expected, KernelPhase next) noexcept {
@@ -248,7 +285,7 @@ namespace Zos::Kernel::Initialization {
         }
 
         void InitializeKernelProcess(KernelRuntime& runtime) noexcept {
-            const auto process_error = runtime.KernelProcess.InitializeKernel(KernelProcessId);
+            const auto process_error = runtime.KernelProcess.InitializeKernel(KernelProcessId, runtime.KernelPageMap);
             if (process_error != Processes::ProcessInitializationError::Success)
                 Diagnostics::Fatal("Process", Processes::Process::Describe(process_error));
 
@@ -466,6 +503,110 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Scheduler] Preemptive round-robin verified.\n");
         }
 
+        void InitializeProcessAddressSpaces(KernelRuntime& runtime) noexcept {
+            const auto process_error = runtime.FirstUserProcess.InitializeIsolated(FirstUserProcessId, runtime.PhysicalMemory, runtime.KernelPageMap);
+            if (process_error != Processes::ProcessInitializationError::Success)
+                Diagnostics::Fatal("Process", Processes::Process::Describe(process_error));
+
+            if (!runtime.FirstUserProcess.IsInitialized() || runtime.FirstUserProcess.Id() != FirstUserProcessId ||
+                runtime.FirstUserProcess.State() != Processes::ProcessState::Active || !runtime.FirstUserProcess.OwnsAddressSpace() ||
+                runtime.FirstUserProcess.AddressSpace() == nullptr || runtime.FirstUserProcess.AddressSpace()->RootTable() == runtime.KernelPageMap.RootTable())
+                Diagnostics::Fatal("Process", "isolated process address-space state is invalid");
+
+            Diagnostics::Write("[zOS/Process] Independent process address space established.\n");
+        }
+
+        void RunProcessAddressSpaceSelfTest(KernelRuntime& runtime) noexcept {
+            g_ProcessAddressSpaceWorkerObserved = false;
+
+            auto* process_space = runtime.FirstUserProcess.AddressSpace();
+            if (process_space == nullptr || runtime.KernelPageMap.IsMapped(ProcessPrivateTestAddress) ||
+                process_space->IsMapped(ProcessPrivateTestAddress))
+                Diagnostics::Fatal("Process", "private test address is not initially isolated");
+
+            PhysicalAllocation private_page{};
+            const auto allocation_error = runtime.PhysicalMemory.AllocatePage(private_page);
+            if (allocation_error != PhysicalAllocationError::Success)
+                Diagnostics::Fatal("Process", PhysicalMemoryManager::Describe(allocation_error));
+
+            const VirtualAddress direct = Layout::DirectMapAddress(private_page.Base());
+
+            if (direct.IsNull())
+                Diagnostics::Fatal("Process", "private test page is outside the direct map");
+
+            auto* direct_value = reinterpret_cast<volatile Uint64*>(direct.Value());
+            *direct_value = ProcessPrivateInitialMarker;
+
+            const MappingOptions user_private{
+                .Access = PageAccess::Read | PageAccess::Write | PageAccess::User,
+                .Cache = CachePolicy::WriteBack,
+            };
+
+            const auto mapping_error = process_space->MapPage(ProcessPrivateTestAddress, private_page.Base(),user_private );
+            if (mapping_error != MappingError::Success)
+                Diagnostics::Fatal("Process", PageMap::Describe(mapping_error));
+
+            const auto process_translation = process_space->Translate(ProcessPrivateTestAddress);
+            if (!process_translation.Mapped || process_translation.Physical != private_page.Base() ||
+                !HasAccess(process_translation.Options.Access, PageAccess::Read) ||
+                !HasAccess(process_translation.Options.Access, PageAccess::Write) ||
+                !HasAccess(process_translation.Options.Access, PageAccess::User) ||
+                HasAccess(process_translation.Options.Access, PageAccess::Execute) ||
+                HasAccess(process_translation.Options.Access, PageAccess::Global) ||
+                runtime.KernelPageMap.IsMapped(ProcessPrivateTestAddress))
+                Diagnostics::Fatal("Process", "private user mapping failed isolation validation");
+
+            const auto thread_error = runtime.FirstUserThread.InitializeKernel(FirstUserThreadId, runtime.FirstUserProcess, &FirstUserProcessThreadEntry, &runtime,
+                    runtime.PhysicalMemory, runtime.KernelAddresses, runtime.KernelPageMap, FirstUserThreadStackPages);
+            if (thread_error != Scheduling::ThreadInitializationError::Success)
+                Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(thread_error));
+
+            const Memory::KernelStack* user_stack = runtime.FirstUserThread.Stack();
+            if (user_stack == nullptr || !runtime.FirstUserProcess.OwnsThread(runtime.FirstUserThread ) ||
+                runtime.FirstUserProcess.ThreadCount() != 1)
+                Diagnostics::Fatal("Process", "isolated process thread membership is invalid");
+
+            const auto kernel_stack_translation = runtime.KernelPageMap.Translate(user_stack->Bottom());
+            const auto process_stack_translation = process_space->Translate(user_stack->Bottom());
+            if (!kernel_stack_translation.Mapped || !process_stack_translation.Mapped ||
+                kernel_stack_translation.Physical != process_stack_translation.Physical)
+                Diagnostics::Fatal("Process", "shared kernel stack mapping is missing from process address space");
+            
+            /*
+             * RegisterThread mutates the BSP ready queue. Timer preemption is already
+             * active, so exclude it while publishing the new runnable thread.
+             */
+            __asm__ volatile("cli" ::: "memory");
+
+            const auto registration_error = runtime.BootstrapScheduler.RegisterThread(runtime.FirstUserThread);
+            __asm__ volatile("sti" ::: "memory");
+            if (registration_error != Scheduling::SchedulerRegistrationError::Success)
+                Diagnostics::Fatal("Scheduler", Scheduling::Scheduler::Describe(registration_error));
+
+            const Uint64 start = runtime.Clock.Nanoseconds();
+            while (!g_ProcessAddressSpaceWorkerObserved) {
+                if (runtime.Clock.Nanoseconds() - start > 1'000'000'000ULL)
+                    Diagnostics::Fatal("Process", "cross-process address-space switch timed out");
+                __asm__ volatile("pause");
+            }
+
+            if (*direct_value != ProcessPrivateWorkerMarker)
+                Diagnostics::Fatal("Process", "isolated process did not modify its private mapping");
+
+            if (!runtime.KernelPageMap.IsActive() || runtime.KernelPageMap.IsMapped(ProcessPrivateTestAddress))
+                Diagnostics::Fatal("Process", "kernel address space was contaminated by private user mapping");
+
+            const auto unmap_error = process_space->UnmapPage(ProcessPrivateTestAddress);
+            if (unmap_error != MappingError::Success)
+                Diagnostics::Fatal("Process", PageMap::Describe(unmap_error));
+
+            if (runtime.PhysicalMemory.Release(private_page) != PhysicalAllocationError::Success)
+                Diagnostics::Fatal("Process", "failed to release private address-space test page");
+
+            Diagnostics::Write("[zOS/Process] Private user mapping isolation verified.\n");
+            Diagnostics::Write("[zOS/Process] Cross-process CR3 scheduling verified.\n");
+        }
+
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
             if (runtime.Boot.Initialized)
                 Diagnostics::Fatal("Startup", "boot context was internalized more than once");
@@ -508,7 +649,7 @@ namespace Zos::Kernel::Initialization {
     }
 
     [[noreturn]] void EnterRuntime(KernelRuntime& runtime) noexcept {
-        AdvancePhase(runtime, KernelPhase::PreemptionReady, KernelPhase::Runtime);
+        AdvancePhase(runtime, KernelPhase::ProcessAddressSpacesReady, KernelPhase::Runtime);
 
         Diagnostics::Write("[zOS/Kernel] Permanent kernel runtime entered.\n");
 
@@ -670,6 +811,11 @@ namespace Zos::Kernel::Initialization {
         RunPreemptionSelfTest(runtime);
 
         AdvancePhase(runtime, KernelPhase::LocalApicTimerReady, KernelPhase::PreemptionReady);
+
+        InitializeProcessAddressSpaces(runtime);
+        RunProcessAddressSpaceSelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::PreemptionReady, KernelPhase::ProcessAddressSpacesReady);
 
         EnterRuntime(runtime);
     }

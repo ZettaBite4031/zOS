@@ -35,6 +35,8 @@ namespace Zos::Kernel::Scheduling {
         CurrentStateInvalid,
         TargetNotReady,
         ResumeStateMismatch,
+        AddressSpaceSwitchFailed,
+        ResumeAddressSpaceMismatch,
     };
 
     class Thread final {

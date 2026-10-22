@@ -103,6 +103,17 @@ namespace Zos::Kernel::Scheduling {
         if (next.m_State != ThreadState::Ready || !next.m_ContextReady)
             return ThreadSwitchError::TargetNotReady;
 
+        Architecture::AMD64::PageMap* current_space = m_OwningProcess != nullptr ? m_OwningProcess->AddressSpace() : nullptr;
+        Architecture::AMD64::PageMap* next_space = next.m_OwningProcess != nullptr ? next.m_OwningProcess->AddressSpace() : nullptr;
+        if (current_space == nullptr || next_space == nullptr ||!current_space->IsActive())
+            return ThreadSwitchError::AddressSpaceSwitchFailed;
+
+        if (current_space != next_space) {
+            const auto address_space_error = next_space->SwitchTo();
+            if (address_space_error != Architecture::AMD64::PageMapSwitchError::Success)
+                return ThreadSwitchError::AddressSpaceSwitchFailed;
+        }
+
         m_State = ThreadState::Ready;
         next.m_State = ThreadState::Running;
         processor->CurrentThread = &next;
@@ -114,6 +125,9 @@ namespace Zos::Kernel::Scheduling {
         processor = Architecture::AMD64::CurrentProcessor();
         if (processor == nullptr || processor->CurrentThread != this || m_State != ThreadState::Running)
             return ThreadSwitchError::ResumeStateMismatch;
+
+        if (m_OwningProcess == nullptr || m_OwningProcess->AddressSpace() == nullptr || !m_OwningProcess->AddressSpace()->IsActive())
+            return ThreadSwitchError::ResumeAddressSpaceMismatch;
 
         return ThreadSwitchError::Success;
     }
@@ -204,6 +218,8 @@ namespace Zos::Kernel::Scheduling {
         case ThreadSwitchError::CurrentStateInvalid: return "outgoing thread is not running";
         case ThreadSwitchError::TargetNotReady: return "target thread is not ready or has no resumable context";
         case ThreadSwitchError::ResumeStateMismatch: return "resumed thread state does not match processor ownership";
+        case ThreadSwitchError::AddressSpaceSwitchFailed: return "failed to activate the target thread process address space";
+        case ThreadSwitchError::ResumeAddressSpaceMismatch: return "resumed thread address space does not match process ownership";
         default: return "unknown cooperative thread switch error";
         }
     }
