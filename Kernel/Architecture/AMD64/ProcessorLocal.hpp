@@ -4,6 +4,7 @@
 
 namespace Zos::Kernel::Scheduling {
     class Thread;
+    class Scheduler;
 }
 
 namespace Zos::Kernel::Architecture::AMD64 {
@@ -24,6 +25,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         Memory::Uint32 ApicId{};
 
         ::Zos::Kernel::Scheduling::Thread* CurrentThread{};
+        ::Zos::Kernel::Scheduling::Scheduler* LocalScheduler{};
 
         bool BootstrapProcessor{};
         bool Initialized{};

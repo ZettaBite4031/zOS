@@ -21,7 +21,7 @@
 #include <Kernel/Time/LocalApicTimer.hpp>
 
 #include <Kernel/Scheduling/Thread.hpp>
-
+#include <Kernel/Scheduling/Scheduler.hpp>
 
 namespace Zos::Kernel {
     struct BootContext final {
@@ -87,6 +87,7 @@ namespace Zos::Kernel {
         ProcessorLocalReady,
         KernelThreadsReady,
         CooperativeContextSwitchReady,
+        SchedulerReady,
         LocalApicTimerReady,
 
         Runtime,
@@ -132,6 +133,8 @@ namespace Zos::Kernel {
 
         Scheduling::Thread BootstrapThread{};
         Scheduling::Thread FirstWorkerThread{};
+
+        Scheduling::Scheduler BootstrapScheduler{};
 
         KernelPhase Phase{ KernelPhase::Entry };
     };

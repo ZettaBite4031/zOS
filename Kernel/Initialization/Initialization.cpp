@@ -26,6 +26,10 @@ namespace Zos::Kernel::Initialization {
         bool g_FirstWorkerEntered{};
         bool g_FirstWorkerStackVerified{};
 
+        volatile Uint64 g_SchedulerWorkerIterations{};
+
+        inline constexpr Uint64 SchedulerSelfTestRounds{ 4 };
+
         [[noreturn]] void FirstWorkerThreadEntry(void* context) noexcept {
             if (context == nullptr) Diagnostics::Fatal("Thread", "first worker thread received a null context");
 
@@ -47,16 +51,32 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Thread] Worker thread entered on dedicated stack.\n");
 
             const auto switch_error = runtime.FirstWorkerThread.SwitchTo(runtime.BootstrapThread);
-
             if (switch_error != Scheduling::ThreadSwitchError::Success)
                 Diagnostics::Fatal("Thread", Scheduling::Thread::Describe(switch_error));
 
             /*
-            * Step 10 only expects one Bootstrap -> Worker -> Bootstrap
-            * round trip. A later scheduler milestone will define what
-            * happens when this worker is selected again.
+            * Returning here means Step 11's scheduler selected this thread
+            * after the Step 10 bootstrap round trip.
             */
-            Diagnostics::Fatal("Thread", "first worker thread resumed before scheduler initialization");
+            processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.FirstWorkerThread ||
+                processor->LocalScheduler == nullptr || !processor->LocalScheduler->IsInitialized())
+                Diagnostics::Fatal("Scheduler", "worker thread resumed without a valid local scheduler");
+
+            Diagnostics::Write("[zOS/Scheduler] Worker thread joined scheduler rotation.\n");
+
+            for (;;) {
+                g_SchedulerWorkerIterations = g_SchedulerWorkerIterations + 1;
+
+                const auto yield_error = processor->LocalScheduler->Yield();
+                if (yield_error != Scheduling::SchedulerYieldError::Success)
+                    Diagnostics::Fatal("Scheduler", Scheduling::Scheduler::Describe(yield_error));
+
+                processor = CurrentProcessor();
+                if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.FirstWorkerThread ||
+                    processor->LocalScheduler != &runtime.BootstrapScheduler)
+                    Diagnostics::Fatal("Scheduler", "worker thread resumed with invalid scheduler ownership");
+            }
         }
 
         void AdvancePhase(KernelRuntime& runtime, KernelPhase expected, KernelPhase next) noexcept {
@@ -281,6 +301,62 @@ namespace Zos::Kernel::Initialization {
             Diagnostics::Write("[zOS/Thread] Cooperative context switch verified.\n");
         }
 
+        void InitializeScheduler(KernelRuntime& runtime) noexcept {
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.BootstrapThread)
+                Diagnostics::Fatal("Scheduler", "bootstrap processor state is invalid during scheduler initialization");
+
+            const auto scheduler_error = runtime.BootstrapScheduler.Initialize(runtime.BootstrapProcessor);
+            if (scheduler_error != Scheduling::SchedulerInitializationError::Success)
+                Diagnostics::Fatal("Scheduler", Scheduling::Scheduler::Describe(scheduler_error));
+
+            const auto registration_error = runtime.BootstrapScheduler.RegisterThread(runtime.FirstWorkerThread);
+            if (registration_error != Scheduling::SchedulerRegistrationError::Success)
+                Diagnostics::Fatal("Scheduler", Scheduling::Scheduler::Describe(registration_error));
+
+            if (processor->LocalScheduler != &runtime.BootstrapScheduler || runtime.BootstrapScheduler.ReadyCount() != 1)
+                Diagnostics::Fatal("Scheduler", "initial ready queue state is invalid");
+
+            Diagnostics::Write("[zOS/Scheduler] BSP scheduler initialized.\n");
+            Diagnostics::Write("[zOS/Scheduler] Ready threads: ");
+            Diagnostics::WriteDecimal(runtime.BootstrapScheduler.ReadyCount());
+            Diagnostics::Write("\n");
+        }
+
+        void RunSchedulerSelfTest(KernelRuntime& runtime) noexcept {
+            g_SchedulerWorkerIterations = 0;
+
+            ProcessorLocal* processor = CurrentProcessor();
+            if (processor != &runtime.BootstrapProcessor || processor->CurrentThread != &runtime.BootstrapThread || processor->LocalScheduler != &runtime.BootstrapScheduler)
+                Diagnostics::Fatal("Scheduler", "scheduler self-test began with invalid processor state");
+
+            const Uint64 initial_switch_count = runtime.BootstrapScheduler.SwitchCount();
+            for (Uint64 round = 0; round < SchedulerSelfTestRounds; round++) {
+                const auto yield_error = runtime.BootstrapScheduler.Yield();
+                if (yield_error != Scheduling::SchedulerYieldError::Success)
+                    Diagnostics::Fatal("Scheduler", Scheduling::Scheduler::Describe(yield_error));
+
+                /*
+                * One Bootstrap -> Worker -> Bootstrap round trip produces
+                * two scheduler-selected context switches.
+                */
+                const Uint64 expected_worker_iterations = round + 1;
+                const Uint64 expected_switches = initial_switch_count + expected_worker_iterations * 2;
+
+                processor = CurrentProcessor();
+                if (g_SchedulerWorkerIterations != expected_worker_iterations || processor != &runtime.BootstrapProcessor ||
+                    processor->CurrentThread != &runtime.BootstrapThread || runtime.BootstrapThread.State() != Scheduling::ThreadState::Running ||
+                    runtime.FirstWorkerThread.State() != Scheduling::ThreadState::Ready || runtime.BootstrapScheduler.ReadyCount() != 1 ||
+                    runtime.BootstrapScheduler.SwitchCount() != expected_switches)
+                    Diagnostics::Fatal("Scheduler", "round-robin scheduler self-test state is invalid");
+            }
+
+            Diagnostics::Write("[zOS/Scheduler] Cooperative round-robin verified.\n");
+            Diagnostics::Write("[zOS/Scheduler] Context switches: ");
+            Diagnostics::WriteDecimal(runtime.BootstrapScheduler.SwitchCount());
+            Diagnostics::Write("\n");
+        }
+
         void InternalizeBootContext(KernelRuntime& runtime, const Boot::BootEnvironment& environment) noexcept {
             if (runtime.Boot.Initialized)
                 Diagnostics::Fatal("Startup", "boot context was internalized more than once");
@@ -452,6 +528,11 @@ namespace Zos::Kernel::Initialization {
 
         AdvancePhase(runtime, KernelPhase::KernelThreadsReady, KernelPhase::CooperativeContextSwitchReady);
 
+        InitializeScheduler(runtime);
+        RunSchedulerSelfTest(runtime);
+
+        AdvancePhase(runtime, KernelPhase::CooperativeContextSwitchReady, KernelPhase::SchedulerReady);
+
         const auto timer_error = runtime.Timer.Initialize(runtime.Apic, runtime.Interrupts, runtime.Clock, runtime.BootstrapProcessor);
         if (timer_error != Time::LocalApicTimerInitializationError::Success)
             Diagnostics::Fatal("Timer", Time::LocalApicTimer::Describe(timer_error));
@@ -467,7 +548,7 @@ namespace Zos::Kernel::Initialization {
 
         Diagnostics::Write("[zOS/CPU] Processor-local interrupt access verified.\n");
 
-        AdvancePhase(runtime, KernelPhase::CooperativeContextSwitchReady, KernelPhase::LocalApicTimerReady);
+        AdvancePhase(runtime, KernelPhase::SchedulerReady, KernelPhase::LocalApicTimerReady);
 
         EnterRuntime(runtime);
     }

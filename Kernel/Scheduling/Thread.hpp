@@ -48,16 +48,18 @@ namespace Zos::Kernel::Scheduling {
         [[nodiscard]] ThreadInitializationError InitializeBootstrap(ThreadId id, Memory::KernelStack& current_stack) noexcept;
 
         /*
-         * Creates a dormant kernel thread with its own guarded stack.
-         * Step 9 records the entry contract only; Step 10 will construct
-         * the initial execution context that actually enters it.
+         * Creates a dormant kernel thread with its own guarded stack and
+         * prepares the initial architectural context used on first dispatch.
          */
         [[nodiscard]] ThreadInitializationError InitializeKernel(ThreadId id, ThreadEntry entry, void* entry_context, Memory::PhysicalMemoryManager& physical_memory, 
             Memory::VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map, Memory::Uint64 stack_page_count) noexcept;
 
         /*
-         * Cooperatively transfer execution from this Running thread to a
+         * Low-level cooperative transfer from this Running thread to a
          * Ready thread. IF must already be clear.
+         *
+         * Once a Scheduler is active, normal scheduling goes through
+         * Scheduler::Yield() rather than selecting threads directly.
          */
         [[nodiscard]] ThreadSwitchError SwitchTo(Thread& next) noexcept;
 
@@ -79,6 +81,8 @@ namespace Zos::Kernel::Scheduling {
         [[nodiscard]] static const char* Describe(ThreadSwitchError error) noexcept;
 
     private:
+        friend class Scheduler;
+
         static void StartContext(void* argument) noexcept;
         void Print() const noexcept;
 
@@ -92,9 +96,11 @@ namespace Zos::Kernel::Scheduling {
         Memory::KernelStack* m_Stack{};
 
         Architecture::AMD64::ThreadContext m_Context{};
+        Thread* m_ReadyNext{};
 
         bool m_OwnsStack{};
         bool m_ContextReady{};
+        bool m_ReadyQueued{};
         bool m_Initialized{};
     };
 }

@@ -192,6 +192,7 @@ namespace Zos::Kernel::Scheduling {
         case ThreadInitializationError::InvalidDependency: return "thread initialization dependency is invalid";
         case ThreadInitializationError::InvalidEntry: return "kernel thread entry point is invalid";
         case ThreadInitializationError::StackInitializationFailed: return "failed to initialize the kernel thread stack";
+        case ThreadInitializationError::ContextInitializationFailed: return "failed to prepare the initial kernel thread context";
         default: return "unknown thread initialization error";
         }
     }
