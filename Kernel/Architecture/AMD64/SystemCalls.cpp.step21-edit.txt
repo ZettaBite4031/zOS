@@ -1,0 +1,18 @@
+Target: Kernel/Architecture/AMD64/SystemCalls.cpp
+
+At the end of SystemCallEntry::Dispatch(), replace the current dispatcher call:
+
+    m_DispatchCount++;
+    context.Rax = SystemCalls::DispatchNative(request, *process);
+
+with:
+
+    SystemCalls::Context native_context{
+        .CurrentProcess = *process,
+        .CurrentThread = *thread,
+    };
+
+    m_DispatchCount++;
+    context.Rax = SystemCalls::DispatchNative(request, native_context);
+
+No other changes are required in this file.

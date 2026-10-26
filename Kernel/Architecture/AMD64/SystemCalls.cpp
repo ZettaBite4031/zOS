@@ -311,8 +311,13 @@ namespace Zos::Kernel::Architecture::AMD64 {
             },
         };
 
+        SystemCalls::Context native_context{
+            .CurrentProcess = *process,
+            .CurrentThread = *thread,
+        };
+
         m_DispatchCount++;
-        context.Rax = SystemCalls::DispatchNative(request, *process);
+        context.Rax = SystemCalls::DispatchNative(request, native_context);
     }
 
     const char* SystemCallEntry::Describe(SystemCallInitializationError error) noexcept {

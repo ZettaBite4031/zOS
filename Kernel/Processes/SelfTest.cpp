@@ -2,6 +2,7 @@
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 #include <Kernel/Memory/Layout.hpp>
+#include <Kernel/Objects/Object.hpp>
 
 namespace Zos::Kernel::Processes::SelfTest {
     namespace {
@@ -10,22 +11,30 @@ namespace Zos::Kernel::Processes::SelfTest {
     }
 
     void VerifyKernelProcess(Process& process, Architecture::AMD64::PageMap& kernel_page_map) noexcept {
-        if (!process.IsInitialized() || process.Id() != 0 ||
-            process.State() != ProcessState::Active ||
-            process.ThreadCount() != 0 || process.OwnsAddressSpace() ||
-            process.AddressSpace() != &kernel_page_map)
+        const auto& object = static_cast<const Objects::Object&>(process);
+
+        if (!process.IsInitialized() || process.Id() != 0 || process.State() != ProcessState::Active ||
+            process.ThreadCount() != 0 || process.OwnsAddressSpace() || process.AddressSpace() != &kernel_page_map ||
+            !object.IsObjectInitialized() || object.Type() != Objects::ObjectType::Process || object.Id() == 0 ||
+            object.ReferenceCount() != 1 || !process.Handles().IsInitialized() || process.Handles().ActiveCount() != 0 ||
+            !process.Handles().Validate())
             Diagnostics::Fatal("Process", "kernel process initial state is invalid");
 
-        Diagnostics::Write("[zOS/Process] Kernel process established.\n");
+        Diagnostics::Write("[zOS/Process] Kernel process object and handle table verified.\n");
     }
 
     void VerifyIsolatedAddressSpace(Process& process, Memory::State& memory) noexcept {
         using namespace Memory;
 
         auto* process_space = process.AddressSpace();
-        if (!process.IsInitialized() || !process.OwnsAddressSpace() ||
-            process.State() != ProcessState::Active || process_space == nullptr ||
-            process_space->RootTable() == memory.KernelPageMap.RootTable())
+
+        const auto& object = static_cast<const Objects::Object&>(process);
+
+        if (!process.IsInitialized() || !process.OwnsAddressSpace() || process.State() != ProcessState::Active ||
+            process_space == nullptr || process_space->RootTable() == memory.KernelPageMap.RootTable() ||
+            !object.IsObjectInitialized() || object.Type() != Objects::ObjectType::Process || object.Id() == 0 ||
+            object.ReferenceCount() != 1 || !process.Handles().IsInitialized() || process.Handles().ActiveCount() != 0 ||
+            !process.Handles().Validate())
             Diagnostics::Fatal("Process", "isolated process ownership state is invalid");
 
         if (memory.KernelPageMap.IsMapped(ProbeAddress) || process_space->IsMapped(ProbeAddress))
@@ -61,11 +70,10 @@ namespace Zos::Kernel::Processes::SelfTest {
             !HasAccess(translation.Options.Access, PageAccess::User) ||
             HasAccess(translation.Options.Access, PageAccess::Execute) ||
             HasAccess(translation.Options.Access, PageAccess::Global) ||
-            memory.KernelPageMap.IsMapped(ProbeAddress) ||
-            *direct_value != ProbeValue)
+            memory.KernelPageMap.IsMapped(ProbeAddress) || *direct_value != ProbeValue)
             Diagnostics::Fatal("Process", "private user mapping failed isolation validation");
 
-        if (process_space->UnmapPage(ProbeAddress) != Architecture::AMD64::MappingError::Success)
+        if (process_space->UnmapPage(ProbeAddress ) !=Architecture::AMD64::MappingError::Success)
             Diagnostics::Fatal("Process", "failed to unmap process isolation probe");
 
         if (memory.Physical.Release(private_page) != PhysicalAllocationError::Success)

@@ -42,6 +42,10 @@ city_user_programs = SConscript(
     "User/CityPrograms/SConscript",
     exports={"user_environment": user_environment, "output_root": output_root, "user_runtime_objects": user_runtime_objects},
 )
+object_test_program = SConscript(
+    "User/ObjectTest/SConscript",
+    exports={"user_environment": user_environment, "output_root": output_root, "user_runtime_objects": user_runtime_objects},
+)
 kernel = SConscript(
     "Kernel/SConscript",
     exports={
@@ -49,6 +53,7 @@ kernel = SConscript(
         "output_root": output_root,
         "first_user_program": first_user_program,
         "city_user_programs": city_user_programs,
+        "object_test_program": object_test_program,
     },
 )
 
@@ -215,6 +220,11 @@ city_user_verifications = [
     )
     for role in ("Exit", "Fault", "Survivor")
 ]
+object_test_verification = host_environment.Command(
+    target=f"{output_root}/Verification/ObjectTest.stamp",
+    source=object_test_program,
+    action=Action(VerifyUserProgram, "Verifying Step 21 object-handle ELF $SOURCE"),
+)
 
 staged_loader = host_environment.Command(
     target=f"{output_root}/ESP/EFI/BOOT/BOOTX64.EFI",
@@ -237,6 +247,7 @@ build_products = [
     kernel_verification,
     user_program_verification,
     *city_user_verifications,
+    object_test_verification,
     staged_loader,
     staged_kernel,
 ]
@@ -248,11 +259,9 @@ Alias("verify", [
     kernel_verification,
     user_program_verification,
     *city_user_verifications,
+    object_test_verification,
 ])
 
-# Build.py uses this non-interactive alias before starting a debug session.
-# Keeping preparation inside SCons preserves the same dependency graph used by
-# normal runs without placing an interactive GDB process inside an SCons action.
 Alias("debug-build", [*build_products, ovmf_variables])
 
 run = host_environment.Alias(

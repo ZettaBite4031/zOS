@@ -1,8 +1,10 @@
 #pragma once
 
-#include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Architecture/AMD64/ContextSwitching.hpp>
+#include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Memory/KernelStack.hpp>
+#include <Kernel/Objects/Handle.hpp>
+#include <Kernel/Objects/Object.hpp>
 
 namespace Zos::Kernel::Processes {
     class Process;
@@ -11,6 +13,8 @@ namespace Zos::Kernel::Processes {
 namespace Zos::Kernel::Scheduling {
     using ThreadId = Memory::Uint64;
     using ThreadEntry = void(*)(void* context) noexcept;
+
+    inline constexpr Objects::AccessMask ThreadQuery{ 1ULL << 0 };
 
     enum class ThreadState : Memory::Uint32 {
         Ready,
@@ -25,6 +29,7 @@ namespace Zos::Kernel::Scheduling {
         InvalidEntry,
         StackInitializationFailed,
         ContextInitializationFailed,
+        ObjectInitializationFailed,
     };
 
     enum class ThreadSwitchError : Memory::Uint32 {
@@ -51,34 +56,20 @@ namespace Zos::Kernel::Scheduling {
         InvalidStackMapping,
     };
 
-    class Thread final {
+    class Thread final : public Objects::Object {
     public:
+        inline static constexpr Objects::ObjectType ObjectKind{ Objects::ObjectType::Thread };
+
         constexpr Thread() noexcept = default;
 
         Thread(const Thread&) = delete;
         Thread& operator=(const Thread&) = delete;
 
-        /*
-         * Represents execution that is already running on an existing
-         * kernel-owned stack. The thread borrows the stack; it does not
-         * acquire a second ownership claim over it.
-         */
         [[nodiscard]] ThreadInitializationError InitializeBootstrap(ThreadId id, Processes::Process& owning_process, Memory::KernelStack& current_stack) noexcept;
 
-        /*
-         * Creates a dormant kernel thread with its own guarded stack and
-         * prepares the initial architectural context used on first dispatch.
-         */
-        [[nodiscard]] ThreadInitializationError InitializeKernel(ThreadId id, Processes::Process& owning_process, ThreadEntry entry, void* entry_context,
-            Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map, Memory::Uint64 stack_page_count) noexcept;
+        [[nodiscard]] ThreadInitializationError InitializeKernel(ThreadId id, Processes::Process& owning_process, ThreadEntry entry, void* entry_context, Memory::PhysicalMemoryManager& physical_memory,
+            Memory::VirtualAddressAllocator& virtual_addresses, Architecture::AMD64::PageMap& page_map, Memory::Uint64 stack_page_count) noexcept;
 
-        /*
-         * Low-level transfer from this Running thread to a Ready thread.
-         * IF must already be clear.
-         *
-         * Both cooperative scheduling and interrupt-driven preemption use
-         * this primitive.
-         */
         [[nodiscard]] ThreadSwitchError SwitchTo(Thread& next) noexcept;
 
         [[nodiscard]] ThreadUserModeError ConfigureUserMode(Memory::VirtualAddress entry, Memory::VirtualAddress stack_top) noexcept;
@@ -86,6 +77,7 @@ namespace Zos::Kernel::Scheduling {
         [[noreturn]] void EnterUserMode() noexcept;
 
         [[nodiscard]] bool UserModeConfigured() const noexcept { return m_UserModeConfigured; }
+
         [[nodiscard]] Memory::VirtualAddress UserEntry() const noexcept { return m_UserEntry; }
         [[nodiscard]] Memory::VirtualAddress UserStackTop() const noexcept { return m_UserStackTop; }
 
@@ -101,6 +93,7 @@ namespace Zos::Kernel::Scheduling {
 
         [[nodiscard]] Memory::KernelStack* Stack() noexcept { return m_Stack; }
         [[nodiscard]] const Memory::KernelStack* Stack() const noexcept { return m_Stack; }
+
         [[nodiscard]] bool OwnsStack() const noexcept { return m_OwnsStack; }
         [[nodiscard]] bool HasContext() const noexcept { return m_ContextReady; }
 
@@ -119,6 +112,7 @@ namespace Zos::Kernel::Scheduling {
         };
 
         [[nodiscard]] ThreadSwitchError TransferTo(Thread& next, TransferDisposition disposition) noexcept;
+
         [[noreturn]] void TerminateAndSwitchTo(Thread& next) noexcept;
         void MarkTerminated() noexcept;
         static void StartContext(void* argument) noexcept;

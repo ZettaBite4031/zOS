@@ -2,15 +2,18 @@
 
 #include <Kernel/Architecture/AMD64/Paging.hpp>
 #include <Kernel/Memory/PhysicalMemory.hpp>
+#include <Kernel/Objects/HandleTable.hpp>
+#include <Kernel/Objects/Object.hpp>
 #include <Kernel/UserFault.hpp>
 
 namespace Zos::Kernel::Scheduling {
     class Thread;
 }
 
-
 namespace Zos::Kernel::Processes {
     using ProcessId = Memory::Uint64;
+
+    inline constexpr Objects::AccessMask ProcessQuery{ 1ULL << 0 };
 
     enum class ProcessState : Memory::Uint32 {
         Active,
@@ -24,6 +27,8 @@ namespace Zos::Kernel::Processes {
         InvalidDependency,
         AddressSpaceInitializationFailed,
         KernelMappingInstallFailed,
+        ObjectInitializationFailed,
+        HandleTableInitializationFailed,
     };
 
     struct ProcessFaultRecord final {
@@ -38,8 +43,12 @@ namespace Zos::Kernel::Processes {
         Memory::Uint32 Status{};
     };
 
-    class Process final {
+    class Process final : public Objects::Object {
     public:
+        inline static constexpr Objects::ObjectType ObjectKind{
+            Objects::ObjectType::Process
+        };
+
         constexpr Process() noexcept = default;
 
         Process(const Process&) = delete;
@@ -66,7 +75,12 @@ namespace Zos::Kernel::Processes {
 
         [[nodiscard]] Architecture::AMD64::PageMap* AddressSpace() noexcept { return m_PageMap; }
         [[nodiscard]] const Architecture::AMD64::PageMap* AddressSpace() const noexcept { return m_PageMap; }
+
         [[nodiscard]] bool OwnsAddressSpace() const noexcept { return m_OwnsPageMap; }
+
+        [[nodiscard]] Objects::HandleTable& Handles() noexcept { return m_Handles; }
+        [[nodiscard]] const Objects::HandleTable& Handles() const noexcept { return m_Handles; }
+
         [[nodiscard]] const ProcessFaultRecord& FaultRecord() const noexcept { return m_FaultRecord; }
         [[nodiscard]] const ProcessExitRecord& ExitRecord() const noexcept { return m_ExitRecord; }
 
@@ -76,7 +90,6 @@ namespace Zos::Kernel::Processes {
         [[nodiscard]] bool OwnsThread(const Scheduling::Thread& thread) const noexcept;
 
         [[nodiscard]] static const char* StateName(ProcessState state) noexcept;
-
         [[nodiscard]] static const char* Describe(ProcessInitializationError error) noexcept;
 
     private:
@@ -84,6 +97,7 @@ namespace Zos::Kernel::Processes {
 
         void NotifyThreadTerminated(Scheduling::Thread& thread) noexcept;
         void AttachThread(Scheduling::Thread& thread) noexcept;
+        void CloseHandlesForTermination() noexcept;
         void Print() const noexcept;
 
         ProcessId m_Id{};
@@ -91,6 +105,8 @@ namespace Zos::Kernel::Processes {
 
         Architecture::AMD64::PageMap m_OwnedPageMap{};
         Architecture::AMD64::PageMap* m_PageMap{};
+
+        Objects::HandleTable m_Handles{};
 
         Scheduling::Thread* m_ThreadHead{};
         Scheduling::Thread* m_ThreadTail{};

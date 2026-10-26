@@ -17,25 +17,24 @@ namespace Zos::Kernel::Scheduling {
                 Diagnostics::Fatal("Thread", Thread::Describe(error));
 
             ProcessorLocal* processor = CurrentProcessor();
-            if (processor != &runtime.Platform.BootstrapProcessor ||
-                !processor->IsInitialized())
+            if (processor != &runtime.Platform.BootstrapProcessor || !processor->IsInitialized())
                 Diagnostics::Fatal("Thread", "current processor is invalid during bootstrap-thread binding");
 
             processor->CurrentThread = &runtime.Scheduling.BootstrapThread;
             if (!SetCurrentKernelEntryStack(runtime.Memory.PrimaryStack.Top()))
                 Diagnostics::Fatal("Thread", "failed to bind bootstrap kernel entry stack");
 
-            if (processor->CurrentThread != &runtime.Scheduling.BootstrapThread ||
-                !runtime.Scheduling.BootstrapThread.IsInitialized() ||
-                runtime.Scheduling.BootstrapThread.Id() != BootstrapThreadId ||
-                runtime.Scheduling.BootstrapThread.State() != ThreadState::Running ||
-                runtime.Scheduling.BootstrapThread.OwningProcess() != &runtime.Processes.KernelProcess ||
-                runtime.Scheduling.BootstrapThread.Stack() != &runtime.Memory.PrimaryStack ||
-                runtime.Scheduling.BootstrapThread.OwnsStack() ||
-                runtime.Scheduling.BootstrapThread.HasContext())
-                Diagnostics::Fatal("Thread", "bootstrap-thread state or processor binding is invalid");
+            const auto& bootstrap = runtime.Scheduling.BootstrapThread;
+            if (processor->CurrentThread != &bootstrap || !bootstrap.IsInitialized() ||
+                bootstrap.Id() != BootstrapThreadId || bootstrap.State() != ThreadState::Running ||
+                bootstrap.OwningProcess() != &runtime.Processes.KernelProcess ||
+                bootstrap.Stack() != &runtime.Memory.PrimaryStack ||
+                bootstrap.OwnsStack() || bootstrap.HasContext() ||
+                !bootstrap.IsObjectInitialized() || bootstrap.Type() != Objects::ObjectType::Thread ||
+                bootstrap.ReferenceCount() != 1)
+                Diagnostics::Fatal("Thread", "bootstrap-thread state or object identity is invalid");
 
-            Diagnostics::Write("[zOS/Thread] Current processor binding verified.\n");
+            Diagnostics::Write("[zOS/Thread] Current processor and bootstrap object binding verified.\n");
         }
 
         void InitializeScheduler(KernelRuntime& runtime) noexcept {
@@ -71,12 +70,7 @@ namespace Zos::Kernel::Scheduling {
         InitializeScheduler(runtime);
         SelfTest::VerifyRoundRobin(runtime);
 
-        Time::InitializeSchedulerTimer(
-            runtime.Time,
-            runtime.Platform.Apic,
-            runtime.Architecture.Interrupts,
-            runtime.Platform.BootstrapProcessor
-        );
+        Time::InitializeSchedulerTimer(runtime.Time, runtime.Platform.Apic, runtime.Architecture.Interrupts, runtime.Platform.BootstrapProcessor);
 
         if (Architecture::AMD64::CurrentProcessor()->CurrentThread != &runtime.Scheduling.BootstrapThread)
             Diagnostics::Fatal("Thread", "current thread changed unexpectedly during timer initialization");

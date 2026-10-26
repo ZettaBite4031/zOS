@@ -1,22 +1,18 @@
 #include <Kernel/Processes/UserProcessLauncher.hpp>
 
+#include <Kernel/Architecture/AMD64/Instructions.hpp>
 #include <Kernel/Architecture/AMD64/ProcessorLocal.hpp>
 #include <Kernel/Diagnostics/Diagnostics.hpp>
-#include <Kernel/Architecture/AMD64/Instructions.hpp>
 
 namespace Zos::Kernel::Processes {
-    namespace {
-
-    }
-
-    UserProcessLaunchError UserProcessInstance::Launch( ProcessId process_id, Scheduling::ThreadId thread_id, const Executables::ExecutableImageView& executable, const Executables::UserExecutableLoadOptions& load_options,
+    UserProcessLaunchError UserProcessInstance::Launch(ProcessId process_id, Scheduling::ThreadId thread_id, const Executables::ExecutableImageView& executable, const Executables::UserExecutableLoadOptions& load_options,
         Memory::Uint64 kernel_stack_pages, Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& kernel_addresses, Architecture::AMD64::PageMap& kernel_page_map, Scheduling::Scheduler& scheduler) noexcept {
-        
-        if (m_State != UserProcessLaunchState::Empty || m_Process.IsInitialized() || m_Thread.IsInitialized() || m_Image.IsLoaded()) 
+        if (m_State != UserProcessLaunchState::Empty || m_Process.IsInitialized() || m_Thread.IsInitialized() || m_Image.IsLoaded())
             return UserProcessLaunchError::AlreadyLaunched;
 
-        if (process_id == 0 || thread_id == 0 || !executable.IsValid() || kernel_stack_pages == 0 || !physical_memory.IsInitialized() || !kernel_addresses.IsInitialized() ||
-            !kernel_page_map.IsInitialized() || !kernel_page_map.IsActive() || !scheduler.IsInitialized() || !scheduler.PreemptionEnabled() ||
+        if (process_id == 0 || thread_id == 0 || !executable.IsValid() || kernel_stack_pages == 0 ||
+            !physical_memory.IsInitialized() || !kernel_addresses.IsInitialized() || !kernel_page_map.IsInitialized() ||
+            !kernel_page_map.IsActive() || !scheduler.IsInitialized() || !scheduler.PreemptionEnabled() ||
             !Architecture::AMD64::InterruptsEnabled())
             return UserProcessLaunchError::InvalidDependency;
 
@@ -28,9 +24,7 @@ namespace Zos::Kernel::Processes {
             return m_LastError = UserProcessLaunchError::ProcessInitializationFailed;
         }
 
-        const auto image_error = Executables::UserExecutableLoader::LoadStaticElf(
-            executable.Data, executable.Size, m_Process, physical_memory, load_options, m_Image
-        );
+        const auto image_error = Executables::UserExecutableLoader::LoadStaticElf(executable.Data, executable.Size, m_Process, physical_memory, load_options, m_Image);
         if (image_error != Executables::UserExecutableLoadError::Success) {
             m_State = UserProcessLaunchState::Failed;
             return m_LastError = UserProcessLaunchError::ImageLoadFailed;
@@ -48,12 +42,14 @@ namespace Zos::Kernel::Processes {
             return m_LastError = UserProcessLaunchError::UserModeConfigurationFailed;
         }
 
-        /* Publish all execution state before the first runnable registration. */
         Scheduling::SchedulerRegistrationError registration_error{};
+
         {
             Architecture::AMD64::ScopedInterruptDisable guard{};
+
             m_State = UserProcessLaunchState::Runnable;
             registration_error = scheduler.RegisterThread(m_Thread);
+
             if (registration_error != Scheduling::SchedulerRegistrationError::Success)
                 m_State = UserProcessLaunchState::Failed;
         }
@@ -66,16 +62,17 @@ namespace Zos::Kernel::Processes {
 
     void UserProcessInstance::ThreadEntry(void* context) noexcept {
         auto* instance = static_cast<UserProcessInstance*>(context);
-        if (instance == nullptr || !instance->IsLaunched() || !instance->m_Image.IsLoaded() ||
-            !instance->m_Thread.UserModeConfigured() ||
+
+        if (instance == nullptr || !instance->IsLaunched() ||
+            !instance->m_Image.IsLoaded() || !instance->m_Thread.UserModeConfigured() ||
             instance->m_Process.State() != ProcessState::Active)
-            Diagnostics::Fatal("City", "invalid user launch context");
+            Diagnostics::Fatal("Process", "invalid native user launch context");
 
         auto* processor = Architecture::AMD64::CurrentProcessor();
         if (processor == nullptr || processor->CurrentThread != &instance->m_Thread ||
             instance->m_Thread.OwningProcess() != &instance->m_Process ||
             !instance->m_Process.AddressSpace()->IsActive())
-            Diagnostics::Fatal("City", "user launch lost thread or CR3 ownership");
+            Diagnostics::Fatal("Process", "native user launch lost thread or CR3 ownership");
 
         instance->m_Thread.EnterUserMode();
     }
