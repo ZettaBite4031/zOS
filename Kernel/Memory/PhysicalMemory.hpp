@@ -139,7 +139,7 @@ namespace Zos::Kernel::Memory {
         PhysicalMemoryManager(const PhysicalMemoryManager&) = delete;
         PhysicalMemoryManager& operator=(const PhysicalMemoryManager&) = delete;
 
-        [[nodiscard]] PhysicalMemoryInitializationError Initialize(const Boot::BootEnvironment& environment) noexcept;
+        [[nodiscard]] PhysicalMemoryInitializationError Initialize(const ::Zos::Boot::BootEnvironment& environment) noexcept;
         [[nodiscard]] PhysicalMemoryReclamationError ReclaimBootMemory(PhysicalMemoryReclamationResult& result) noexcept;
         [[nodiscard]] PhysicalMemoryMetadataAccessError PromoteMetadataAccess(VirtualAddress metadata_base) noexcept;
 
@@ -186,32 +186,32 @@ namespace Zos::Kernel::Memory {
         static_assert(sizeof(ManagedRegion) == 32);
 
         [[nodiscard]] static bool IsPowerOfTwo(Uint64 value) noexcept;
-        [[nodiscard]] static bool IsManagedType(Boot::FirmwareMemoryType type) noexcept;
-        [[nodiscard]] static PageState InitialStateFor(Boot::FirmwareMemoryType type) noexcept;
+        [[nodiscard]] static bool IsManagedType(::Zos::Boot::FirmwareMemoryType type) noexcept;
+        [[nodiscard]] static PageState InitialStateFor(::Zos::Boot::FirmwareMemoryType type) noexcept;
         [[nodiscard]] static bool TryRangeEnd(Uint64 base, Uint64 size, Uint64& end) noexcept;
-        [[nodiscard]] static bool TryDescriptorEnd(const Boot::FirmwareMemoryDescriptor& descriptor, Uint64& end) noexcept;
+        [[nodiscard]] static bool TryDescriptorEnd(const ::Zos::Boot::FirmwareMemoryDescriptor& descriptor, Uint64& end) noexcept;
         [[nodiscard]] static bool Overlaps(Uint64 left_base, Uint64 left_end, Uint64 right_base, Uint64 right_end) noexcept;
         [[nodiscard]] static Uint64 AlignDown(Uint64 value, Uint64 alignment) noexcept;
         [[nodiscard]] static bool TryAlignUp(Uint64 value, Uint64 alignment, Uint64& result) noexcept;
 
-        [[nodiscard]] const Boot::FirmwareMemoryDescriptor* DescriptorAt(const Boot::BootEnvironment& environment, Uint64 index) const noexcept;
+        [[nodiscard]] const ::Zos::Boot::FirmwareMemoryDescriptor* DescriptorAt(const ::Zos::Boot::BootEnvironment& environment, Uint64 index) const noexcept;
 
-        [[nodiscard]] PhysicalMemoryInitializationError ValidateMemoryMap(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64& managed_pages, Uint64& managed_region_capacity, Uint64& conventional_pages) const noexcept;
+        [[nodiscard]] PhysicalMemoryInitializationError ValidateMemoryMap(const ::Zos::Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64& managed_pages, Uint64& managed_region_capacity, Uint64& conventional_pages) const noexcept;
         
-        [[nodiscard]] bool FindMetadataRegion(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 metadata_page_count, PhysicalSpan& result) const noexcept;
+        [[nodiscard]] bool FindMetadataRegion(const ::Zos::Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 metadata_page_count, PhysicalSpan& result) const noexcept;
 
-        [[nodiscard]] bool CandidateOverlapsProtectedRange(const Boot::BootEnvironment& environment, Uint64 candidate_base, Uint64 candidate_end, Uint64& next_candidate_end) const noexcept;
+        [[nodiscard]] bool CandidateOverlapsProtectedRange(const ::Zos::Boot::BootEnvironment& environment, Uint64 candidate_base, Uint64 candidate_end, Uint64& next_candidate_end) const noexcept;
 
         [[nodiscard]] bool MetadataViewsMatch(const ManagedRegion* candidate_regions, const Uint8* candidate_page_states) const noexcept;
 
         void InitializeMetadataStorage(Uint64 managed_region_capcity, Uint64 managed_pages) noexcept;
-        void BuildManagedRegions(const Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 managed_region_capacity) noexcept;
+        void BuildManagedRegions(const ::Zos::Boot::BootEnvironment& environment, Uint64 descriptor_count, Uint64 managed_region_capacity) noexcept;
         void SortManagedRegions() noexcept;
         void MergedAdjacentManagedRegions() noexcept;
         void AssignStateOffsets() noexcept;
         void InitializePageStates() noexcept;
 
-        void ReserveBootOwnedRanges(const Boot::BootEnvironment& environment) noexcept;
+        void ReserveBootOwnedRanges(const ::Zos::Boot::BootEnvironment& environment) noexcept;
         void ReserveSpan(PhysicalSpan span) noexcept;
         void AccountStateRemoval(PageState state) noexcept;
 

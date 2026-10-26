@@ -14,5 +14,5 @@ namespace Zos::Kernel::Initialization {
      * This function never returns because the loader-provided
      * call stack is explicitly retired during bootstrap.
      */
-    [[noreturn]] void Bootstrap(const Boot::BootEnvironment& environment, KernelRuntime& runtime) noexcept;
+    [[noreturn]] void Bootstrap(const ::Zos::Boot::BootEnvironment& environment, KernelRuntime& runtime) noexcept;
 }
