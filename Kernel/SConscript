@@ -7,6 +7,7 @@ Import(
     "first_user_program",
     "city_user_programs",
     "object_test_program",
+    "wait_test_program",
 )
 
 component_output = f"{output_root}/Kernel"
@@ -36,6 +37,7 @@ IMAGE_NAMES = (
     "CityFault",
     "CitySurvivor",
     "ObjectTest",
+    "WaitTest",
 )
 
 
@@ -88,6 +90,7 @@ images = [
     first_user_program[0],
     *(city_user_programs[name][0] for name in ("Exit", "Fault", "Survivor")),
     object_test_program[0],
+    wait_test_program[0],
 ]
 
 embedded_source = kernel_environment.Command(

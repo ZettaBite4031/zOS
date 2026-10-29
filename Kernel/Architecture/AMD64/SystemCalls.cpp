@@ -6,6 +6,7 @@
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
 #include <Kernel/Processes/Process.hpp>
+#include <Kernel/Scheduling/Scheduler.hpp>
 #include <Kernel/Scheduling/Thread.hpp>
 #include <Kernel/SystemCalls/SystemCalls.hpp>
 
@@ -32,15 +33,8 @@ namespace {
     inline constexpr Uint64 RflagsResume{ 1ULL << 16 };
     inline constexpr Uint64 RflagsAlignmentCheck{ 1ULL << 18 };
 
-    inline constexpr Uint64 SystemCallFlagMask{
-        RflagsTrap |
-        RflagsInterruptEnable |
-        RflagsDirection |
-        RflagsIoPrivilege |
-        RflagsNestedTask |
-        RflagsResume |
-        RflagsAlignmentCheck
-    };
+    inline constexpr Uint64 SystemCallFlagMask{ RflagsTrap | RflagsInterruptEnable | RflagsDirection |
+        RflagsIoPrivilege | RflagsNestedTask | RflagsResume | RflagsAlignmentCheck };
 
     /*
      * For 64-bit SYSRET, CS = STAR[63:48] + 16 and SS = STAR[63:48] + 8,
@@ -52,17 +46,12 @@ namespace {
     static_assert(static_cast<Uint16>(SysretSelectorBase + 8) == UserDataSelector);
     static_assert(static_cast<Uint16>(SysretSelectorBase + 16) == UserCodeSelector);
 
-    inline constexpr Uint64 StarValue{
-        (static_cast<Uint64>(SysretSelectorBase) << 48) |
-        (static_cast<Uint64>(KernelCodeSelector) << 32)
-    };
+    inline constexpr Uint64 StarValue{ (static_cast<Uint64>(SysretSelectorBase) << 48) | (static_cast<Uint64>(KernelCodeSelector) << 32) };
 
     SystemCallEntry* g_SystemCallEntry{};
 
     [[nodiscard]] bool IsUserAddress(VirtualAddress address) noexcept {
-        return !address.IsNull() &&
-            PageMap::IsCanonical(address) &&
-            address.Value() < 0x0000800000000000ULL;
+        return !address.IsNull() && PageMap::IsCanonical(address) && address.Value() < 0x0000800000000000ULL;
     }
 }
 
@@ -168,11 +157,8 @@ __asm__(
 
 extern "C" void Amd64SystemCallDispatch(Zos::Kernel::Architecture::AMD64::SystemCallContext* context) noexcept {
     using namespace Zos::Kernel::Diagnostics;
-
-    if (context == nullptr || g_SystemCallEntry == nullptr) {
+    if (context == nullptr || g_SystemCallEntry == nullptr)
         Fatal("Syscall", "AMD64 syscall dispatcher entered without initialized state");
-    }
-
     g_SystemCallEntry->Dispatch(*context);
 }
 
@@ -265,8 +251,9 @@ namespace Zos::Kernel::Architecture::AMD64 {
             Diagnostics::Fatal("Syscall", "syscall dispatched before initialization");
 
         ProcessorLocal* processor = CurrentProcessor();
-        if (processor == nullptr || !processor->IsInitialized() || processor->CurrentThread == nullptr)
-            Diagnostics::Fatal("Syscall", "syscall arrived without current-thread ownership");
+        if (processor == nullptr || !processor->IsInitialized() || processor->CurrentThread == nullptr ||
+            processor->LocalScheduler == nullptr || !processor->LocalScheduler->IsInitialized())
+            Diagnostics::Fatal("Syscall", "syscall arrived without current execution ownership");
 
         Scheduling::Thread* thread = processor->CurrentThread;
         Processes::Process* process = thread->OwningProcess();
@@ -293,9 +280,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
          * from userspace RFLAGS. Ordinary arithmetic/status flags and IF are
          * otherwise preserved from the architectural R11 image.
          */
-        constexpr Memory::Uint64 ForbiddenReturnFlags{
-            RflagsIoPrivilege | RflagsNestedTask | (1ULL << 17)
-        };
+        constexpr Memory::Uint64 ForbiddenReturnFlags{ RflagsIoPrivilege | RflagsNestedTask | (1ULL << 17) };
         context.UserRflags &= ~ForbiddenReturnFlags;
         context.UserRflags |= 1ULL << 1;
 
@@ -314,6 +299,7 @@ namespace Zos::Kernel::Architecture::AMD64 {
         SystemCalls::Context native_context{
             .CurrentProcess = *process,
             .CurrentThread = *thread,
+            .CurrentScheduler = *processor->LocalScheduler,
         };
 
         m_DispatchCount++;

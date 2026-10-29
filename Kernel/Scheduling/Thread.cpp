@@ -91,17 +91,25 @@ namespace Zos::Kernel::Scheduling {
             return ThreadSwitchError::InterruptsEnabled;
 
         Architecture::AMD64::ProcessorLocal* processor = Architecture::AMD64::CurrentProcessor();
-        if (processor == nullptr || processor->CurrentThread != this)
+        if (processor == nullptr || processor->CurrentThread != this) 
             return ThreadSwitchError::NotCurrentThread;
 
         if (m_State != ThreadState::Running)
             return ThreadSwitchError::CurrentStateInvalid;
 
-        if (next.m_State != ThreadState::Ready || !next.m_ContextReady)
+        if (disposition == TransferDisposition::Blocked) {
+            if (m_WaitQueue == nullptr || m_WaitNext != nullptr)
+                return ThreadSwitchError::WaitStateInvalid;
+        } else if (m_WaitQueue != nullptr || m_WaitNext != nullptr) {
+            return ThreadSwitchError::WaitStateInvalid;
+        }
+
+        if (next.m_State != ThreadState::Ready || !next.m_ContextReady ||
+            next.m_WaitQueue != nullptr || next.m_WaitNext != nullptr)
             return ThreadSwitchError::TargetNotReady;
 
         if (m_Stack == nullptr || next.m_Stack == nullptr ||
-            !Architecture::AMD64::SetCurrentKernelEntryStack(next.m_Stack->Top()))
+            !Architecture::AMD64::SetCurrentKernelEntryStack(next.m_Stack ->Top()))
             return ThreadSwitchError::KernelPrivilegeStackUpdateFailed;
 
         Architecture::AMD64::PageMap* current_space = m_OwningProcess != nullptr ? m_OwningProcess->AddressSpace() : nullptr;
@@ -119,11 +127,20 @@ namespace Zos::Kernel::Scheduling {
             }
         }
 
-        if (disposition == TransferDisposition::Terminated) {
-            MarkTerminated();
-        } else {
+        switch (disposition) {
+        case TransferDisposition::Ready:
             m_State = ThreadState::Ready;
             m_ContextReady = true;
+            break;
+
+        case TransferDisposition::Blocked:
+            m_State = ThreadState::Blocked;
+            m_ContextReady = true;
+            break;
+
+        case TransferDisposition::Terminated:
+            MarkTerminated();
+            break;
         }
 
         next.m_State = ThreadState::Running;
@@ -131,20 +148,17 @@ namespace Zos::Kernel::Scheduling {
 
         Architecture::AMD64::SwitchThreadContext(&m_Context, &next.m_Context);
 
-        if (disposition == TransferDisposition::Terminated)
+        if (disposition == TransferDisposition::Terminated) 
             Diagnostics::Fatal("Thread", "terminated thread unexpectedly resumed");
 
         if (m_Stack == nullptr || Architecture::AMD64::CurrentKernelEntryStack() != m_Stack->Top())
             return ThreadSwitchError::ResumeKernelPrivilegeStackMismatch;
 
         processor = Architecture::AMD64::CurrentProcessor();
-
         if (processor == nullptr || processor->CurrentThread != this || m_State != ThreadState::Running)
             return ThreadSwitchError::ResumeStateMismatch;
 
-        if (m_OwningProcess == nullptr ||
-            m_OwningProcess->AddressSpace() == nullptr ||
-            !m_OwningProcess->AddressSpace()->IsActive())
+        if (m_OwningProcess == nullptr || m_OwningProcess->AddressSpace() == nullptr || !m_OwningProcess->AddressSpace()->IsActive())
             return ThreadSwitchError::ResumeAddressSpaceMismatch;
 
         return ThreadSwitchError::Success;
@@ -293,6 +307,7 @@ namespace Zos::Kernel::Scheduling {
         switch (state) {
         case ThreadState::Ready: return "ready";
         case ThreadState::Running: return "running";
+        case ThreadState::Blocked: return "blocked";
         case ThreadState::Terminated: return "terminated";
         default: return "unknown";
         }
@@ -318,6 +333,7 @@ namespace Zos::Kernel::Scheduling {
         case ThreadSwitchError::InterruptsEnabled: return "cooperative context switching requires maskable interrupts to be disabled";
         case ThreadSwitchError::NotCurrentThread: return "outgoing thread is not the current processor thread";
         case ThreadSwitchError::CurrentStateInvalid: return "outgoing thread is not running";
+        case ThreadSwitchError::WaitStateInvalid: return "thread wait-queue state is invalid for the requested transfer";
         case ThreadSwitchError::TargetNotReady: return "target thread is not ready or has no resumable context";
         case ThreadSwitchError::ResumeStateMismatch: return "resumed thread state does not match processor ownership";
         case ThreadSwitchError::AddressSpaceSwitchFailed: return "failed to activate the target thread process address space";

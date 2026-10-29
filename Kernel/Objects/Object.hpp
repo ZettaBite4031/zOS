@@ -9,6 +9,10 @@ namespace Zos::Kernel::Objects {
         Invalid,
         Process,
         Thread,
+        Event,
+        Semaphore,
+        Mutex,
+        Timer,
     };
 
     class HandleTable;

@@ -13,6 +13,12 @@ namespace Zos::ABI {
         CloseHandle = 4,
         GetProcessIdFromHandle = 5,
         GetThreadIdFromHandle = 6,
+
+        WaitForObject = 7,
+        SignalEvent = 8,
+        ResetEvent = 9,
+        ReleaseSemaphore = 10,
+        ReleaseMutex = 11,
     };
 
     inline constexpr SystemCallNumber InvalidSystemCallResult{

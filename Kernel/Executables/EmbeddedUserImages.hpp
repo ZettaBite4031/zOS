@@ -12,4 +12,5 @@ namespace Zos::Kernel::Executables {
     [[nodiscard]] EmbeddedImage CitySurvivorImage() noexcept;
 
     [[nodiscard]] EmbeddedImage ObjectTestImage() noexcept;
+    [[nodiscard]] EmbeddedImage WaitTestImage() noexcept;
 }

@@ -10,6 +10,10 @@ namespace Zos::Kernel::Processes {
     class Process;
 }
 
+namespace Zos::Kernel::Synchronization {
+    class WaitQueue;
+}
+
 namespace Zos::Kernel::Scheduling {
     using ThreadId = Memory::Uint64;
     using ThreadEntry = void(*)(void* context) noexcept;
@@ -19,6 +23,7 @@ namespace Zos::Kernel::Scheduling {
     enum class ThreadState : Memory::Uint32 {
         Ready,
         Running,
+        Blocked,
         Terminated,
     };
 
@@ -39,6 +44,7 @@ namespace Zos::Kernel::Scheduling {
         NotCurrentThread,
         CurrentStateInvalid,
         TargetNotReady,
+        WaitStateInvalid,
         ResumeStateMismatch,
         AddressSpaceSwitchFailed,
         ResumeAddressSpaceMismatch,
@@ -105,9 +111,11 @@ namespace Zos::Kernel::Scheduling {
     private:
         friend class Scheduler;
         friend class ::Zos::Kernel::Processes::Process;
+        friend class ::Zos::Kernel::Synchronization::WaitQueue;
 
         enum class TransferDisposition : Memory::Uint8 {
             Ready,
+            Blocked,
             Terminated,
         };
 
@@ -131,7 +139,10 @@ namespace Zos::Kernel::Scheduling {
         Memory::KernelStack* m_Stack{};
 
         Architecture::AMD64::ThreadContext m_Context{};
+
         Thread* m_ReadyNext{};
+        Thread* m_WaitNext{};
+        Synchronization::WaitQueue* m_WaitQueue{};
 
         Memory::VirtualAddress m_UserEntry{};
         Memory::VirtualAddress m_UserStackTop{};

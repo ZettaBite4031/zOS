@@ -8,6 +8,7 @@ namespace Zos::Kernel::Processes {
 }
 
 namespace Zos::Kernel::Scheduling {
+    class Scheduler;
     class Thread;
 }
 
@@ -15,33 +16,22 @@ namespace Zos::Kernel::SystemCalls {
     using Number = ABI::SystemCallNumber;
     using NativeSystemCall = ABI::NativeSystemCall;
 
-    inline constexpr Memory::Uint64 InvalidSystemCallResult{
-        ABI::InvalidSystemCallResult
-    };
+    inline constexpr Memory::Uint64 InvalidSystemCallResult{ ABI::InvalidSystemCallResult };
 
-    /*
-     * Architecture-neutral request presented to the native zOS syscall layer.
-     *
-     * Native AMD64 ABI:
-     *   RAX              syscall number / return value
-     *   RDI, RSI, RDX,
-     *   R10, R8, R9      arguments 0..5
-     *   RCX, R11         architecturally clobbered by SYSCALL/SYSRET
-     *   other GPRs       preserved
-     */
     struct Request final {
         Number CallNumber{};
         Memory::Uint64 Arguments[6]{};
     };
 
     /*
-     * The native dispatcher needs execution identity, not architecture state.
-     * Keeping Process and Thread together here prevents every future syscall
-     * from growing another top-level dispatcher parameter.
+     * Architecture-neutral execution identity presented to native syscall
+     * implementations. Subsystems receive exactly the scheduler/process/thread
+     * context that a syscall may act on, without reaching through KernelRuntime.
      */
     struct Context final {
         Processes::Process& CurrentProcess;
         Scheduling::Thread& CurrentThread;
+        Scheduling::Scheduler& CurrentScheduler;
     };
 
     [[nodiscard]] Memory::Uint64 DispatchNative(const Request& request, Context& context) noexcept;

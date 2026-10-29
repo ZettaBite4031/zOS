@@ -1,9 +1,9 @@
 #include <Kernel/Time/LocalApicTimer.hpp>
 
 #include <Kernel/Diagnostics/Diagnostics.hpp>
-#include <Kernel/Architecture/AMD64/Instructions.hpp>
 
 #include <Kernel/Scheduling/Scheduler.hpp>
+#include <Kernel/Synchronization/Timer.hpp>
 
 namespace Zos::Kernel::Time {
     namespace {
@@ -20,6 +20,22 @@ namespace Zos::Kernel::Time {
         inline constexpr Uint64 TargetInterruptRateHz{ 100 };
         inline constexpr Uint64 DeliveryTestInterruptCount{ 8 };
         inline constexpr Uint64 DeliveryTestTimeoutNanoseconds{ 500'000'000ULL };
+
+        [[nodiscard]] Uint64 ReadRflags() noexcept {
+            Uint64 flags{};
+
+            __asm__ volatile(
+                "pushfq\n\t"
+                "popq %0"
+                : "=r"(flags)
+                :
+                : "memory"
+            );
+
+            return flags;
+        }
+
+        inline constexpr Uint64 RflagsInterruptEnable{ 1ULL << 9 };
     }
 
     LocalApicTimer* LocalApicTimer::s_ActiveTimer{};
@@ -32,7 +48,7 @@ namespace Zos::Kernel::Time {
             return LocalApicTimerInitializationError::InvalidDependency;
 
         if (s_ActiveTimer != nullptr) return LocalApicTimerInitializationError::ActiveInstanceExists;
-        if (Architecture::AMD64::InterruptsEnabled())
+        if ((ReadRflags() & RflagsInterruptEnable) != 0)
             return LocalApicTimerInitializationError::InvalidDependency;
 
         m_Apic = &apic;
@@ -129,7 +145,7 @@ namespace Zos::Kernel::Time {
 
     bool LocalApicTimer::EnableAndVerifyInterruptDelivery() noexcept {
         if (!m_Initialized || m_Apic == nullptr || m_Clock == nullptr) return false;
-        if (Architecture::AMD64::InterruptsEnabled()) return false;
+        if ((ReadRflags() & RflagsInterruptEnable) != 0) return false;
 
         m_InterruptCount = 0;
         m_FirstInterruptNanoseconds = 0;
@@ -232,6 +248,14 @@ namespace Zos::Kernel::Time {
 
         timer->m_LastInterruptNanoseconds = now;
         timer->m_InterruptCount = count + 1;
+
+        /*
+         * Waitable timers share the existing LAPIC cadence. Expired timers
+         * make their blocked threads Ready before the scheduler decides
+         * whether this tick should preempt the current thread.
+         */
+        if (current != nullptr && current->LocalScheduler != nullptr && current->LocalScheduler->IsInitialized())
+            Synchronization::Timer::Poll(now, *current->LocalScheduler);
 
         /*
         * Timer delivery verification occurs before preemption is enabled,

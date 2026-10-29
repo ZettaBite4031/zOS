@@ -1,0 +1,17 @@
+from pathlib import Path
+from SCons.Script import File
+
+from UserImages import BuildNativeElf
+
+Import("user_environment", "user_runtime_objects", "output_root")
+
+source_directory = Path(Dir(".").srcnode().abspath)
+
+source_files = sorted(path for path in source_directory.iterdir() if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx"})
+
+if not source_files:
+    raise RuntimeError("WaitTest contains no translation units.")
+
+program = BuildNativeElf(user_environment, output_root, "WaitTest", source_files, user_runtime_objects, File("Linker.ld"))
+
+Return("program")

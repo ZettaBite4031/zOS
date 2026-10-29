@@ -88,6 +88,25 @@ namespace Zos::Kernel::Objects {
         return HandleError::Success;
     }
 
+    HandleError HandleTable::AcquireAny(Handle handle, AccessMask required_rights, ObjectReference<Object>& output) noexcept {
+        if (!m_Initialized) return HandleError::NotInitialized;
+        if (output) return HandleError::OutputBusy;
+
+        Entry* entry{};
+        const HandleError resolve_error = Resolve(handle, entry);
+        if (resolve_error != HandleError::Success)
+            return resolve_error;
+
+        if (!GrantsAccess(entry->Rights, required_rights))
+            return HandleError::AccessDenied;
+
+        if (!entry->ObjectPointer->AddReference())
+            return HandleError::ReferenceOverflow;
+
+        output.Adopt(*entry->ObjectPointer);
+        return HandleError::Success;
+    }
+
     HandleError HandleTable::Resolve(Handle handle, Entry*& output) noexcept {
         const Entry* resolved{};
         const HandleError error = static_cast<const HandleTable*>(this)->Resolve(handle, resolved);

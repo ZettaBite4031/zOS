@@ -46,6 +46,10 @@ object_test_program = SConscript(
     "User/ObjectTest/SConscript",
     exports={"user_environment": user_environment, "output_root": output_root, "user_runtime_objects": user_runtime_objects},
 )
+wait_test_program = SConscript(
+    "User/WaitTest/SConscript",
+    exports={"user_environment": user_environment, "output_root": output_root, "user_runtime_objects": user_runtime_objects},
+)
 kernel = SConscript(
     "Kernel/SConscript",
     exports={
@@ -54,6 +58,7 @@ kernel = SConscript(
         "first_user_program": first_user_program,
         "city_user_programs": city_user_programs,
         "object_test_program": object_test_program,
+        "wait_test_program": wait_test_program,
     },
 )
 
@@ -225,6 +230,11 @@ object_test_verification = host_environment.Command(
     source=object_test_program,
     action=Action(VerifyUserProgram, "Verifying Step 21 object-handle ELF $SOURCE"),
 )
+wait_test_verification = host_environment.Command(
+    target=f"{output_root}/Verification/WaitTest.stamp",
+    source=wait_test_program,
+    action=Action(VerifyUserProgram, "Verifying Step 22 waitable-object ELF $SOURCE"),
+)
 
 staged_loader = host_environment.Command(
     target=f"{output_root}/ESP/EFI/BOOT/BOOTX64.EFI",
@@ -248,6 +258,7 @@ build_products = [
     user_program_verification,
     *city_user_verifications,
     object_test_verification,
+    wait_test_verification,
     staged_loader,
     staged_kernel,
 ]
@@ -260,6 +271,7 @@ Alias("verify", [
     user_program_verification,
     *city_user_verifications,
     object_test_verification,
+    wait_test_verification,
 ])
 
 Alias("debug-build", [*build_products, ovmf_variables])

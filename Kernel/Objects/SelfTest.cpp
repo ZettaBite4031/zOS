@@ -24,27 +24,30 @@ namespace Zos::Kernel::Objects::SelfTest {
         TestObject<ObjectType::Thread> thread{};
         HandleTable table{};
 
-        if (!process.Initialize() || !thread.Initialize() ||
-            process.Id() == 0 || thread.Id() == 0 ||
-            process.Id() == thread.Id() ||
-            process.ReferenceCount() != 1 ||
-            thread.ReferenceCount() != 1)
+        if (!process.Initialize() || !thread.Initialize() || process.Id() == 0 || thread.Id() == 0 ||
+            process.Id() == thread.Id() || process.ReferenceCount() != 1 || thread.ReferenceCount() != 1)
             Diagnostics::Fatal("Object", "typed object identity initialization failed");
 
         if (table.Initialize() != HandleError::Success || !table.Validate())
             Diagnostics::Fatal("Handle", "handle table initialization failed");
 
         Handle first{};
-        if (table.Open(process, QueryRight, first) != HandleError::Success ||
-            !first.IsValid() || process.ReferenceCount() != 2 ||
-            table.ActiveCount() != 1 || !table.Validate())
+        if (table.Open(process, QueryRight, first) != HandleError::Success || !first.IsValid() ||
+            process.ReferenceCount() != 2 || table.ActiveCount() != 1 || !table.Validate())
             Diagnostics::Fatal("Handle", "handle open/reference accounting failed");
 
         ObjectReference<TestObject<ObjectType::Process>> process_reference{};
         if (table.Acquire(first, QueryRight, process_reference) != HandleError::Success ||
-            !process_reference || process_reference->Id() != process.Id() ||
-            process.ReferenceCount() != 3)
+            !process_reference || process_reference->Id() != process.Id() || process.ReferenceCount() != 3)
             Diagnostics::Fatal("Handle", "typed handle acquisition failed");
+
+        ObjectReference<Object> generic_reference{};
+        if (table.AcquireAny(first, QueryRight, generic_reference) != HandleError::Success ||
+            !generic_reference || generic_reference->Type() != ObjectType::Process ||
+            generic_reference->Id() != process.Id())
+            Diagnostics::Fatal("Handle", "generic handle acquisition failed");
+
+        generic_reference.Reset();
 
         ObjectReference<TestObject<ObjectType::Thread>> wrong_type{};
         if (table.Acquire(first, QueryRight, wrong_type) != HandleError::WrongType)
@@ -57,11 +60,12 @@ namespace Zos::Kernel::Objects::SelfTest {
         process_reference.Reset();
 
         Handle duplicate{};
-        if (table.Open(process, QueryRight, duplicate) != HandleError::Success ||
+        if (table.Open(process, QueryRight, duplicate) != HandleError::Success || 
             duplicate == first || process.ReferenceCount() != 3)
             Diagnostics::Fatal("Handle", "multiple handles did not preserve object identity");
 
         const ObjectId shared_id = process.Id();
+
         if (table.Close(first) != HandleError::Success || process.ReferenceCount() != 2)
             Diagnostics::Fatal("Handle", "handle close/reference release failed");
 

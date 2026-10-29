@@ -11,6 +11,7 @@ namespace Zos::Kernel::Processes {
     enum class UserProcessLaunchState : Memory::Uint32 {
         Empty,
         Preparing,
+        Prepared,
         Runnable,
         Failed,
     };
@@ -28,12 +29,9 @@ namespace Zos::Kernel::Processes {
 
     /*
      * Permanent ownership root for one isolated, single-threaded native
-     * process. A launched instance must not be moved or destroyed while its
-     * thread can run.
-     *
-     * Terminated process resources remain retained until zOS gains a safe
-     * process/thread reaping protocol. Object references and process-local
-     * handles are released independently of that later storage reclamation.
+     * process. Prepare() makes the process complete but not runnable, allowing
+     * initial capabilities/state to be installed before Start() publishes its
+     * thread to the scheduler.
      */
     class UserProcessInstance final {
     public:
@@ -42,9 +40,15 @@ namespace Zos::Kernel::Processes {
         UserProcessInstance(const UserProcessInstance&) = delete;
         UserProcessInstance& operator=(const UserProcessInstance&) = delete;
 
+        [[nodiscard]] UserProcessLaunchError Prepare(ProcessId process_id, Scheduling::ThreadId thread_id, const Executables::ExecutableImageView& executable, const Executables::UserExecutableLoadOptions& load_options,
+            Memory::Uint64 kernel_stack_pages, Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& kernel_addresses, Architecture::AMD64::PageMap& kernel_page_map) noexcept;
+
+        [[nodiscard]] UserProcessLaunchError Start(Scheduling::Scheduler& scheduler) noexcept;
+
         [[nodiscard]] UserProcessLaunchError Launch(ProcessId process_id, Scheduling::ThreadId thread_id, const Executables::ExecutableImageView& executable, const Executables::UserExecutableLoadOptions& load_options,
             Memory::Uint64 kernel_stack_pages, Memory::PhysicalMemoryManager& physical_memory, Memory::VirtualAddressAllocator& kernel_addresses, Architecture::AMD64::PageMap& kernel_page_map, Scheduling::Scheduler& scheduler) noexcept;
 
+        [[nodiscard]] bool IsPrepared() const noexcept { return m_State == UserProcessLaunchState::Prepared; }
         [[nodiscard]] bool IsLaunched() const noexcept { return m_State == UserProcessLaunchState::Runnable; }
         [[nodiscard]] UserProcessLaunchState LaunchState() const noexcept { return m_State; }
         [[nodiscard]] UserProcessLaunchError LastLaunchError() const noexcept { return m_LastError; }
@@ -65,7 +69,9 @@ namespace Zos::Kernel::Processes {
         Process m_Process{};
         Scheduling::Thread m_Thread{};
         Executables::LoadedUserImage m_Image{};
+
         UserProcessLaunchState m_State{ UserProcessLaunchState::Empty };
+
         UserProcessLaunchError m_LastError{ UserProcessLaunchError::Success };
     };
 }

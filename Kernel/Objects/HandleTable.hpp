@@ -58,6 +58,8 @@ namespace Zos::Kernel::Objects {
             return HandleError::Success;
         }
 
+        [[nodiscard]] HandleError AcquireAny(Handle handle, AccessMask required_rights, ObjectReference<Object>& output) noexcept;
+
         [[nodiscard]] bool IsInitialized() const noexcept { return m_Initialized; }
         [[nodiscard]] Memory::Uint32 ActiveCount() const noexcept { return m_ActiveCount; }
 
